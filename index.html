@@ -1135,11 +1135,10 @@ let _fieldValues = {};  // 用对象存储字段值，避免 onclick 中有特�
 function showFieldModal(data) {
   _fieldData = data;
   _fieldValues = {};
+  const sdkList = data['SDK列表'] || [];
   const fields = [
     ['最终判断', data['最终判断']],
     ['初始Activity', data['初始Activity']],
-    ['SDK名称', data['SDK名称']],
-    ['SDK Key', data['SDK Key']],
     ['激励视频聚合id', data['激励视频聚合id']],
     ['插屏聚合id', data['插屏聚合id']],
     ['归因平台', data['归因平台']],
@@ -1150,11 +1149,25 @@ function showFieldModal(data) {
     const key = label.replace(/\s/g, '');
     _fieldValues[key] = value || '';
     const val = value || '<span class="field-missing">未提取到</span>';
-    html += `<tr>
-      <td>${esc(label)}</td>
-      <td>${val} ${value ? '<span class="field-copy" onclick="copyFieldByKey(\'' + key + '\',this)">复制</span>' : ''}</td>
-    </tr>`;
+    html += '<tr><td>' + esc(label) + '</td><td>' + val + (value ? ' <span class="field-copy" onclick="copyFieldByKey(\'' + key + '\',this)">复制</span>' : '') + '</td></tr>';
   }
+
+  // SDK 列表
+  if (sdkList.length > 0) {
+    html += '<tr><td colspan="2" style="padding-top:12px;border-bottom:none"></td></tr>';
+    let idx = 0;
+    for (const sdk of sdkList) {
+      const name = sdk['名称'] || '未知';
+      const keyVal = sdk['key'] || '';
+      const label = name + ' SDK Key';
+      const displayVal = keyVal || '<span class="field-missing">未提取到</span>';
+      const copyVal = keyVal ? (name + ' SDK Key: ' + keyVal) : '';
+      const key = 'sdk_' + (idx++);
+      _fieldValues[key] = copyVal;
+      html += '<tr><td>' + esc(label) + '</td><td>' + displayVal + (keyVal ? ' <span class="field-copy" onclick="copyFieldByKey(\'' + key + '\',this)">复制</span>' : '') + '</td></tr>';
+    }
+  }
+
   document.getElementById('fieldTable').innerHTML = html;
 
   const raw = data['完整日志'] || '';
@@ -1182,12 +1195,16 @@ function copyAllFields() {
   const lines = [
     '最终判断: ' + (_fieldData['最终判断'] || ''),
     '初始Activity: ' + (_fieldData['初始Activity'] || ''),
-    'SDK名称: ' + (_fieldData['SDK名称'] || ''),
-    'SDK Key: ' + (_fieldData['SDK Key'] || ''),
-    '激励视频聚合id: ' + (_fieldData['激励视频聚合id'] || ''),
-    '插屏聚合id: ' + (_fieldData['插屏聚合id'] || ''),
-    '归因平台: ' + (_fieldData['归因平台'] || ''),
   ];
+  const sdkList = _fieldData['SDK列表'] || [];
+  for (const sdk of sdkList) {
+    const name = sdk['名称'] || '未知';
+    const key = sdk['key'] || '';
+    lines.push(name + ' SDK Key: ' + key);
+  }
+  lines.push('激励视频聚合id: ' + (_fieldData['激励视频聚合id'] || ''));
+  lines.push('插屏聚合id: ' + (_fieldData['插屏聚合id'] || ''));
+  lines.push('归因平台: ' + (_fieldData['归因平台'] || ''));
   navigator.clipboard.writeText(lines.join('\n')).then(() => {
     cOk('已复制全部字段');
   }).catch(() => cErr('复制失败'));
