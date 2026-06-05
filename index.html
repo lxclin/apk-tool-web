@@ -578,6 +578,23 @@ select.form-input {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ── 字段提取弹窗 ── */
+.field-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:1000; align-items:center; justify-content:center; }
+.field-modal-overlay.show { display:flex; }
+.field-modal { background:var(--bg-card); border:1px solid var(--border-default); border-radius:12px; width:640px; max-height:85vh; overflow-y:auto; padding:24px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+.field-modal h3 { color:var(--text-primary); font-size:16px; margin:0 0 16px 0; display:flex; align-items:center; gap:8px; }
+.field-table { width:100%; border-collapse:collapse; }
+.field-table td { padding:8px 12px; border-bottom:1px solid var(--border-default); font-size:13px; }
+.field-table td:first-child { color:var(--text-muted); white-space:nowrap; width:120px; font-weight:500; }
+.field-table td:last-child { color:var(--text-primary); font-family:Menlo,monospace; word-break:break-all; }
+.field-table tr:hover { background:var(--bg-hover); }
+.field-copy { cursor:pointer; color:var(--info); font-size:12px; margin-left:8px; user-select:none; white-space:nowrap; }
+.field-copy:hover { text-decoration:underline; }
+.field-copy.copied { color:var(--success); }
+.field-raw { background:#0d0d0d; color:var(--text-muted); font-family:Menlo,monospace; font-size:11px; padding:10px; border-radius:6px; margin-top:12px; max-height:200px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
+.field-modal-close { float:right; background:none; border:none; color:var(--text-muted); font-size:20px; cursor:pointer; line-height:1; }
+.field-modal-close:hover { color:var(--text-primary); }
 </style>
 </head>
 <body>
@@ -589,7 +606,7 @@ select.form-input {
     <span><b>未检测到本地 ADB 代理</b> — 请先下载并启动代理程序，页面才能执行 ADB 操作</span>
   </span>
   <span style="display:flex;align-items:center;gap:12px;">
-    <a href="download/APK-Tool-Proxy-v2.dmg" id="proxyDownloadLink" style="background:#f0a030;color:#1a1a1a;padding:6px 16px;border-radius:6px;text-decoration:none;font-weight:600;white-space:nowrap;">⬇ 下载 macOS 代理</a>
+    <a href="download/APK-Tool-Proxy.dmg" id="proxyDownloadLink" style="background:#f0a030;color:#1a1a1a;padding:6px 16px;border-radius:6px;text-decoration:none;font-weight:600;white-space:nowrap;">⬇ 下载 macOS 代理</a>
     <button onclick="document.getElementById('proxyHelp').style.display=document.getElementById('proxyHelp').style.display==='none'?'block':'none'" style="background:none;border:1px solid #f0a030;color:#f0a030;padding:5px 12px;border-radius:6px;cursor:pointer;white-space:nowrap;">使用说明</button>
   </span>
 </div>
@@ -711,6 +728,13 @@ select.form-input {
           </button>
         </div>
         <span id="monitorTag" class="monitor-indicator">空闲</span>
+      </div>
+
+      <!-- 字段提取 -->
+      <div class="logcat-section-label">字段提取</div>
+      <div class="form-inline gap-sm">
+        <button class="btn" style="background:var(--info);color:#fff" onclick="extractFields()">🔍 提取聚合参数</button>
+        <span style="font-size:12px;color:var(--text-muted)">从 ZGSDK.AutoDetector 日志中提取 SDK Key、聚合ID、归因平台等字段</span>
       </div>
 
       <!-- 分隔 -->
@@ -911,6 +935,7 @@ function connect() {
       case 'device_status': updateDeviceStatus(m.connected, m.adb_path); break;
       case 'config_data': handleConfigData(m); break;
       case 'config_saved': cOk('配置已写入'); setBtns(true); break;
+      case 'extracted_fields': showFieldModal(m); break;
       case 'error': cErr(m.text); setBtns(true);
         if (_pendingLogcat) { _pendingLogcat=null; }
         break;
@@ -1077,5 +1102,96 @@ function installLocalApk() {
 
 connect();
 </script>
+
+<!-- ═══════ 字段提取弹窗 ═══════ -->
+<div class="field-modal-overlay" id="fieldModal">
+  <div class="field-modal">
+    <button class="field-modal-close" onclick="closeFieldModal()">✕</button>
+    <h3>🔍 聚合参数提取结果</h3>
+    <table class="field-table" id="fieldTable"></table>
+    <div style="display:flex;gap:8px;margin-top:12px;">
+      <button class="btn btn-primary btn-sm" onclick="copyAllFields()">📋 一键复制全部</button>
+      <button class="btn btn-ghost btn-sm" onclick="closeFieldModal()">关闭</button>
+    </div>
+    <div class="field-raw" id="fieldRaw"></div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+// 字段提取
+// ═══════════════════════════════════════════════════════════════════
+
+function extractFields() {
+  setBtns(false);
+  send({type: 'extract_fields'});
+  setTimeout(() => setBtns(true), 5000); // 超时恢复
+}
+
+let _fieldData = null;
+let _fieldValues = {};  // 用对象存储字段值，避免 onclick 中有特殊字符
+
+function showFieldModal(data) {
+  _fieldData = data;
+  _fieldValues = {};
+  const fields = [
+    ['最终判断', data['最终判断']],
+    ['初始Activity', data['初始Activity']],
+    ['SDK名称', data['SDK名称']],
+    ['SDK Key', data['SDK Key']],
+    ['激励视频聚合id', data['激励视频聚合id']],
+    ['插屏聚合id', data['插屏聚合id']],
+    ['归因平台', data['归因平台']],
+  ];
+
+  let html = '';
+  for (const [label, value] of fields) {
+    const key = label.replace(/\s/g, '');
+    _fieldValues[key] = value || '';
+    const val = value || '<span style="color:var(--text-muted)">(未提取到)</span>';
+    html += `<tr>
+      <td>${esc(label)}</td>
+      <td>${val} ${value ? '<span class="field-copy" onclick="copyFieldByKey(\'' + key + '\',this)">复制</span>' : ''}</td>
+    </tr>`;
+  }
+  document.getElementById('fieldTable').innerHTML = html;
+
+  const raw = data['完整日志'] || '';
+  document.getElementById('fieldRaw').textContent = raw || '(暂无原始日志)';
+
+  document.getElementById('fieldModal').classList.add('show');
+  setBtns(true);
+}
+
+function copyFieldByKey(key, btn) {
+  const text = _fieldValues[key] || '';
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = '✓ 已复制';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = '复制'; btn.classList.remove('copied'); }, 1500);
+  }).catch(() => cErr('复制失败'));
+}
+
+function closeFieldModal() {
+  document.getElementById('fieldModal').classList.remove('show');
+}
+
+function copyAllFields() {
+  if (!_fieldData) return;
+  const lines = [
+    '最终判断: ' + (_fieldData['最终判断'] || ''),
+    '初始Activity: ' + (_fieldData['初始Activity'] || ''),
+    'SDK名称: ' + (_fieldData['SDK名称'] || ''),
+    'SDK Key: ' + (_fieldData['SDK Key'] || ''),
+    '激励视频聚合id: ' + (_fieldData['激励视频聚合id'] || ''),
+    '插屏聚合id: ' + (_fieldData['插屏聚合id'] || ''),
+    '归因平台: ' + (_fieldData['归因平台'] || ''),
+  ];
+  navigator.clipboard.writeText(lines.join('\n')).then(() => {
+    cOk('已复制全部字段');
+  }).catch(() => cErr('复制失败'));
+}
+</script>
+
 </body>
 </html>
