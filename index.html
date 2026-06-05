@@ -580,21 +580,22 @@ select.form-input {
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
 /* ── 字段提取弹窗 ── */
-.field-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:1000; align-items:center; justify-content:center; }
+.field-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:1000; align-items:center; justify-content:center; }
 .field-modal-overlay.show { display:flex; }
-.field-modal { background:var(--bg-card); border:1px solid var(--border-default); border-radius:12px; width:640px; max-height:85vh; overflow-y:auto; padding:24px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
-.field-modal h3 { color:var(--text-primary); font-size:16px; margin:0 0 16px 0; display:flex; align-items:center; gap:8px; }
+.field-modal { background:#ffffff; border:1px solid #e0e0e0; border-radius:12px; width:640px; max-height:85vh; overflow-y:auto; padding:24px; box-shadow:0 8px 40px rgba(0,0,0,.15); }
+.field-modal h3 { color:#333333; font-size:16px; margin:0 0 16px 0; display:flex; align-items:center; gap:8px; }
 .field-table { width:100%; border-collapse:collapse; }
-.field-table td { padding:8px 12px; border-bottom:1px solid var(--border-default); font-size:13px; }
-.field-table td:first-child { color:var(--text-muted); white-space:nowrap; width:120px; font-weight:500; }
-.field-table td:last-child { color:var(--text-primary); font-family:Menlo,monospace; word-break:break-all; }
-.field-table tr:hover { background:var(--bg-hover); }
-.field-copy { cursor:pointer; color:var(--info); font-size:12px; margin-left:8px; user-select:none; white-space:nowrap; }
+.field-table td { padding:8px 12px; border-bottom:1px solid #eee; font-size:13px; }
+.field-table td:first-child { color:#888888; white-space:nowrap; width:120px; font-weight:500; }
+.field-table td:last-child { color:#333333; font-family:Menlo,monospace; word-break:break-all; }
+.field-table tr:hover { background:#f5f5f5; }
+.field-copy { cursor:pointer; color:#1976d2; font-size:12px; margin-left:8px; user-select:none; white-space:nowrap; }
 .field-copy:hover { text-decoration:underline; }
-.field-copy.copied { color:var(--success); }
-.field-raw { background:#0d0d0d; color:var(--text-muted); font-family:Menlo,monospace; font-size:11px; padding:10px; border-radius:6px; margin-top:12px; max-height:200px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
-.field-modal-close { float:right; background:none; border:none; color:var(--text-muted); font-size:20px; cursor:pointer; line-height:1; }
-.field-modal-close:hover { color:var(--text-primary); }
+.field-copy.copied { color:#4caf50; }
+.field-missing { color:#e53935; font-weight:500; }
+.field-raw { background:#f5f5f5; color:#666666; font-family:Menlo,monospace; font-size:11px; padding:10px; border-radius:6px; margin-top:12px; max-height:200px; overflow:auto; white-space:pre-wrap; word-break:break-all; border:1px solid #eee; }
+.field-modal-close { float:right; background:none; border:none; color:#999999; font-size:20px; cursor:pointer; line-height:1; }
+.field-modal-close:hover { color:#333333; }
 </style>
 </head>
 <body>
@@ -1148,7 +1149,7 @@ function showFieldModal(data) {
   for (const [label, value] of fields) {
     const key = label.replace(/\s/g, '');
     _fieldValues[key] = value || '';
-    const val = value || '<span style="color:var(--text-muted)">(未提取到)</span>';
+    const val = value || '<span class="field-missing">未提取到</span>';
     html += `<tr>
       <td>${esc(label)}</td>
       <td>${val} ${value ? '<span class="field-copy" onclick="copyFieldByKey(\'' + key + '\',this)">复制</span>' : ''}</td>
