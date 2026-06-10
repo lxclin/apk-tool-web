@@ -1139,6 +1139,7 @@ function showFieldModal(data) {
   const fields = [
     ['最终判断', data['最终判断']],
     ['初始Activity', data['初始Activity']],
+    ['应用类型', data['应用类型']],
     ['激励视频聚合id', data['激励视频聚合id']],
     ['插屏聚合id', data['插屏聚合id']],
     ['归因平台', data['归因平台']],
@@ -1202,6 +1203,7 @@ function copyAllFields() {
     const key = sdk['key'] || '';
     lines.push(name + ' SDK Key:' + key);
   }
+  lines.push('应用类型:' + (_fieldData['应用类型'] || ''));
   lines.push('激励视频聚合id:' + (_fieldData['激励视频聚合id'] || ''));
   lines.push('插屏聚合id:' + (_fieldData['插屏聚合id'] || ''));
   lines.push('归因平台:' + (_fieldData['归因平台'] || ''));
