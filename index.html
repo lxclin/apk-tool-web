@@ -790,6 +790,18 @@ select.form-input {
       </div>
     </div>
 
+    <!-- APKCombo Download Card -->
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--warning)"></div>
+        <h2>APKCombo 下载安装</h2>
+      </div>
+      <div class="form-inline gap-sm">
+        <input class="form-input mono flex-1" type="text" id="apkcomboUrl" placeholder="粘贴 APKCombo 下载链接 (apk/xapk)">
+        <button class="btn btn-primary" onclick="downloadInstall()">下载并安装</button>
+      </div>
+    </div>
+
     <!-- APKPure Card -->
     <div class="card">
       <div class="card-header">
@@ -1087,6 +1099,14 @@ function apkPureSearch() {
   if (!pkg) { cErr('请输入包名'); return; }
   setBtns(false);
   send({type:'cmd',action:'apkpure_search',params:{packageName:pkg}});
+}
+
+function downloadInstall() {
+  const url = $('apkcomboUrl').value.trim();
+  if (!url) { cErr('请输入 APKCombo 下载链接'); return; }
+  setBtns(false);
+  cWarn('正在下载...');
+  send({type:'cmd', action:'download_install', params:{url:url}});
 }
 
 function installLocalApk() {
