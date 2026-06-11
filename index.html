@@ -1103,10 +1103,25 @@ function apkPureSearch() {
 
 function downloadInstall() {
   const url = $('apkcomboUrl').value.trim();
-  if (!url) { cErr('请输入 APKCombo 下载链接'); return; }
-  setBtns(false);
-  cWarn('正在下载...');
-  send({type:'cmd', action:'download_install', params:{url:url}});
+  if (!url) { cErr('请输入下载链接或 Google Play 地址'); return; }
+
+  // 直链(.apk/.xapk) → 代理下载安装
+  if (url.endsWith('.apk') || url.endsWith('.xapk')) {
+    setBtns(false);
+    cWarn('正在下载...');
+    send({type:'cmd', action:'download_install', params:{url:url}});
+    return;
+  }
+
+  // Google Play 链接 → 在新标签页打开 apkcombo
+  const m = url.match(/[?&]id=([^&]+)/);
+  if (m) {
+    window.open('https://apkcombo.com/' + m[1] + '/download/apk', '_blank');
+    cOk('已在浏览器打开 apkcombo，下载后将 xapk 路径粘贴到「本地 APK 安装」中安装');
+    return;
+  }
+
+  cErr('无法识别链接格式');
 }
 
 function installLocalApk() {
