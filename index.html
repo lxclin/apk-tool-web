@@ -895,6 +895,25 @@ function cDone(code) {
   const cls = code===0 ? 'console-success' : 'console-error';
   consoleEl.innerHTML+=`<div class="${cls}">[exit=${code}]</div>`; cScroll();
 }
+
+function handleFillData(data) {
+  // 字段名兼容多种写法
+  const pkg = data.package_name || data.packageName || data['包名'] || '';
+  const appId = data.up2_appid || data.appId || data['UP2 appid'] || '';
+  const gpUrl = data.gp_url || data.gpUrl || data['GP链接'] || '';
+
+  if (pkg) { const el = $('pkgName'); if (el) el.value = pkg; }
+  if (appId) { const el = $('appId'); if (el) el.value = appId; }
+  if (gpUrl) { const el = $('apkFilePath'); if (el) el.value = gpUrl; }
+
+  const filled = [];
+  if (pkg) filled.push('包名');
+  if (appId) filled.push('AppId');
+  if (gpUrl) filled.push('GP链接');
+  if (filled.length) {
+    cOk('✅ 已自动填入: ' + filled.join(', '));
+  }
+}
 let autoScroll = true;
 function cScroll() { if (autoScroll) consoleEl.scrollTop = consoleEl.scrollHeight; }
 function clearConsole() {
@@ -949,6 +968,7 @@ function connect() {
       case 'config_data': handleConfigData(m); break;
       case 'config_saved': cOk('配置已写入'); setBtns(true); break;
       case 'extracted_fields': showFieldModal(m); break;
+      case 'fill_data': handleFillData(m.data); break;
       case 'error': cErr(m.text); setBtns(true);
         if (_pendingLogcat) { _pendingLogcat=null; }
         break;
