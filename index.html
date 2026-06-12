@@ -904,7 +904,7 @@ function handleFillData(data) {
 
   if (pkg) { const el = $('pkgName'); if (el) el.value = pkg; }
   if (appId) { const el = $('appId'); if (el) el.value = appId; }
-  if (gpUrl) { const el = $('apkFilePath'); if (el) el.value = gpUrl; }
+  if (gpUrl) { const el = $('apkUrl'); if (el) el.value = gpUrl; }
 
   const filled = [];
   if (pkg) filled.push('包名');
@@ -1316,7 +1316,7 @@ function copyAllFields() {
     var fi = [];
     if (pkg) { var e = document.getElementById('pkgName'); if (e) { e.value = pkg; fi.push('包名'); } }
     if (appId) { var e = document.getElementById('appId'); if (e) { e.value = appId; fi.push('AppId'); } }
-    if (gpUrl) { var e = document.getElementById('apkFilePath'); if (e) { e.value = gpUrl; fi.push('GP链接'); } }
+    if (gpUrl) { var e = document.getElementById('apkUrl'); if (e) { e.value = gpUrl; fi.push('GP链接'); } }
     if (fi.length) {
       var ce = document.querySelector('.console');
       if (ce) {
