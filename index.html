@@ -1256,7 +1256,7 @@ function openBackendUrl() {
 
   // 最终判断 → 聚合平台（映射到下拉框合法值）
   const final = _fieldData['最终判断'] || '';
-  const pm = final.match(/^(\S+)/);
+  const pm = final.match(/^([A-Za-z_]+)/);
   if (pm) {
     const raw = pm[1].toLowerCase();
     const map = {applovin:'max',iron:'iron_source',ironsource:'iron_source',levelplay:'level_play'};
