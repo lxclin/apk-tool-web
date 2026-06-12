@@ -1306,26 +1306,33 @@ function copyAllFields() {
 
 <!-- URL 参数回填（同事适配表跳转过来） -->
 <script>
-document.addEventListener('DOMContentLoaded', function() {
+(function fillFromUrl() {
   var q = new URLSearchParams(window.location.search);
   var pkg = q.get('package_name') || q.get('packageName') || '';
   var appId = q.get('appid') || q.get('appId') || '';
   var gpUrl = q.get('google_download_url') || q.get('gpUrl') || '';
 
-  var fi = [];
-  if (pkg) { var e = document.getElementById('pkgName'); if (e) { e.value = pkg; fi.push('包名'); } }
-  if (appId) { var e = document.getElementById('appId'); if (e) { e.value = appId; fi.push('AppId'); } }
-  if (gpUrl) { var e = document.getElementById('apkFilePath'); if (e) { e.value = gpUrl; fi.push('GP链接'); } }
-
-  if (fi.length) {
-    var ce = document.querySelector('.console');
-    if (ce) {
-      ce.classList.add('has-content');
-      ce.innerHTML += '<div class="console-success">🔗 已从适配表自动填入: ' + fi.join(', ') + '</div>';
-      ce.scrollTop = ce.scrollHeight;
+  function doFill() {
+    var fi = [];
+    if (pkg) { var e = document.getElementById('pkgName'); if (e) { e.value = pkg; fi.push('包名'); } }
+    if (appId) { var e = document.getElementById('appId'); if (e) { e.value = appId; fi.push('AppId'); } }
+    if (gpUrl) { var e = document.getElementById('apkFilePath'); if (e) { e.value = gpUrl; fi.push('GP链接'); } }
+    if (fi.length) {
+      var ce = document.querySelector('.console');
+      if (ce) {
+        ce.classList.add('has-content');
+        ce.innerHTML += '<div class="console-success">🔗 已从适配表自动填入: ' + fi.join(', ') + '</div>';
+        ce.scrollTop = ce.scrollHeight;
+      }
     }
   }
-});
+
+  // 多次尝试：确保 DOM 就绪后回填
+  if (document.readyState === 'complete') { doFill(); }
+  else { window.addEventListener('load', doFill); }
+  // 兜底：1s 后再执行一次（防止被其他脚本覆盖）
+  setTimeout(doFill, 1000);
+})();
 </script>
 
 </body>
