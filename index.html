@@ -1167,6 +1167,7 @@ connect();
     <table class="field-table" id="fieldTable"></table>
     <div style="display:flex;gap:8px;margin-top:12px;">
       <button class="btn btn-primary btn-sm" onclick="copyAllFields()">📋 一键复制全部</button>
+      <button class="btn btn-primary btn-sm" onclick="openBackendUrl()">🔗 跳转后台</button>
       <button class="btn btn-ghost btn-sm" onclick="closeFieldModal()">关闭</button>
     </div>
     <div class="field-raw" id="fieldRaw"></div>
@@ -1244,6 +1245,41 @@ function copyFieldByKey(key, btn) {
 
 function closeFieldModal() {
   document.getElementById('fieldModal').classList.remove('show');
+}
+
+function openBackendUrl() {
+  if (!_fieldData) return;
+  const pkg = ($('pkgName').value || '').trim();
+  if (!pkg) { cErr('请先在「配置」中填写包名'); return; }
+
+  const params = { change: '1', package_name: pkg };
+
+  // 最终判断 → 聚合平台
+  const final = _fieldData['最终判断'] || '';
+  const pm = final.match(/^(\S+)/);
+  if (pm) params.aggr_platform = pm[1];
+
+  // 直接映射
+  const map = {
+    '归因平台': 'attribution_platform',
+    '插屏聚合id': 'aggr_chaping_id',
+    '激励视频聚合id': 'aggr_jilishipin_id',
+    '初始Activity': 'activity_main_page'
+  };
+  for (const [k, v] of Object.entries(map)) {
+    if (_fieldData[k]) params[v] = _fieldData[k];
+  }
+
+  // AppLovin SDK Key
+  (sdkList = _fieldData['SDK列表'] || []).forEach(sdk => {
+    if (sdk['名称'] === 'AppLovin' && sdk['key']) {
+      params.manual_applovin_sdk_key = sdk['key'];
+    }
+  });
+
+  const qs = Object.entries(params).map(([k,v]) => encodeURIComponent(k)+'='+encodeURIComponent(v)).join('&');
+  window.open('http://data_center_web_internet.hongdinghe.cn/CpAdaptManage/CpAdapt?' + qs, '_blank');
+  cOk('已在浏览器打开后台页面，请确认后提交');
 }
 
 function copyAllFields() {
