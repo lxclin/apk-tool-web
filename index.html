@@ -1254,10 +1254,14 @@ function openBackendUrl() {
 
   const params = { change: '1', package_name: pkg };
 
-  // 最终判断 → 聚合平台
+  // 最终判断 → 聚合平台（映射到下拉框合法值）
   const final = _fieldData['最终判断'] || '';
   const pm = final.match(/^(\S+)/);
-  if (pm) params.aggr_platform = pm[1];
+  if (pm) {
+    const raw = pm[1].toLowerCase();
+    const map = {applovin:'max',iron:'iron_source',ironsource:'iron_source',levelplay:'level_play'};
+    params.aggr_platform = map[raw] || raw;
+  }
 
   // 直接映射
   const map = {
