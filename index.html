@@ -600,30 +600,6 @@ select.form-input {
 </head>
 <body>
 
-<!-- URL 参数回填：必须在最前面，不依赖任何 JS -->
-<script>
-(function(){
-  var q = new URLSearchParams(window.location.search);
-  var pkg = q.get('package_name') || q.get('packageName') || '';
-  var appId = q.get('appid') || q.get('appId') || '';
-  var gpUrl = q.get('google_download_url') || q.get('gpUrl') || '';
-
-  function fill(id, val) {
-    var el = document.getElementById(id);
-    if (el && val) { el.value = val; return true; }
-    return false;
-  }
-
-  var fi = [];
-  if (fill('pkgName', pkg)) fi.push('包名');
-  if (fill('appId', appId)) fi.push('AppId');
-  if (fill('apkFilePath', gpUrl)) fi.push('GP链接');
-
-  // 存到 window 供后续代码显示提示
-  window._fillResult = fi;
-})();
-</script>
-
 <!-- ═══════ PROXY BANNER ═══════ -->
 <div id="proxyBanner" style="display:flex;align-items:center;justify-content:space-between;background:#2d1f0e;border-bottom:1px solid #f0a030;padding:12px 20px;color:#f0d080;font-size:13px;">
   <span style="display:flex;align-items:center;gap:8px;">
@@ -1180,11 +1156,6 @@ function installLocalApk() {
 // INIT
 // ═══════════════════════════════════════════════════════════════════
 
-// 显示 URL 回填结果提示
-if (window._fillResult && window._fillResult.length) {
-  cOk('🔗 已从适配表自动填入: ' + window._fillResult.join(', '));
-}
-
 connect();
 </script>
 
@@ -1331,6 +1302,30 @@ function copyAllFields() {
     cOk('已复制全部字段');
   }).catch(() => cErr('复制失败'));
 }
+</script>
+
+<!-- URL 参数回填（同事适配表跳转过来） -->
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var q = new URLSearchParams(window.location.search);
+  var pkg = q.get('package_name') || q.get('packageName') || '';
+  var appId = q.get('appid') || q.get('appId') || '';
+  var gpUrl = q.get('google_download_url') || q.get('gpUrl') || '';
+
+  var fi = [];
+  if (pkg) { var e = document.getElementById('pkgName'); if (e) { e.value = pkg; fi.push('包名'); } }
+  if (appId) { var e = document.getElementById('appId'); if (e) { e.value = appId; fi.push('AppId'); } }
+  if (gpUrl) { var e = document.getElementById('apkFilePath'); if (e) { e.value = gpUrl; fi.push('GP链接'); } }
+
+  if (fi.length) {
+    var ce = document.querySelector('.console');
+    if (ce) {
+      ce.classList.add('has-content');
+      ce.innerHTML += '<div class="console-success">🔗 已从适配表自动填入: ' + fi.join(', ') + '</div>';
+      ce.scrollTop = ce.scrollHeight;
+    }
+  }
+});
 </script>
 
 </body>
