@@ -1,0 +1,10 @@
+build/
+dist/
+*.spec
+__pycache__/
+.DS_Store
+*.log
+*.har
+.claude/
+ip_whitelist.json
+auto_asana/

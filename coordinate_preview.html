@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>坐标对比 (553, 1585) vs (553, 1635)</title>
+<style>
+  body { margin: 0; padding: 20px; background: #1a1a2e; font-family: -apple-system, sans-serif; display: flex; flex-direction: column; align-items: center; color: #eee; }
+  canvas { border-radius: 24px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+  .info { margin-top: 20px; text-align: center; line-height: 2; }
+  .coord-a { color: #ff6b6b; font-weight: bold; font-size: 18px; }
+  .coord-b { color: #ffd93d; font-weight: bold; font-size: 18px; }
+  .delta { color: #6bcb77; font-weight: bold; }
+</style>
+</head>
+<body>
+<h2>📍 向下 50px 对比：<span class="coord-a">(553, 1585)</span> → <span class="coord-b">(553, 1635)</span></h2>
+<canvas id="c"></canvas>
+<div class="info">
+  <span class="coord-a">● (553, 1585)</span> — 水平 51.2% · 垂直 67.7%<br>
+  <span class="coord-b">● (553, 1635)</span> — 水平 51.2% · 垂直 69.9%<br>
+  <span class="delta">↓ 差距仅 50px，占屏幕高度的 2.1%</span>
+</div>
+<script>
+const W = 1080, H = 2340;
+const scale = 0.18;
+const canvas = document.getElementById('c');
+canvas.width = W * scale;
+canvas.height = H * scale;
+const ctx = canvas.getContext('2d');
+
+ctx.fillStyle = '#0d0d0d';
+ctx.beginPath();
+ctx.roundRect(0, 0, canvas.width, canvas.height, 16 * scale);
+ctx.fill();
+
+// 网格
+ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+ctx.lineWidth = 0.5;
+for (let x = 0; x <= W; x += 108) { ctx.beginPath(); ctx.moveTo(x*scale,0); ctx.lineTo(x*scale,H*scale); ctx.stroke(); }
+for (let y = 0; y <= H; y += 117) { ctx.beginPath(); ctx.moveTo(0,y*scale); ctx.lineTo(W*scale,y*scale); ctx.stroke(); }
+
+// 状态栏 + 导航栏示意
+ctx.fillStyle = 'rgba(255,255,255,0.03)';
+ctx.fillRect(0, 0, W*scale, 60*scale);
+ctx.fillRect(0, (H-130)*scale, W*scale, 130*scale);
+
+// 50px 差距带（红色半透明）
+const y1 = 1585 * scale, y2 = 1635 * scale;
+ctx.fillStyle = 'rgba(255,107,107,0.12)';
+ctx.fillRect(0, y1, W*scale, y2 - y1);
+ctx.fillStyle = 'rgba(255,255,255,0.2)';
+ctx.font = `${10}px monospace`;
+ctx.fillText('50px', W*scale - 42, (y1 + y2) / 2 + 3);
+
+function drawPoint(x, y, color, label) {
+  const px = x * scale, py = y * scale;
+  // 虚线十字
+  ctx.strokeStyle = color.replace('1)', '0.25)');
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(px, 0); ctx.lineTo(px, H*scale);
+  ctx.moveTo(0, py); ctx.lineTo(W*scale, py);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  // 涟漪
+  for (let r = 1; r <= 2; r++) {
+    ctx.beginPath();
+    ctx.arc(px, py, r*6, 0, Math.PI*2);
+    ctx.strokeStyle = color.replace('1)', `${0.4 - r*0.15})`);
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+  // 实心点
+  ctx.beginPath();
+  ctx.arc(px, py, 6, 0, Math.PI*2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  // 标签
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${11}px -apple-system, sans-serif`;
+  ctx.fillText(label, px + 12, py - 8);
+}
+
+drawPoint(553, 1585, 'rgba(255,107,107,1)',   '(553, 1585)');
+drawPoint(553, 1635, 'rgba(255,217,61,1)',    '(553, 1635)');
+</script>
+</body>
+</html>

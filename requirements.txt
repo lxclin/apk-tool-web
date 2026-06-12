@@ -1,0 +1,7 @@
+qrcode>=8.0
+Pillow>=10.0
+pytest>=8.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+websockets
+python-multipart

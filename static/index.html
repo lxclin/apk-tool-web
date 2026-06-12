@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>APK Tool</title>
+<style>
+/* ═══════════════════════════════════════════════════════════════════
+   DESIGN SYSTEM — Dark Mode Admin Panel
+   ═══════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── Surface ── */
+  --bg-root:      #0B0F19;
+  --bg-elevated:  #111827;
+  --bg-card:      #161D2A;
+  --bg-input:     #0F1520;
+  --bg-hover:     #1C2535;
+  --bg-terminal:  #080C14;
+
+  /* ── Border ── */
+  --border-subtle:  #1E293B;
+  --border-default: #273449;
+  --border-focus:   #3B7CFF;
+
+  /* ── Text ── */
+  --text-primary:   #F1F5F9;
+  --text-secondary: #94A3B8;
+  --text-muted:     #64748B;
+  --text-accent:    #60A5FA;
+
+  /* ── Brand / Status ── */
+  --brand:          #3B7CFF;
+  --brand-hover:    #5B9AFF;
+  --brand-pressed:  #2563EB;
+  --success:        #22C55E;
+  --success-bg:     #052E16;
+  --warning:        #F59E0B;
+  --warning-bg:     #422006;
+  --danger:         #EF4444;
+  --danger-bg:      #3F0A0A;
+  --info:           #60A5FA;
+
+  /* ── Spacing ── */
+  --space-xs:  4px;
+  --space-sm:  8px;
+  --space-md:  12px;
+  --space-lg:  16px;
+  --space-xl:  24px;
+
+  /* ── Radius ── */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-full: 9999px;
+
+  /* ── Typography ── */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  --font-mono: 'SF Mono', 'Menlo', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+
+  --text-2xs:  10px;
+  --text-xs:   11px;
+  --text-sm:   12px;
+  --text-base: 13px;
+  --text-lg:   15px;
+  --text-xl:   18px;
+
+  --leading-tight:  1.25;
+  --leading-normal: 1.5;
+  --leading-mono:   1.4;
+
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* ── Shadow ── */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+  --shadow-md: 0 4px 12px rgba(0,0,0,.5);
+  --shadow-focus: 0 0 0 2px rgba(59,124,255,.3);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   RESET & BASE
+   ═══════════════════════════════════════════════════════════════════ */
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg-root);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   HEADER
+   ═══════════════════════════════════════════════════════════════════ */
+
+.header {
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border-subtle);
+  padding: var(--space-md) var(--space-xl);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-lg);
+  flex-shrink: 0;
+}
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+.header-logo {
+  width: 22px; height: 22px;
+  background: var(--brand);
+  border-radius: var(--radius-sm);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: var(--weight-bold); color: #fff;
+}
+.header-title {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+.header-meta {
+  display: flex; align-items: center; gap: var(--space-md);
+  font-size: var(--text-sm);
+}
+.header-meta input {
+  background: var(--bg-input);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+  padding: 4px 8px; border-radius: var(--radius-sm);
+  font-size: var(--text-xs); width: 180px; outline: none;
+  transition: border-color .15s;
+}
+.header-meta input:focus { border-color: var(--border-focus); }
+
+/* ── Status Badge ── */
+.status-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: var(--radius-full);
+  font-size: var(--text-xs); font-weight: var(--weight-medium);
+  border: 1px solid transparent;
+}
+.status-badge::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+}
+.status-badge.offline { color: var(--text-muted); border-color: var(--border-default); }
+.status-badge.offline::before { background: var(--text-muted); }
+.status-badge.ready  { color: var(--warning); border-color: var(--warning); }
+.status-badge.ready::before  { background: var(--warning); }
+.status-badge.online { color: var(--success); border-color: var(--success); }
+.status-badge.online::before { background: var(--success); }
+
+/* ═══════════════════════════════════════════════════════════════════
+   TAB BAR
+   ═══════════════════════════════════════════════════════════════════ */
+
+.tab-bar {
+  display: flex; gap: 0;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border-subtle);
+  padding: 0 var(--space-xl);
+  flex-shrink: 0;
+}
+.tab-item {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--text-muted); font-size: var(--text-sm);
+  font-weight: var(--weight-medium); padding: 10px var(--space-lg); cursor: pointer;
+  transition: color .15s, border-color .15s; outline: none;
+}
+.tab-item:hover { color: var(--text-secondary); }
+.tab-item:focus-visible { box-shadow: var(--shadow-focus); border-radius: var(--radius-sm); }
+.tab-item.active { color: var(--brand); border-bottom-color: var(--brand); }
+.tab-item .badge {
+  display: inline-block; margin-left: 4px;
+  font-size: 10px; padding: 1px 6px; border-radius: var(--radius-full);
+  background: var(--brand); color: #fff; vertical-align: middle;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   MAIN CONTENT
+   ═══════════════════════════════════════════════════════════════════ */
+
+.main {
+  flex: 1; display: flex; flex-direction: column;
+  padding: var(--space-lg); gap: var(--space-md); overflow-y: auto;
+  scroll-behavior: smooth;
+}
+.tab-panel { display: none; flex-direction: column; gap: var(--space-md); }
+.tab-panel.active { display: flex; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   CARD
+   ═══════════════════════════════════════════════════════════════════ */
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+  box-shadow: var(--shadow-sm);
+}
+.card-header {
+  display: flex; align-items: center; gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+.card-header h2 {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-bold);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.card-header .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+}
+.card-divider {
+  border: none; border-top: 1px solid var(--border-subtle);
+  margin: var(--space-sm) 0 var(--space-md);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   FORM
+   ═══════════════════════════════════════════════════════════════════ */
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-sm) var(--space-lg);
+  align-items: center;
+}
+.form-grid .form-cell {
+  display: contents;
+}
+.form-grid .form-group {
+  display: flex; align-items: center; gap: var(--space-sm);
+}
+.form-grid .form-label {
+  width: 78px; flex-shrink: 0;
+  font-size: var(--text-sm); color: var(--text-secondary);
+  text-align: right; padding-right: var(--space-sm);
+  white-space: nowrap;
+}
+.form-grid .form-label::after { content: ':'; }
+.form-grid .form-input { flex: 1; }
+
+.form-full-row {
+  display: grid;
+  grid-template-columns: 78px 1fr;
+  gap: var(--space-sm);
+  align-items: center;
+  margin-top: var(--space-sm);
+}
+.form-full-row .form-label {
+  font-size: var(--text-sm); color: var(--text-secondary);
+  text-align: right; padding-right: var(--space-sm);
+  white-space: nowrap;
+}
+.form-full-row .form-label::after { content: ':'; }
+.form-full-row .form-input { grid-column: 2; }
+
+.form-inline {
+  display: flex; align-items: center; gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.form-label {
+  display: inline-block;
+  width: 78px;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-normal);
+  color: rgba(255,255,255,.55);
+  white-space: nowrap;
+  text-align: right;
+  padding-right: var(--space-sm);
+  flex-shrink: 0;
+}
+.form-label::after { content: ':'; }
+.form-input {
+  background: rgba(255,255,255,.04);
+  border: 1px solid var(--border-default);
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  font-family: var(--font-mono);
+  font-weight: var(--weight-normal);
+  outline: none;
+  width: 100%;
+  transition: border-color .2s ease, box-shadow .2s ease, background .2s ease;
+}
+.form-input::placeholder { color: var(--text-muted); }
+.form-input:focus {
+  background: rgba(255,255,255,.06);
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px rgba(59,124,255,.25);
+}
+.form-input:disabled {
+  opacity: .4; cursor: not-allowed;
+}
+select.form-input {
+  appearance: none;
+  font-family: var(--font-sans); /* 下拉选项用 UI 字体 */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2364748B'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 26px;
+  cursor: pointer;
+}
+
+/* ── Custom File Upload ── */
+.file-upload-wrap {
+  display: flex; align-items: center; gap: var(--space-sm); flex: 1;
+}
+.file-upload-wrap input[type="file"] {
+  display: none;
+}
+.file-upload-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 32px; padding: 0 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--text-sm); font-weight: var(--weight-medium);
+  cursor: pointer; white-space: nowrap;
+  transition: all .2s ease;
+  user-select: none;
+}
+.file-upload-btn:hover { color: var(--text-primary); border-color: var(--text-muted); background: var(--bg-hover); }
+.file-upload-btn:active { transform: scale(.97); }
+.file-name {
+  font-size: var(--text-sm); color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 260px;
+  line-height: 32px;
+}
+
+.uid-tag {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 10px; border-radius: var(--radius-full);
+  font-family: var(--font-mono); font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  background: var(--bg-input);
+  border: 1px solid var(--border-default);
+  color: var(--text-muted);
+}
+.uid-tag.found {
+  color: var(--success);
+  border-color: var(--success);
+  background: var(--success-bg);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   BUTTONS — Hierarchy
+   ═══════════════════════════════════════════════════════════════════ */
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  padding: 6px 14px;
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  font-family: var(--font-sans);
+  cursor: pointer;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  outline: none;
+  transition: all .2s ease;
+  user-select: none;
+}
+.btn:focus-visible { box-shadow: var(--shadow-focus); }
+.btn:active:not(:disabled) { transform: scale(.97); }
+.btn:disabled { opacity: .35; cursor: not-allowed; pointer-events: none; transform: none; }
+
+/* Primary — Filled, core actions */
+.btn-primary {
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand);
+}
+.btn-primary:hover:not(:disabled) { background: var(--brand-hover); border-color: var(--brand-hover); }
+.btn-primary:active:not(:disabled) { background: var(--brand-pressed); border-color: var(--brand-pressed); }
+
+/* Secondary — Outline, less prominent */
+.btn-secondary {
+  background: transparent;
+  color: var(--text-secondary);
+  border-color: var(--border-default);
+}
+.btn-secondary:hover:not(:disabled) { color: var(--text-primary); border-color: var(--text-muted); background: var(--bg-hover); }
+.btn-secondary:active:not(:disabled) { background: var(--bg-input); }
+
+/* Tertiary — Text only, minimal */
+.btn-ghost {
+  background: transparent;
+  color: var(--text-muted);
+  border-color: transparent;
+  padding: 6px 8px;
+}
+.btn-ghost:hover:not(:disabled) { color: var(--text-primary); background: var(--bg-hover); }
+.btn-ghost:active:not(:disabled) { color: var(--text-primary); }
+
+/* Success variant */
+.btn-success {
+  background: var(--success);
+  color: #052E16;
+  border-color: var(--success);
+}
+.btn-success:hover:not(:disabled) { filter: brightness(1.15); }
+.btn-success:active:not(:disabled) { filter: brightness(.9); }
+
+/* Danger variant */
+.btn-danger {
+  background: transparent;
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.btn-danger:hover:not(:disabled) { background: var(--danger-bg); }
+.btn-danger:active:not(:disabled) { filter: brightness(.9); }
+
+/* Crash variant */
+.btn-crash {
+  background: transparent;
+  color: #FB923C;
+  border-color: #FB923C;
+}
+.btn-crash:hover:not(:disabled) { background: rgba(251,146,60,.12); }
+.btn-crash:active:not(:disabled) { filter: brightness(.9); }
+
+/* ═══════════════════════════════════════════════════════════════════
+   MONITOR TAG
+   ═══════════════════════════════════════════════════════════════════ */
+
+.monitor-indicator {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: var(--radius-full);
+  font-size: var(--text-xs); font-weight: var(--weight-medium);
+  background: var(--bg-input); color: var(--text-muted);
+  border: 1px solid var(--border-default);
+}
+.monitor-indicator::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-muted);
+}
+.monitor-indicator.active {
+  background: var(--danger-bg); color: var(--danger);
+  border-color: var(--danger);
+}
+.monitor-indicator.active::before {
+  background: var(--danger);
+  animation: pulse 1.5s infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
+
+.logcat-control-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--space-md); margin-bottom: var(--space-md);
+}
+.logcat-section-label {
+  font-size: var(--text-xs); font-weight: var(--weight-semibold);
+  color: var(--text-muted); text-transform: uppercase;
+  letter-spacing: 0.06em; padding: 2px 0 6px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: var(--space-sm); margin-top: var(--space-md);
+}
+.logcat-section-label:first-of-type { margin-top: 0; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   CONSOLE — Terminal style
+   ═══════════════════════════════════════════════════════════════════ */
+
+.console {
+  flex: 2; min-height: 320px;
+  background: var(--bg-terminal);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: var(--space-sm) var(--space-md);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  line-height: var(--leading-mono);
+  letter-spacing: 0.02em;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  position: relative;
+}
+.console-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  height: 100%; min-height: 140px; color: var(--text-muted); user-select: none;
+  gap: var(--space-sm);
+}
+.console-empty-icon {
+  opacity: .25; margin-bottom: var(--space-xs);
+}
+.console-empty-icon svg {
+  width: 36px; height: 36px;
+}
+.console-empty-label {
+  font-size: var(--text-sm); color: var(--text-muted); font-weight: var(--weight-medium);
+}
+.console-empty-hint {
+  font-size: var(--text-xs); color: var(--border-default);
+}
+/* Hide empty state when console has content (JS adds class) */
+.console.has-content .console-empty { display: none; }
+.console-prompt { color: var(--brand); }
+.console-output { color: #E2E8F0; }
+.console-success { color: var(--success); }
+.console-error { color: var(--danger); }
+.console-warn { color: var(--warning); }
+
+/* ── Console Floating Toolbar ── */
+.console-toolbar {
+  position: absolute; top: 6px; right: 6px;
+  display: flex; gap: 2px;
+  opacity: 1;
+}
+.console-tool-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  background: rgba(255,255,255,.05); border: 1px solid transparent;
+  border-radius: var(--radius-sm); color: var(--text-muted);
+  cursor: pointer; transition: all .2s ease;
+}
+.console-tool-btn:hover { background: rgba(255,255,255,.1); color: var(--text-primary); border-color: var(--border-default); }
+.console-tool-btn:active { transform: scale(.93); }
+.console-tool-btn.active { color: var(--brand); background: rgba(59,124,255,.12); border-color: rgba(59,124,255,.3); }
+
+/* ═══════════════════════════════════════════════════════════════════
+   FOOTER
+   ═══════════════════════════════════════════════════════════════════ */
+
+.footer {
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--border-subtle);
+  padding: 5px var(--space-xl);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  display: flex; align-items: center; justify-content: space-between;
+  flex-shrink: 0;
+}
+.footer-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-muted);
+  display: inline-block; margin-right: 4px;
+}
+.footer-dot.connected { background: var(--success); }
+
+/* ═══════════════════════════════════════════════════════════════════
+   UTILITY
+   ═══════════════════════════════════════════════════════════════════ */
+
+.gap-xs { gap: var(--space-xs); }
+.gap-sm { gap: var(--space-sm); }
+.gap-md { gap: var(--space-md); }
+.mt-sm { margin-top: var(--space-sm); }
+.mt-md { margin-top: var(--space-md); }
+.flex-1 { flex: 1; }
+.w-full { width: 100%; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ── 字段提取弹窗 ── */
+.field-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:1000; align-items:center; justify-content:center; }
+.field-modal-overlay.show { display:flex; }
+.field-modal { background:#ffffff; border:1px solid #e0e0e0; border-radius:12px; width:640px; max-height:85vh; overflow-y:auto; padding:24px; box-shadow:0 8px 40px rgba(0,0,0,.15); }
+.field-modal h3 { color:#333333; font-size:16px; margin:0 0 16px 0; display:flex; align-items:center; gap:8px; }
+.field-table { width:100%; border-collapse:collapse; }
+.field-table td { padding:8px 12px; border-bottom:1px solid #eee; font-size:13px; }
+.field-table td:first-child { color:#888888; white-space:nowrap; width:120px; font-weight:500; }
+.field-table td:last-child { color:#333333; font-family:Menlo,monospace; word-break:break-all; }
+.field-table tr:hover { background:#f5f5f5; }
+.field-copy { cursor:pointer; color:#1976d2; font-size:12px; margin-left:8px; user-select:none; white-space:nowrap; }
+.field-copy:hover { text-decoration:underline; }
+.field-copy.copied { color:#4caf50; }
+.field-missing { color:#e53935; font-weight:500; }
+.field-raw { background:#f5f5f5; color:#666666; font-family:Menlo,monospace; font-size:11px; padding:10px; border-radius:6px; margin-top:12px; max-height:200px; overflow:auto; white-space:pre-wrap; word-break:break-all; border:1px solid #eee; }
+.field-modal-close { float:right; background:none; border:none; color:#999999; font-size:20px; cursor:pointer; line-height:1; }
+.field-modal-close:hover { color:#333333; }
+</style>
+</head>
+<body>
+
+<!-- ═══════ PROXY BANNER ═══════ -->
+<div id="proxyBanner" style="display:flex;align-items:center;justify-content:space-between;background:#2d1f0e;border-bottom:1px solid #f0a030;padding:12px 20px;color:#f0d080;font-size:13px;">
+  <span style="display:flex;align-items:center;gap:8px;">
+    <span style="font-size:18px;">⚠️</span>
+    <span><b>未检测到本地 ADB 代理</b> — 请先下载并启动代理程序，页面才能执行 ADB 操作</span>
+  </span>
+  <span style="display:flex;align-items:center;gap:12px;">
+    <a href="download/APK-Tool-Proxy.dmg" id="proxyDownloadLink" style="background:#f0a030;color:#1a1a1a;padding:6px 16px;border-radius:6px;text-decoration:none;font-weight:600;white-space:nowrap;">⬇ 下载 macOS 代理</a>
+    <button onclick="document.getElementById('proxyHelp').style.display=document.getElementById('proxyHelp').style.display==='none'?'block':'none'" style="background:none;border:1px solid #f0a030;color:#f0a030;padding:5px 12px;border-radius:6px;cursor:pointer;white-space:nowrap;">使用说明</button>
+  </span>
+</div>
+<div id="proxyHelp" style="display:none;background:#1a1a2e;border-bottom:1px solid #333;padding:16px 20px;color:#aaa;font-size:13px;line-height:1.8;">
+  <b style="color:#fff;">macOS 使用步骤：</b><br>
+  1. 点击上方按钮下载 <code style="background:#333;padding:2px 6px;border-radius:3px;">APK Tool Proxy.app</code><br>
+  2. 解压后将 App 拖入「应用程序」文件夹<br>
+  3. 双击启动（首次会弹出安全提示，前往「系统设置 → 隐私与安全性」点击「仍要打开」）<br>
+  4. 终端窗口显示 "监听: ws://localhost:9527" 即表示代理已就绪<br>
+  5. 刷新本页面，底部状态栏显示 "已连接(本地代理)" 即可开始使用<br>
+  <br>
+  <b style="color:#fff;">前提条件：</b><br>
+  · macOS 系统<br>
+  · 安卓手机 USB 连接电脑并开启 USB 调试<br>
+  · <b>无需安装 Python、ADB 或任何依赖</b>（全部内嵌在 App 中）
+</div>
+
+<!-- ═══════ HEADER ═══════ -->
+<header class="header">
+  <div class="header-brand">
+    <div class="header-logo">A</div>
+    <span class="header-title">APK Tool</span>
+  </div>
+  <div class="header-meta">
+    <input type="text" id="adbPathInput" placeholder="ADB 路径 (自动检测)">
+    <button class="btn btn-ghost" onclick="setAdbPath()">设置</button>
+    <span id="devStatus" class="status-badge offline">检测中</span>
+  </div>
+</header>
+
+<!-- ═══════ TABS ═══════ -->
+<nav class="tab-bar">
+  <button class="tab-item active" onclick="switchTab('apk')">APK 工具</button>
+  <button class="tab-item" onclick="switchTab('adb')">ADB 指令</button>
+</nav>
+
+<!-- ═══════ MAIN ═══════ -->
+<main class="main">
+
+  <!-- TAB: ADB 指令 -->
+  <div id="tab-adb" class="tab-panel">
+
+    <!-- Config Card -->
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--brand)"></div>
+        <h2>配置</h2>
+      </div>
+      <div class="form-grid">
+        <div class="form-group">
+          <span class="form-label">包名</span>
+          <input class="form-input mono" type="text" id="pkgName" placeholder="com.example.game">
+        </div>
+        <div class="form-group">
+          <span class="form-label">AppId</span>
+          <input class="form-input mono" type="text" id="appId" placeholder="appId">
+        </div>
+        <div class="form-group">
+          <span class="form-label">taskUUID</span>
+          <select class="form-input" id="taskUUID">
+            <option>mediation_test_snow</option>
+            <option>test_snow</option>
+            <option>rec_view_test_snow</option>
+            <option>rec_window_test_snow</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <span class="form-label">工作目录</span>
+          <input class="form-input mono" type="text" id="workDir" placeholder="工作目录路径">
+        </div>
+      </div>
+      <div class="form-full-row">
+        <span class="form-label">Config 路径</span>
+        <input class="form-input mono" type="text" id="configPath" placeholder="config.json 路径">
+      </div>
+      <div class="form-inline mt-sm gap-sm">
+        <label class="form-label">UID</label>
+        <span id="uidDisplay" class="uid-tag">(未获取)</span>
+      </div>
+      <hr class="card-divider">
+      <div class="form-inline gap-sm">
+        <button class="btn btn-primary" onclick="loadConfig()">读取配置</button>
+        <button class="btn btn-secondary" onclick="saveConfig()">写入配置</button>
+        <button class="btn btn-ghost" onclick="cdWorkDir()">cd 到此目录</button>
+      </div>
+    </div>
+
+    <!-- Actions Card -->
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--success)"></div>
+        <h2>操作指令</h2>
+      </div>
+      <div class="form-inline gap-sm">
+        <button class="btn btn-primary" id="btnPush" onclick="sendCmd('push_config')">推送 Config</button>
+        <button class="btn btn-primary" id="btnZygote" onclick="sendCmd('zygote_build')">执行 zygote_build</button>
+        <button class="btn btn-secondary" id="btnUid" onclick="sendCmd('get_uid')">获取应用 UID</button>
+        <button class="btn btn-secondary" id="btnClear" onclick="sendCmd('clear_cache')">清除缓存</button>
+        <button class="btn btn-secondary" id="btnStop" onclick="sendCmd('force_stop')">强制停止</button>
+        <button class="btn btn-secondary" id="btnOpen" onclick="sendCmd('open_app')">打开应用</button>
+        <button class="btn btn-secondary" id="btnPlayStore" onclick="sendCmd('clear_play_store')">清空 Play Store 缓存</button>
+      </div>
+    </div>
+
+    <!-- Logcat Card -->
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--danger)"></div>
+        <h2>Logcat 实时监听</h2>
+      </div>
+
+      <!-- 控制区：主监听 + 停止 + 状态 -->
+      <div class="logcat-control-row">
+        <div class="form-inline gap-sm">
+          <button class="btn btn-primary" onclick="startLogcat('ZGSDK.AutoDetector', true)">按 UID 过滤 ZGSDK.AutoDetector</button>
+          <button class="btn btn-danger" onclick="stopLogcat()">
+            <svg width="10" height="10" viewBox="0 0 10 10" style="margin-right:3px"><rect x="0" y="0" width="10" height="10" rx="2" fill="currentColor"/></svg>
+            停止监听
+          </button>
+        </div>
+        <span id="monitorTag" class="monitor-indicator">空闲</span>
+      </div>
+
+      <!-- 字段提取 -->
+      <div class="logcat-section-label">字段提取</div>
+      <div class="form-inline gap-sm">
+        <button class="btn" style="background:var(--info);color:#fff" onclick="extractFields()">🔍 提取聚合参数</button>
+        <span style="font-size:12px;color:var(--text-muted)">从 ZGSDK.AutoDetector 日志中提取 SDK Key、聚合ID、归因平台等字段</span>
+      </div>
+
+      <!-- 分隔 -->
+      <div class="logcat-section-label">崩溃日志</div>
+      <div class="form-inline gap-sm">
+        <button class="btn btn-crash" onclick="startLogcat('AndroidRuntime')">Java 崩溃</button>
+        <button class="btn btn-crash" onclick="startLogcat('Fatal signal')">Native 崩溃</button>
+      </div>
+
+      <!-- 分隔 -->
+      <div class="logcat-section-label mt-sm">聚合平台过滤</div>
+      <div class="form-inline gap-sm">
+        <button class="btn btn-secondary" onclick="startLogcat('ZGSDK.Max')">Max 聚合</button>
+        <button class="btn btn-secondary" onclick="startLogcat('ZGSDK.iron')">IronSource</button>
+        <button class="btn btn-secondary" onclick="startLogcat('ZGSDK.admob')">AdMob</button>
+        <button class="btn btn-secondary" onclick="startLogcat('ZGSDK.single')">Single</button>
+        <button class="btn btn-secondary" onclick="startLogcat('ZGSDK.send')">Send</button>
+        <button class="btn btn-secondary" onclick="startLogcat('MaxInterstitialAdMulti')">插屏聚合ID</button>
+        <button class="btn btn-secondary" onclick="startLogcat('MaxUnifiedAd')">激励聚合ID</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- TAB: APK 工具 -->
+  <div id="tab-apk" class="tab-panel active">
+
+    <!-- URL Install Card -->
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--brand)"></div>
+        <h2>Google Play 链接安装</h2>
+      </div>
+      <div class="form-inline gap-sm">
+        <input class="form-input mono flex-1" type="text" id="apkUrl" placeholder="https://play.google.com/store/apps/details?id=com.example.game">
+      </div>
+      <div class="form-inline gap-sm mt-sm">
+        <button class="btn btn-primary" onclick="openUrlOnDevice()">打开 Play Store 页面</button>
+        <button class="btn btn-secondary" onclick="apkComboDownload()">APKCombo 代理下载</button>
+      </div>
+    </div>
+
+    <!-- Local APK Card -->
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--success)"></div>
+        <h2>本地 APK 安装</h2>
+      </div>
+      <div class="form-inline gap-sm">
+        <input class="form-input mono flex-1" type="text" id="apkFilePath" placeholder="输入本机 APK 文件路径，如 /Users/xxx/app.apk">
+        <button class="btn btn-primary" onclick="installLocalApk()">安装本地 APK</button>
+      </div>
+    </div>
+
+    <!-- APKCombo Download Card -->
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--warning)"></div>
+        <h2>APKCombo 下载安装</h2>
+      </div>
+      <div class="form-inline gap-sm">
+        <input class="form-input mono flex-1" type="text" id="apkcomboUrl" placeholder="粘贴 APKCombo 下载链接 (apk/xapk)">
+        <button class="btn btn-primary" onclick="downloadInstall()">下载并安装</button>
+      </div>
+    </div>
+
+    <!-- APKPure Card -->
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--info)"></div>
+        <h2>APKPure 应用内搜索</h2>
+      </div>
+      <div class="form-inline gap-sm">
+        <input class="form-input mono flex-1" type="text" id="apkpurePkg" placeholder="com.example.game">
+        <button class="btn btn-primary" onclick="apkPureSearch()">搜索安装</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ═══════ CONSOLE ═══════ -->
+  <div id="console" class="console">
+    <div class="console-empty">
+      <div class="console-empty-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="4 17 10 11 4 5"/>
+          <line x1="12" y1="19" x2="20" y2="19"/>
+        </svg>
+      </div>
+      <div class="console-empty-label">等待日志输出</div>
+      <div class="console-empty-hint">执行 ADB 命令后输出将在此显示</div>
+    </div>
+    <!-- 浮动工具栏 -->
+    <div id="consoleToolbar" class="console-toolbar">
+      <button class="console-tool-btn" onclick="clearConsole()" title="清空日志">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+      </button>
+      <button class="console-tool-btn active" id="btnAutoScroll" onclick="toggleAutoScroll()" title="自动滚动">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+    </div>
+  </div>
+
+</main>
+
+<!-- ═══════ FOOTER ═══════ -->
+<footer class="footer">
+  <span><span class="footer-dot" id="footerDot"></span><span id="statusText">未连接</span></span>
+  <span>
+    <button class="btn btn-ghost" onclick="setBtns(true)" title="强制恢复所有按钮" style="font-size:10px;padding:2px 8px;">重置按钮</button>
+    <span id="statusExtra"></span>
+  </span>
+</footer>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════
+
+let ws = null, cachedUid = null, reconnectTimer = null;
+
+const $ = id => document.getElementById(id);
+const pkgEl=$('pkgName'),appIdEl=$('appId'),taskUuidEl=$('taskUUID');
+const uidDisplay=$('uidDisplay'),devStatus=$('devStatus');
+const monitorTag=$('monitorTag'),consoleEl=$('console');
+const cfgPathEl=$('configPath'),workDirEl=$('workDir');
+const apkUrlEl=$('apkUrl');
+const footerDot=$('footerDot'),statusText=$('statusText'),statusExtra=$('statusExtra');
+const opButtons = document.querySelectorAll('#btnPush,#btnZygote,#btnUid,#btnClear,#btnStop,#btnOpen,#btnPlayStore');
+
+cfgPathEl.value = '/Users/a1506/Documents/test/适配动作与聚合参数获取_260518/config.json';
+workDirEl.value = '/Users/a1506/Documents/test/适配动作与聚合参数获取_260518';
+
+// ═══════════════════════════════════════════════════════════════════
+// TABS
+// ═══════════════════════════════════════════════════════════════════
+
+function switchTab(name) {
+  document.querySelectorAll('.tab-item').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelector(`.tab-item[onclick*="${name}"]`).classList.add('active');
+  $(`tab-${name}`).classList.add('active');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CONSOLE
+// ═══════════════════════════════════════════════════════════════════
+
+function cEnsure() { consoleEl.classList.add('has-content'); }
+function cCmd(t) { cEnsure(); consoleEl.innerHTML+=`<div class="console-prompt">$ ${esc(t)}</div>`; cScroll(); }
+function cOut(t) { cEnsure(); consoleEl.innerHTML+=`<div class="console-output">${esc(t)}</div>`; cScroll(); }
+function cOk(t)  { cEnsure(); consoleEl.innerHTML+=`<div class="console-success">${esc(t)}</div>`; cScroll(); }
+function cErr(t) { cEnsure(); consoleEl.innerHTML+=`<div class="console-error">${esc(t)}</div>`; cScroll(); }
+function cWarn(t){ cEnsure(); consoleEl.innerHTML+=`<div class="console-warn">${esc(t)}</div>`; cScroll(); }
+function cDone(code) {
+  cEnsure();
+  const cls = code===0 ? 'console-success' : 'console-error';
+  consoleEl.innerHTML+=`<div class="${cls}">[exit=${code}]</div>`; cScroll();
+}
+
+function handleFillData(data) {
+  // 字段名兼容多种写法
+  const pkg = data.package_name || data.packageName || data['包名'] || '';
+  const appId = data.up2_appid || data.appId || data['UP2 appid'] || '';
+  const gpUrl = data.gp_url || data.gpUrl || data['GP链接'] || '';
+
+  if (pkg) { const el = $('pkgName'); if (el) el.value = pkg; }
+  if (appId) { const el = $('appId'); if (el) el.value = appId; }
+  if (gpUrl) { const el = $('apkFilePath'); if (el) el.value = gpUrl; }
+
+  const filled = [];
+  if (pkg) filled.push('包名');
+  if (appId) filled.push('AppId');
+  if (gpUrl) filled.push('GP链接');
+  if (filled.length) {
+    cOk('✅ 已自动填入: ' + filled.join(', '));
+  }
+}
+let autoScroll = true;
+function cScroll() { if (autoScroll) consoleEl.scrollTop = consoleEl.scrollHeight; }
+function clearConsole() {
+  consoleEl.innerHTML = '';
+  consoleEl.classList.remove('has-content');
+  // 恢复空状态
+  const empty = document.createElement('div'); empty.className = 'console-empty';
+  empty.innerHTML = `<div class="console-empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div><div class="console-empty-label">等待日志输出</div><div class="console-empty-hint">执行 ADB 命令后输出将在此显示</div>`;
+  consoleEl.appendChild(empty);
+  // 恢复工具栏
+  const tb = document.createElement('div'); tb.id = 'consoleToolbar'; tb.className = 'console-toolbar';
+  tb.innerHTML = `<button class="console-tool-btn" onclick="clearConsole()" title="清空日志"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></button><button class="console-tool-btn${autoScroll?' active':''}" id="btnAutoScroll" onclick="toggleAutoScroll()" title="自动滚动"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></button>`;
+  consoleEl.appendChild(tb);
+}
+function toggleAutoScroll() {
+  autoScroll = !autoScroll;
+  const btn = document.getElementById('btnAutoScroll');
+  if (btn) btn.classList.toggle('active', autoScroll);
+  // 同步更新重建后的按钮状态
+  if (autoScroll) cScroll();
+}
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ═══════════════════════════════════════════════════════════════════
+// WEBSOCKET
+// ═══════════════════════════════════════════════════════════════════
+
+const PROXY_WS = 'ws://localhost:9527';  // 本地 ADB 代理地址
+
+function connect() {
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  ws = new WebSocket(PROXY_WS);
+  ws.onopen = () => {
+    footerDot.className = 'footer-dot connected';
+    statusText.textContent = '已连接(本地代理)';
+    statusExtra.textContent = '';
+    proxyBanner.style.display = 'none';
+  };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    switch (m.type) {
+      case 'cmd_display': cCmd(m.text); break;
+      case 'line': cOut(m.text); break;
+      case 'done': cDone(m.exit); setBtns(true); break;
+      case 'uid': cachedUid=m.value; uidDisplay.textContent=m.value; uidDisplay.className='uid-tag found';
+        // 继续启动 logcat（如果正在等待 UID）
+        if (_pendingLogcat) { const p=_pendingLogcat; _pendingLogcat=null; startLogcat(p.pattern, p.withUid); }
+        break;
+      case 'logline': cOut(m.text); break;
+      case 'logcat_stopped': monitorTag.textContent='空闲'; monitorTag.className='monitor-indicator'; break;
+      case 'device_status': updateDeviceStatus(m.connected, m.adb_path); break;
+      case 'config_data': handleConfigData(m); break;
+      case 'config_saved': cOk('配置已写入'); setBtns(true); break;
+      case 'extracted_fields': showFieldModal(m); break;
+      case 'fill_data': handleFillData(m.data); break;
+      case 'error': cErr(m.text); setBtns(true);
+        if (_pendingLogcat) { _pendingLogcat=null; }
+        break;
+    }
+  };
+  ws.onclose = () => {
+    footerDot.className = 'footer-dot'; statusText.textContent='断开，重连中...';
+    proxyBanner.style.display = 'flex';
+    updateDeviceStatus(false);
+    setBtns(true);
+    reconnectTimer = setTimeout(connect, 3000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+function send(data) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { cErr('WebSocket 未连接'); return false; }
+  ws.send(JSON.stringify(data)); return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DEVICE STATUS
+// ═══════════════════════════════════════════════════════════════════
+
+function checkDevice() { send({type:'device_check'}); }
+
+function updateDeviceStatus(ok, adbPath) {
+  devStatus.classList.remove('offline','ready','online');
+  if (ok) { devStatus.textContent='设备已连接'; devStatus.classList.add('online'); }
+  else if (adbPath && adbPath!=='未找到') { devStatus.textContent='就绪，待连接'; devStatus.classList.add('ready'); }
+  else { devStatus.textContent='ADB 未找到'; devStatus.classList.add('offline'); }
+}
+
+let btnTimeout = null;
+function setBtns(enable) {
+  opButtons.forEach(b => b.disabled = !enable);
+  // 清除旧超时
+  if (btnTimeout) { clearTimeout(btnTimeout); btnTimeout = null; }
+  // 禁用时设 60 秒兜底恢复，防止卡死
+  if (!enable) {
+    btnTimeout = setTimeout(() => {
+      opButtons.forEach(b => b.disabled = false);
+      cWarn('按钮超时自动恢复（60s 无响应），请重试');
+    }, 60000);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════════════
+
+let _pendingLogcat = null;  // 等待 UID 完成后启动 logcat
+
+function handleConfigData(d) {
+  if (d.ok) {
+    pkgEl.value = d.packageName || '';
+    appIdEl.value = d.appId || '';
+    taskUuidEl.value = d.taskUUID || '';
+    cOk('已读取配置');
+  } else {
+    cErr(d.error);
+  }
+}
+
+function loadConfig() {
+  const p = cfgPathEl.value.trim();
+  send({type: 'config_read', path: p});
+}
+function saveConfig() {
+  const pkg = pkgEl.value.trim();
+  const appId = appIdEl.value.trim();
+  if (!pkg) { cErr('包名不能为空，写入已取消'); return; }
+  if (!appId) { cErr('AppId 不能为空，写入已取消'); return; }
+  setBtns(false);
+  send({type: 'config_write', path: cfgPathEl.value.trim(), packageName: pkg, appId: appId, taskUUID: taskUuidEl.value});
+}
+function cdWorkDir() {
+  const d = workDirEl.value.trim();
+  cCmd(`cd ${d}`);
+  cfgPathEl.value = d.replace(/\/$/,'')+'/config.json';
+  cOk(`config.json → ${cfgPathEl.value}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// COMMANDS
+// ═══════════════════════════════════════════════════════════════════
+
+function sendCmd(action) {
+  setBtns(false);
+  send({type:'cmd',action,params:{packageName:pkgEl.value.trim(),configPath:cfgPathEl.value.trim(),workDir:workDirEl.value.trim()}});
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LOGCAT
+// ═══════════════════════════════════════════════════════════════════
+
+async function startLogcat(pattern, withUid) {
+  if (withUid && !cachedUid) {
+    const pkg = pkgEl.value.trim();
+    if (!pkg) { cErr('请先填写包名或手动点击「获取应用 UID」'); return; }
+    cWarn('自动获取 UID 中...');
+    // 通过 WebSocket cmd 获取 UID（异步），完成后 _pendingLogcat 续接 logcat
+    _pendingLogcat = {pattern, withUid};
+    send({type:'cmd', action:'get_uid', params:{packageName:pkg}});
+    return;  // 等待 UID 回调中处理 _pendingLogcat
+  }
+  send({type:'logcat_start', pattern, uid: withUid ? cachedUid : ''});
+  monitorTag.textContent = `监听中: ${pattern}`;
+  monitorTag.className = 'monitor-indicator active';
+}
+function stopLogcat() {
+  send({type:'logcat_stop'});
+  monitorTag.textContent = '空闲';
+  monitorTag.className = 'monitor-indicator';
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ADB PATH
+// ═══════════════════════════════════════════════════════════════════
+
+function setAdbPath() {
+  // 代理模式下 ADB 路径由代理自动检测，仅更新显示
+  const p = $('adbPathInput').value.trim();
+  if (p) cOk('ADB 路径由本地代理管理，当前显示: ' + p);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// APK TOOLS
+// ═══════════════════════════════════════════════════════════════════
+
+function openUrlOnDevice() {
+  const url = apkUrlEl.value.trim();
+  if (!url) { cErr('请输入 Google Play 链接'); return; }
+  setBtns(false);
+  send({type:'cmd',action:'open_url',params:{url}});
+}
+
+function apkComboDownload() {
+  const url = apkUrlEl.value.trim();
+  const m = url.match(/[?&]id=([^&]+)/);
+  if (!m) { cErr('无法从 URL 提取包名'); return; }
+  setBtns(false);
+  send({type:'cmd',action:'open_apkcombo',params:{packageName:m[1]}});
+}
+
+function apkPureSearch() {
+  const pkg = $('apkpurePkg').value.trim();
+  if (!pkg) { cErr('请输入包名'); return; }
+  setBtns(false);
+  send({type:'cmd',action:'apkpure_search',params:{packageName:pkg}});
+}
+
+function downloadInstall() {
+  const url = $('apkcomboUrl').value.trim();
+  if (!url) { cErr('请输入下载链接或 Google Play 地址'); return; }
+
+  // 直链(.apk/.xapk) → 代理下载安装
+  if (url.endsWith('.apk') || url.endsWith('.xapk')) {
+    setBtns(false);
+    cWarn('正在下载...');
+    send({type:'cmd', action:'download_install', params:{url:url}});
+    return;
+  }
+
+  // Google Play 链接 → 在新标签页打开 apkcombo
+  const m = url.match(/[?&]id=([^&]+)/);
+  if (m) {
+    window.open('https://apkcombo.com/' + m[1] + '/download/apk', '_blank');
+    cOk('已在浏览器打开 apkcombo，下载后将 xapk 路径粘贴到「本地 APK 安装」中安装');
+    return;
+  }
+
+  cErr('无法识别链接格式');
+}
+
+function installLocalApk() {
+  const fp = $('apkFilePath').value.trim();
+  if (!fp) { cErr('请输入 APK 或 XAPK 文件路径'); return; }
+  setBtns(false);
+  cWarn('安装中: ' + fp);
+  send({type:'cmd', action:'install_file', params:{filepath:fp}});
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════════════
+
+connect();
+</script>
+
+<!-- ═══════ 字段提取弹窗 ═══════ -->
+<div class="field-modal-overlay" id="fieldModal">
+  <div class="field-modal">
+    <button class="field-modal-close" onclick="closeFieldModal()">✕</button>
+    <h3>🔍 聚合参数提取结果</h3>
+    <table class="field-table" id="fieldTable"></table>
+    <div style="display:flex;gap:8px;margin-top:12px;">
+      <button class="btn btn-primary btn-sm" onclick="copyAllFields()">📋 一键复制全部</button>
+      <button class="btn btn-ghost btn-sm" onclick="closeFieldModal()">关闭</button>
+    </div>
+    <div class="field-raw" id="fieldRaw"></div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+// 字段提取
+// ═══════════════════════════════════════════════════════════════════
+
+function extractFields() {
+  setBtns(false);
+  send({type: 'extract_fields'});
+  setTimeout(() => setBtns(true), 5000); // 超时恢复
+}
+
+let _fieldData = null;
+let _fieldValues = {};  // 用对象存储字段值，避免 onclick 中有特殊字符
+
+function showFieldModal(data) {
+  _fieldData = data;
+  _fieldValues = {};
+  const sdkList = data['SDK列表'] || [];
+  const fields = [
+    ['最终判断', data['最终判断']],
+    ['初始Activity', data['初始Activity']],
+    ['应用类型', data['应用类型']],
+    ['激励视频聚合id', data['激励视频聚合id']],
+    ['插屏聚合id', data['插屏聚合id']],
+    ['归因平台', data['归因平台']],
+  ];
+
+  let html = '';
+  for (const [label, value] of fields) {
+    const key = label.replace(/\s/g, '');
+    _fieldValues[key] = value || '';
+    const val = value || '<span class="field-missing">未提取到</span>';
+    html += '<tr><td>' + esc(label) + '</td><td>' + val + (value ? ' <span class="field-copy" onclick="copyFieldByKey(\'' + key + '\',this)">复制</span>' : '') + '</td></tr>';
+  }
+
+  // SDK 列表
+  if (sdkList.length > 0) {
+    html += '<tr><td colspan="2" style="padding-top:12px;border-bottom:none"></td></tr>';
+    let idx = 0;
+    for (const sdk of sdkList) {
+      const name = sdk['名称'] || '未知';
+      const keyVal = sdk['key'] || '';
+      const label = name + ' SDK Key';
+      const displayVal = keyVal || '<span class="field-missing">未提取到</span>';
+      const copyVal = keyVal ? (name + ' SDK Key:' + keyVal) : '';
+      const key = 'sdk_' + (idx++);
+      _fieldValues[key] = copyVal;
+      html += '<tr><td>' + esc(label) + '</td><td>' + displayVal + (keyVal ? ' <span class="field-copy" onclick="copyFieldByKey(\'' + key + '\',this)">复制</span>' : '') + '</td></tr>';
+    }
+  }
+
+  document.getElementById('fieldTable').innerHTML = html;
+
+  const raw = data['完整日志'] || '';
+  document.getElementById('fieldRaw').textContent = raw || '(暂无原始日志)';
+
+  document.getElementById('fieldModal').classList.add('show');
+  setBtns(true);
+}
+
+function copyFieldByKey(key, btn) {
+  const text = _fieldValues[key] || '';
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = '✓ 已复制';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = '复制'; btn.classList.remove('copied'); }, 1500);
+  }).catch(() => cErr('复制失败'));
+}
+
+function closeFieldModal() {
+  document.getElementById('fieldModal').classList.remove('show');
+}
+
+function copyAllFields() {
+  if (!_fieldData) return;
+  const lines = [
+    '最终判断:' + (_fieldData['最终判断'] || ''),
+    '初始Activity:' + (_fieldData['初始Activity'] || ''),
+  ];
+  const sdkList = _fieldData['SDK列表'] || [];
+  for (const sdk of sdkList) {
+    const name = sdk['名称'] || '未知';
+    const key = sdk['key'] || '';
+    lines.push(name + ' SDK Key:' + key);
+  }
+  lines.push('应用类型:' + (_fieldData['应用类型'] || ''));
+  lines.push('激励视频聚合id:' + (_fieldData['激励视频聚合id'] || ''));
+  lines.push('插屏聚合id:' + (_fieldData['插屏聚合id'] || ''));
+  lines.push('归因平台:' + (_fieldData['归因平台'] || ''));
+  navigator.clipboard.writeText(lines.join('\n')).then(() => {
+    cOk('已复制全部字段');
+  }).catch(() => cErr('复制失败'));
+}
+</script>
+
+</body>
+</html>
