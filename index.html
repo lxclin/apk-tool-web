@@ -1161,11 +1161,27 @@ function installLocalApk() {
   const q = new URLSearchParams(window.location.search);
   const pkg = q.get('package_name') || q.get('packageName') || '';
   const appId = q.get('appid') || q.get('appId') || '';
-  const gpUrl = q.get('google_download_url') || q.get('gpUrl') || '';
+  const gpUrl = q.get('google_download_url') || q.get('gpUrl') || q.get('url') || '';
 
-  if (pkg) { const el = $('pkgName'); if (el) el.value = pkg; }
-  if (appId) { const el = $('appId'); if (el) el.value = appId; }
-  if (gpUrl) { const el = $('apkFilePath'); if (el) el.value = gpUrl; }
+  // 调试：打印所有参数
+  console.log('[URL回填] search:', window.location.search);
+  console.log('[URL回填] pkg:', pkg, 'appId:', appId, 'gpUrl:', gpUrl);
+
+  if (pkg) {
+    const el = $('pkgName');
+    console.log('[URL回填] pkgName el:', el);
+    if (el) el.value = pkg;
+  }
+  if (appId) {
+    const el = $('appId');
+    console.log('[URL回填] appId el:', el);
+    if (el) el.value = appId;
+  }
+  if (gpUrl) {
+    const el = $('apkFilePath');
+    console.log('[URL回填] apkFilePath el:', el, 'value to set:', gpUrl);
+    if (el) el.value = gpUrl;
+  }
 
   if (pkg || appId || gpUrl) {
     const parts = [];
