@@ -1282,7 +1282,7 @@ function openBackendUrl() {
   });
 
   const qs = Object.entries(params).map(([k,v]) => encodeURIComponent(k)+'='+encodeURIComponent(v)).join('&');
-  window.open('http://data_center_web_internet.hongdinghe.cn/CpAdaptManage/CpAdapt?' + qs, '_blank');
+  window.open('http://data_center_web_internet.hongdinghe.cn/#/CpAdaptManage/CpAdapt?' + qs, '_blank');
   cOk('已在浏览器打开后台页面，请确认后提交');
 }
 
