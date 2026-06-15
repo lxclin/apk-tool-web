@@ -1254,6 +1254,8 @@ function openBackendUrl() {
 
   const params = { change: '1', package_name: pkg };
 
+  const firstCsvValue = value => String(value || '').split(',', 1)[0].trim();
+
   // 最终判断 → 聚合平台（映射到下拉框合法值）
   const final = _fieldData['最终判断'] || '';
   const pm = final.match(/^([A-Za-z_]+)/);
@@ -1266,12 +1268,18 @@ function openBackendUrl() {
   // 直接映射
   const map = {
     '归因平台': 'attribution_platform',
-    '插屏聚合id': 'aggr_chaping_id',
-    '激励视频聚合id': 'aggr_jilishipin_id',
     '初始Activity': 'activity_main_page'
   };
   for (const [k, v] of Object.entries(map)) {
     if (_fieldData[k]) params[v] = _fieldData[k];
+  }
+
+  const singleValueMap = {
+    '插屏聚合id': 'aggr_chaping_id',
+    '激励视频聚合id': 'aggr_jilishipin_id'
+  };
+  for (const [k, v] of Object.entries(singleValueMap)) {
+    if (_fieldData[k]) params[v] = firstCsvValue(_fieldData[k]);
   }
 
   // AppLovin SDK Key
