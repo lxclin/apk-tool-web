@@ -25,7 +25,7 @@ from adb_pusher import (
     build_get_uid_cmd, build_clear_cache_cmd, build_force_stop_cmd,
     build_open_app_cmd, build_logcat_cmd,
     start_logcat_stream, stop_logcat_stream,
-    run_stream, cmd_to_str, get_adb_path,
+    run_stream, cmd_to_str, get_adb_path, extract_uid_from_dumpsys,
 )
 
 CONFIG_DEFAULT = os.path.expanduser(
@@ -229,9 +229,9 @@ async def _run_cmd_stream(ws: WebSocket, cmd: list[str], cwd=None,
     def on_line(line: str):
         q.put(("line", line))
         if uid_regex:
-            m = re.search(r"userId=(\d+)", line)
-            if m:
-                uid_found[0] = m.group(1)
+            uid = extract_uid_from_dumpsys(line)
+            if uid:
+                uid_found[0] = uid
 
     def on_done(rc: int):
         q.put(("done", rc))

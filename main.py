@@ -2,8 +2,12 @@ from gui import APKToolApp
 import tkinter as tk
 
 
+def create_root():
+    return tk.Tk()
+
+
 def main():
-    root = tk.Tk()
+    root = create_root()
     APKToolApp(root)
     root.mainloop()
 

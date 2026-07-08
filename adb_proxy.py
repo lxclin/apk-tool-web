@@ -21,6 +21,8 @@ from pathlib import Path
 import websockets
 from websockets.asyncio.server import serve as ws_serve
 
+from adb_pusher import download_artifact_filename, parse_autodetector_fields
+
 
 # ── ADB 路径 ─────────────────────────────────────────────────────
 
@@ -109,6 +111,28 @@ _adb_path = _init_adb()
 def _find_adb() -> str:
     """返回已确认可用的 ADB 路径"""
     return _adb_path
+
+
+def _extract_uid_from_dumpsys_line(line: str) -> str | None:
+    match = re.search(r"\b(?:userId|appId)=(\d+)\b", line)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _extract_af_key_from_content(content: str) -> str:
+    patterns = [
+        r"^af[_\s-]*key\s*[:：]\s*(.+)$",
+        r"^Apps[Ff]lyer\s+(?:SDK\s+)?Key\s*[:：]\s*(.+)$",
+        r"^Apps[Ff]lyer\s+Dev(?:eloper)?\s+Key\s*[:：]\s*(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, content, re.I)
+        if match:
+            value = match.group(1).strip().strip("[]")
+            if value and value != "未找到":
+                return value
+    return ""
 
 
 # ── 命令构建 ─────────────────────────────────────────────────────
@@ -231,78 +255,7 @@ def _extract_fields() -> dict:
     except Exception:
         return {"ok": False, "error": "无法读取 logcat"}
 
-    tag_lines = [line for line in lines if "ZGSDK.AutoDetector" in line]
-
-    fields = {
-        "ok": True,
-        "最终判断": "",
-        "初始Activity": "",
-        "应用类型": "",
-        "激励视频聚合id": "",
-        "插屏聚合id": "",
-        "归因平台": "",
-        "SDK列表": [],
-        "完整日志": "",
-    }
-
-    current_sdk = ""
-
-    for line in tag_lines:
-        m = re.search(r"ZGSDK\.AutoDetector:\s+(.*)", line)
-        if not m:
-            continue
-        content = m.group(1).strip()
-
-        if content.startswith("最终判断:"):
-            fields["最终判断"] = content.replace("最终判断:", "").strip()
-        elif content.startswith("初始页面Activity:"):
-            fields["初始Activity"] = content.replace("初始页面Activity:", "").strip()
-        elif content.startswith("应用类型:"):
-            fields["应用类型"] = content.replace("应用类型:", "").strip()
-        elif content.startswith("归因平台:"):
-            raw = content.replace("归因平台:", "").strip()
-            fields["归因平台"] = raw.strip("[]")
-        elif re.match(r"^[A-Za-z][A-Za-z0-9]+:$", content):
-            current_sdk = content.rstrip(":")
-            found = False
-            for sdk in fields["SDK列表"]:
-                if sdk["名称"] == current_sdk:
-                    found = True
-                    break
-            if not found:
-                fields["SDK列表"].append({"名称": current_sdk, "key": ""})
-        elif "SDK Key:" in content:
-            key_val = content.split("SDK Key:", 1)[1].strip()
-            prefix_m = re.match(r"^(\S+)\s+SDK\s+Key:", content)
-            if prefix_m:
-                sdk_name = prefix_m.group(1)
-                found = False
-                for sdk in fields["SDK列表"]:
-                    if sdk["名称"] == sdk_name:
-                        sdk["key"] = key_val
-                        found = True
-                        break
-                if not found:
-                    fields["SDK列表"].append({"名称": sdk_name, "key": key_val})
-                current_sdk = sdk_name
-            elif current_sdk:
-                for sdk in fields["SDK列表"]:
-                    if sdk["名称"] == current_sdk:
-                        sdk["key"] = key_val
-                        break
-            else:
-                fields["SDK列表"].append({"名称": "未知", "key": key_val})
-        elif "激励视频聚合id:" in content:
-            val = content.split("激励视频聚合id:", 1)[1].strip()
-            if val != "未找到":
-                fields["激励视频聚合id"] = val.strip("[]")
-        elif "插屏聚合id:" in content:
-            val = content.split("插屏聚合id:", 1)[1].strip()
-            if val != "未找到":
-                fields["插屏聚合id"] = val.strip("[]")
-
-    fields["完整日志"] = "\n".join(tag_lines[-50:])
-    return fields
+    return parse_autodetector_fields(lines)
 
 
 # ── 配置路径 ─────────────────────────────────────────────────────
@@ -610,7 +563,7 @@ async def handle_connection(ws):
                         await ws.send(json.dumps({"type": "error", "text": "文件不存在"}))
                         continue
                     # xapk 文件 → 解压后用 install-multiple 安装
-                    if filepath.endswith(".xapk"):
+                    if filepath.lower().endswith(".xapk"):
                         asyncio.create_task(_install_xapk_ws(ws, filepath))
                     else:
                         cmd = [_find_adb(), "install", "-r", filepath]
@@ -748,10 +701,7 @@ async def _install_xapk_ws(ws, xapk_path: str):
 
 async def _download_install_ws(ws, url: str):
     """从 URL 下载 APK/XAPK 并安装到手机"""
-    parsed = urllib.parse.urlparse(url)
-    filename = os.path.basename(parsed.path)
-    if not filename or not (filename.endswith(".apk") or filename.endswith(".xapk")):
-        filename = "download.apk"
+    filename = download_artifact_filename(url)
     tmp_path = os.path.join(tempfile.gettempdir(), filename)
 
     try:
@@ -780,7 +730,7 @@ async def _download_install_ws(ws, url: str):
 
         await ws.send(json.dumps({"type": "line", "text": "下载完成，正在安装..."}))
 
-        if filename.endswith(".xapk"):
+        if filename.lower().endswith(".xapk") or _zip_contains_apks(tmp_path):
             await _install_xapk_ws(ws, tmp_path)
         else:
             cmd = [_find_adb(), "install", "-r", tmp_path]
@@ -799,6 +749,14 @@ async def _download_install_ws(ws, url: str):
                 os.remove(tmp_path)
         except OSError:
             pass
+
+
+def _zip_contains_apks(zip_path: str) -> bool:
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            return any(name.lower().endswith(".apk") for name in z.namelist())
+    except (OSError, zipfile.BadZipFile):
+        return False
 
 
 async def _run_cmd_ws(ws, cmd: list[str], cwd=None, timeout=None):
@@ -857,9 +815,7 @@ async def _run_get_uid_ws(ws, cmd: list[str]):
             except Exception:
                 break
             if uid_found is None:
-                m = re.search(r"userId=(\d+)", val)
-                if m:
-                    uid_found = m.group(1)
+                uid_found = _extract_uid_from_dumpsys_line(val)
         elif kind == "done":
             try:
                 await ws.send(json.dumps({"type": "done", "exit": val}))

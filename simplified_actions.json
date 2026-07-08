@@ -1,0 +1,178 @@
+{
+  "org.cocos2dx.javascript.org.Engine.Util.AppActivity": [
+    {
+      "clickAlertWindow": false,
+      "clickPosition": [
+        556,
+        1695
+      ],
+      "clickDialogFragment": false,
+      "delay": 20292,
+      "recycle": false,
+      "type": "click_activity_window"
+    },
+    {
+      "clickAlertWindow": false,
+      "clickPosition": [
+        557,
+        2023
+      ],
+      "clickDialogFragment": false,
+      "delay": 4473,
+      "recycle": false,
+      "type": "click_activity_window"
+    },
+    {
+      "clickAlertWindow": false,
+      "clickPosition": [
+        130,
+        2085
+      ],
+      "clickDialogFragment": false,
+      "delay": 4449,
+      "recycle": false,
+      "type": "click_activity_window"
+    },
+    {
+      "clickAlertWindow": false,
+      "clickPosition": [
+        554,
+        1483
+      ],
+      "clickDialogFragment": false,
+      "delay": 4495,
+      "recycle": false,
+      "type": "click_activity_window"
+    },
+    {
+      "dragPoints": [
+        {
+          "duration": 0,
+          "x": 517,
+          "y": 1499
+        },
+        {
+          "duration": 504,
+          "x": 568,
+          "y": 1639
+        },
+        {
+          "duration": 129,
+          "x": 846,
+          "y": 1662
+        }
+      ],
+      "duration": 633,
+      "endX": 846,
+      "endY": 1662,
+      "startX": 517,
+      "startY": 1499,
+      "clickDialogFragment": false,
+      "delay": 5281,
+      "recycle": false,
+      "type": "drag"
+    },
+    {
+      "dragPoints": [
+        {
+          "duration": 0,
+          "x": 487,
+          "y": 1796
+        },
+        {
+          "duration": 88,
+          "x": 552,
+          "y": 1756
+        }
+      ],
+      "duration": 88,
+      "endX": 552,
+      "endY": 1756,
+      "startX": 487,
+      "startY": 1796,
+      "clickDialogFragment": false,
+      "delay": 159293,
+      "recycle": false,
+      "type": "drag"
+    },
+    {
+      "dragPoints": [
+        {
+          "duration": 0,
+          "x": 867,
+          "y": 2250
+        },
+        {
+          "duration": 67,
+          "x": 841,
+          "y": 2257
+        }
+      ],
+      "duration": 67,
+      "endX": 841,
+      "endY": 2257,
+      "startX": 867,
+      "startY": 2250,
+      "clickDialogFragment": false,
+      "delay": 4819,
+      "recycle": false,
+      "type": "drag"
+    },
+    {
+      "dragPoints": [
+        {
+          "duration": 0,
+          "x": 602,
+          "y": 2085
+        },
+        {
+          "duration": 167,
+          "x": 615,
+          "y": 2101
+        }
+      ],
+      "duration": 167,
+      "endX": 615,
+      "endY": 2101,
+      "startX": 602,
+      "startY": 2085,
+      "clickDialogFragment": false,
+      "delay": 4829,
+      "recycle": false,
+      "type": "drag"
+    },
+    {
+      "clickAlertWindow": false,
+      "clickPosition": [
+        572,
+        1608
+      ],
+      "clickDialogFragment": false,
+      "delay": 4536,
+      "recycle": false,
+      "type": "click_activity_window"
+    },
+    {
+      "clickAlertWindow": false,
+      "clickPosition": [
+        559,
+        2039
+      ],
+      "clickDialogFragment": false,
+      "delay": 5365,
+      "recycle": false,
+      "type": "click_activity_window"
+    },
+    {
+      "clickAlertWindow": false,
+      "clickPosition": [
+        634,
+        2058
+      ],
+      "clickDialogFragment": false,
+      "delay": 4776,
+      "recycle": false,
+      "type": "click_activity_window"
+    }
+  ]
+}

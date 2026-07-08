@@ -1,7 +1,9 @@
 import json
 import re
+import sys
 import threading
 import time
+import traceback
 import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog
@@ -14,6 +16,7 @@ from qr_generator import generate_qr
 from auto_asana.main import (
     build_sync_clients,
     sync_packages,
+    sync_cp_adapt_records_to_sheet,
     SHEET_ID as DEFAULT_SHEET_ID,
     SHEET_NAME as DEFAULT_SHEET_NAME,
     PROJECT_GID as DEFAULT_PROJECT_GID,
@@ -21,30 +24,82 @@ from auto_asana.main import (
     SA_FILE as DEFAULT_SA_FILE,
     PROXY_URL as DEFAULT_PROXY_URL,
     PARENT_TASK_GID as DEFAULT_PARENT_TASK_GID,
+    CP_ADAPT_LIST_URL as DEFAULT_CP_ADAPT_LIST_URL,
+    CP_ADAPT_TOKEN as DEFAULT_CP_ADAPT_TOKEN,
 )
 from adb_pusher import (
     check_device, push_apk, set_adb_path, get_adb_path,
     get_app_uid, start_logcat_stream, stop_logcat_stream,
     run_stream, cmd_to_str, clear_logcat_buffer,
-    build_push_config_cmd, build_zygote_build_cmd,
+    build_push_config_cmd, build_fix_zygotehole_permissions_cmd, build_zygote_build_cmd,
     build_get_uid_cmd, build_clear_cache_cmd, build_force_stop_cmd,
     build_open_app_cmd, build_logcat_cmd,
     extract_logcat_fields, download_and_install,
+    build_backend_url, extract_uid_from_dumpsys, parse_fill_url,
+    extract_google_play_package, is_apk_download_url,
+    normalize_action_script_text,
+    DEFAULT_FOLLOWING_ACTION_MIN_DELAY_MS,
 )
 
 CONFIG_DEFAULT = os.path.expanduser(
-    "~/Documents/test/适配动作与聚合参数获取_260518/config.json"
+    "~/Documents/适配动作与聚合参数获取_260629/config.json"
 )
 WORK_DIR_DEFAULT = os.path.expanduser(
-    "~/Documents/test/适配动作与聚合参数获取_260518"
+    "~/Documents/适配动作与聚合参数获取_260629"
 )
+
+SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "gui_settings.json")
+CRASH_LOG = os.path.join(os.path.dirname(__file__), "gui_crash.log")
+
+
+def load_gui_settings(settings_path: str = SETTINGS_PATH) -> dict:
+    try:
+        with open(settings_path, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_gui_settings(settings: dict, settings_path: str = SETTINGS_PATH) -> None:
+    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+    with open(settings_path, "w") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+
+
+def get_remembered_path(settings: dict, key: str, default: str) -> str:
+    value = settings.get(key)
+    return value if isinstance(value, str) and value.strip() else default
+
+
+def get_remembered_text(settings: dict, key: str, default: str) -> str:
+    value = settings.get(key)
+    return value if isinstance(value, str) else default
+
+
+def _setup_crash_log():
+    """捕获未处理异常并写入日志文件"""
+    def _handler(exc_type, exc_val, exc_tb):
+        tb_str = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"\n=== CRASH {ts} ===\n{tb_str}\n"
+        try:
+            with open(CRASH_LOG, "a") as f:
+                f.write(msg)
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc_val, exc_tb)
+
+    sys.excepthook = _handler
 
 
 class APKToolApp:
     def __init__(self, root: tk.Tk):
+        _setup_crash_log()
         self.root = root
         self.root.title("APK 工具")
-        self.root.geometry("780x820")
+        self.root.geometry("900x820")
+        self.root.minsize(820, 640)
         self.root.resizable(True, True)
         self._qr_image: ImageTk.PhotoImage | None = None
         self._cached_uid: str | None = None
@@ -55,24 +110,134 @@ class APKToolApp:
         self._last_fill_data: dict = {}
         self._fill_poller_running = True
         self._sync_running = False
+        self._closing = False
+        self._after_ids: set[str] = set()
+        self._settings = load_gui_settings()
+        self._sync_settings_after_id: str | None = None
 
         # ── 数据同步配置 ──
-        self.sheet_id_var      = tk.StringVar(value=DEFAULT_SHEET_ID)
-        self.sheet_name_var    = tk.StringVar(value=DEFAULT_SHEET_NAME)
-        self.project_gid_var   = tk.StringVar(value=DEFAULT_PROJECT_GID)
-        self.asana_pat_var     = tk.StringVar(value=DEFAULT_ASANA_PAT)
-        self.sa_file_var       = tk.StringVar(value=DEFAULT_SA_FILE)
-        self.proxy_url_var     = tk.StringVar(value=DEFAULT_PROXY_URL)
-        self.parent_task_gid_var = tk.StringVar(value=DEFAULT_PARENT_TASK_GID)
+        self.sheet_id_var = tk.StringVar(
+            value=get_remembered_text(self._settings, "sync_sheet_id", DEFAULT_SHEET_ID)
+        )
+        self.sheet_name_var = tk.StringVar(
+            value=get_remembered_text(self._settings, "sync_sheet_name", DEFAULT_SHEET_NAME)
+        )
+        self.project_gid_var = tk.StringVar(
+            value=get_remembered_text(self._settings, "sync_project_gid", DEFAULT_PROJECT_GID)
+        )
+        self.asana_pat_var = tk.StringVar(
+            value=get_remembered_text(self._settings, "sync_asana_pat", DEFAULT_ASANA_PAT)
+        )
+        self.sa_file_var = tk.StringVar(
+            value=get_remembered_path(self._settings, "sync_sa_file", DEFAULT_SA_FILE)
+        )
+        self.proxy_url_var = tk.StringVar(
+            value=get_remembered_text(self._settings, "sync_proxy_url", DEFAULT_PROXY_URL)
+        )
+        self.parent_task_gid_var = tk.StringVar(
+            value=get_remembered_text(
+                self._settings, "sync_parent_task_gid", DEFAULT_PARENT_TASK_GID
+            )
+        )
+        self.cp_adapt_api_url_var = tk.StringVar(
+            value=get_remembered_text(
+                self._settings, "sync_cp_adapt_api_url", DEFAULT_CP_ADAPT_LIST_URL
+            )
+        )
+        self.cp_adapt_x_token_var = tk.StringVar(
+            value=get_remembered_text(self._settings, "sync_cp_adapt_x_token", "")
+        )
+        self.cp_adapt_token_var = tk.StringVar(
+            value=get_remembered_text(self._settings, "sync_cp_adapt_token", DEFAULT_CP_ADAPT_TOKEN)
+        )
+        self.cp_adapt_assign_var = tk.StringVar(
+            value=get_remembered_text(self._settings, "sync_cp_adapt_assign", "rain")
+        )
+        self.following_action_delay_var = tk.StringVar(
+            value=str(DEFAULT_FOLLOWING_ACTION_MIN_DELAY_MS // 1000)
+        )
+        self.config_path_var = tk.StringVar(
+            value=get_remembered_path(self._settings, "config_path", CONFIG_DEFAULT)
+        )
+        self.work_dir_var = tk.StringVar(
+            value=get_remembered_path(self._settings, "work_dir", WORK_DIR_DEFAULT)
+        )
 
         self._build_ui()
+        self._setup_sync_settings_memory()
         self._update_adb_status()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Destroy>", self._on_root_destroy, add="+")
 
         # 后台轮询 HTTP /fill/latest，接收适配表回填数据
         self._fill_poller = threading.Thread(
             target=self._fill_poller_loop, daemon=True
         )
         self._fill_poller.start()
+
+    def _on_root_destroy(self, event):
+        if event.widget is self.root:
+            self._closing = True
+            self._fill_poller_running = False
+
+    def _root_exists(self) -> bool:
+        try:
+            return bool(self.root.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _safe_after(self, delay_ms: int, callback, *args):
+        """Schedule a Tk callback only while the main window is alive."""
+        if self._closing or not self._root_exists():
+            return None
+
+        after_id = None
+
+        def _run():
+            if after_id is not None:
+                self._after_ids.discard(after_id)
+            if self._closing or not self._root_exists():
+                return
+            try:
+                callback(*args)
+            except tk.TclError:
+                if not self._closing:
+                    raise
+
+        try:
+            after_id = self.root.after(delay_ms, _run)
+            self._after_ids.add(after_id)
+            return after_id
+        except (RuntimeError, tk.TclError):
+            return None
+
+    def _cancel_pending_afters(self):
+        for after_id in list(self._after_ids):
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+            finally:
+                self._after_ids.discard(after_id)
+
+    def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._fill_poller_running = False
+        if self._logcat_proc is not None:
+            try:
+                stop_logcat_stream(self._logcat_proc, timeout=0.2)
+            except Exception:
+                pass
+            self._logcat_proc = None
+            self._logcat_thread = None
+            self._active_pattern = None
+        self._cancel_pending_afters()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def _fill_poller_loop(self):
         """后台线程：轮询 localhost:9528/fill/latest，有新数据则回填"""
@@ -86,7 +251,7 @@ class APKToolApp:
                 fill = body.get("data", {})
                 if fill and fill != self._last_fill_data:
                     self._last_fill_data = fill
-                    self.root.after(0, lambda f=fill: self._apply_fill_data(f))
+                    self._safe_after(0, self._apply_fill_data, fill)
             except Exception:
                 pass
             time.sleep(2)
@@ -132,12 +297,18 @@ class APKToolApp:
         self.url_entry.pack(fill=tk.X, pady=(4, 8))
 
         btn_frame = ttk.Frame(top)
-        btn_frame.pack()
-        ttk.Button(btn_frame, text="生成二维码", command=self._on_generate_qr).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="推送安装", command=self._on_push_apk).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="APKCombo 下载", command=self._on_apkcombo_download).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="选择APK", command=self._on_browse).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="设置ADB", command=self._on_set_adb).pack(side=tk.LEFT, padx=3)
+        btn_frame.pack(fill=tk.X)
+        first_row = ttk.Frame(btn_frame)
+        first_row.pack(anchor=tk.W)
+        second_row = ttk.Frame(btn_frame)
+        second_row.pack(anchor=tk.W, pady=(6, 0))
+        ttk.Button(first_row, text="生成二维码", command=self._on_generate_qr).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(first_row, text="解析URL", command=self._on_parse_fill_url).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(first_row, text="推送安装", command=self._on_push_apk).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(first_row, text="APKCombo 下载", command=self._on_apkcombo_download).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(second_row, text="选择APK", command=self._on_browse).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(second_row, text="选择目录", command=self._on_browse_apk_dir).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(second_row, text="设置ADB", command=self._on_set_adb).pack(side=tk.LEFT, padx=(0, 6))
 
         # APKPure 搜索
         apkpure_frame = ttk.Frame(top)
@@ -153,6 +324,77 @@ class APKToolApp:
         qr_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.qr_label = ttk.Label(qr_frame)
         self.qr_label.pack()
+
+    # ── 自动化脚本 Tab ────────────────────────────────────────────
+
+    def _build_action_script_tab(self, parent: ttk.Frame):
+        pad = {"padx": 10, "pady": 8}
+
+        info_frame = ttk.LabelFrame(parent, text="Delay 规则", padding=10)
+        info_frame.pack(fill=tk.X, **pad)
+        ttk.Label(
+            info_frame,
+            text="粘贴自动化脚本 JSON 后一键调整：首个 delay 固定至少 15000ms，其余 delay 使用下方配置。",
+            foreground="gray",
+            justify=tk.LEFT,
+            wraplength=760,
+        ).pack(anchor=tk.W)
+        delay_row = ttk.Frame(info_frame)
+        delay_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(delay_row, text="其余动作最小 delay:").pack(side=tk.LEFT)
+        self.following_action_delay_entry = ttk.Entry(
+            delay_row,
+            textvariable=self.following_action_delay_var,
+            width=8,
+        )
+        self.following_action_delay_entry.pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Label(delay_row, text="秒").pack(side=tk.LEFT)
+
+        script_frame = ttk.LabelFrame(parent, text="自动化脚本", padding=5)
+        script_frame.pack(fill=tk.BOTH, expand=True, **pad)
+
+        toolbar = ttk.Frame(script_frame)
+        toolbar.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(
+            toolbar,
+            text="调整 delay",
+            command=self._on_normalize_action_delays,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            toolbar,
+            text="复制结果",
+            command=self._on_copy_action_script,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            toolbar,
+            text="清空",
+            command=self._on_clear_action_script,
+        ).pack(side=tk.RIGHT)
+        self.action_script_status = ttk.Label(toolbar, text="待粘贴", foreground="gray")
+        self.action_script_status.pack(side=tk.LEFT, padx=8)
+
+        self.action_script_text = tk.Text(
+            script_frame,
+            wrap=tk.NONE,
+            font=("Menlo", 11),
+            bg="#1e1e1e",
+            fg="#d4d4d4",
+            insertbackground="white",
+            height=24,
+        )
+        y_scrollbar = ttk.Scrollbar(script_frame, command=self.action_script_text.yview)
+        x_scrollbar = ttk.Scrollbar(
+            script_frame,
+            orient=tk.HORIZONTAL,
+            command=self.action_script_text.xview,
+        )
+        self.action_script_text.configure(
+            yscrollcommand=y_scrollbar.set,
+            xscrollcommand=x_scrollbar.set,
+        )
+        self.action_script_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        y_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        x_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
 
     # ── ADB 指令 Tab ──────────────────────────────────────────────
 
@@ -196,7 +438,6 @@ class APKToolApp:
         row3 = ttk.Frame(config_frame)
         row3.pack(fill=tk.X, pady=2)
         ttk.Label(row3, text="Config:").pack(side=tk.LEFT)
-        self.config_path_var = tk.StringVar(value=CONFIG_DEFAULT)
         self.config_entry = ttk.Entry(row3, textvariable=self.config_path_var)
         self.config_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(row3, text="选择", command=self._on_browse_config).pack(side=tk.LEFT)
@@ -205,7 +446,6 @@ class APKToolApp:
         row4 = ttk.Frame(config_frame)
         row4.pack(fill=tk.X, pady=2)
         ttk.Label(row4, text="工作目录:").pack(side=tk.LEFT)
-        self.work_dir_var = tk.StringVar(value=WORK_DIR_DEFAULT)
         self.work_dir_entry = ttk.Entry(row4, textvariable=self.work_dir_var)
         self.work_dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(row4, text="cd 到此目录", command=self._on_cd_work_dir).pack(side=tk.LEFT)
@@ -245,6 +485,7 @@ class APKToolApp:
             ("强制停止", self._on_force_stop),
             ("打开应用", self._on_open_app),
             ("清空 Play Store 缓存", self._on_clear_play_store),
+            ("修复 zygotehole 权限", self._on_fix_zygotehole_permissions),
         ]:
             b = ttk.Button(btn_row2, text=text, command=cmd)
             b.pack(side=tk.LEFT, padx=2)
@@ -340,43 +581,184 @@ class APKToolApp:
     def _build_sync_tab(self, parent: ttk.Frame):
         pad = {"padx": 10, "pady": 5}
 
+        outer = ttk.Frame(parent)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        sync_scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=sync_scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sync_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        content = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _on_content_configure(_event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def _on_mousewheel(event):
+            if event.delta:
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+            elif getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+
+        content.bind("<Configure>", _on_content_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        def _bind_scroll_events(_event):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_mousewheel)
+            canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_scroll_events(_event):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _bind_scroll_events)
+        canvas.bind("<Leave>", _unbind_scroll_events)
+
         # --- 凭证配置 ---
-        cfg_frame = ttk.LabelFrame(parent, text="API 凭证与目标", padding=10)
+        cfg_frame = ttk.LabelFrame(content, text="API 凭证与目标", padding=10)
         cfg_frame.pack(fill=tk.X, **pad)
 
         rows = [
-            ("Sheet ID",       self.sheet_id_var,      None),
-            ("Sheet 名称",     self.sheet_name_var,    None),
-            ("Asana 项目 GID", self.project_gid_var,   None),
-            ("Asana PAT",      self.asana_pat_var,     None),
-            ("SA 密钥文件",    self.sa_file_var,       self._on_browse_sa_file),
-            ("代理地址",       self.proxy_url_var,     None),
-            ("父任务 GID",     self.parent_task_gid_var, None),
+            (
+                "Sheet ID",
+                self.sheet_id_var,
+                None,
+                "Google 表格 URL 中 /spreadsheets/d/ 后面的长字符串。",
+            ),
+            (
+                "Sheet 名称",
+                self.sheet_name_var,
+                None,
+                "表格底部的工作表标签名，例如 26年5-6月，需完全一致。",
+            ),
+            (
+                "Asana 项目 GID",
+                self.project_gid_var,
+                None,
+                "Asana 项目 URL 里的项目数字 ID，决定任务同步到哪个项目。",
+            ),
+            (
+                "Asana PAT",
+                self.asana_pat_var,
+                None,
+                "Asana Personal Access Token，用于调用 Asana API，请当作密码保管。",
+            ),
+            (
+                "SA 密钥文件",
+                self.sa_file_var,
+                self._on_browse_sa_file,
+                "Google Service Account 的 JSON 密钥文件，需有该 Sheet 的读写权限。",
+            ),
+            (
+                "代理地址",
+                self.proxy_url_var,
+                None,
+                "访问 Google Sheets API 的本机 HTTP 代理；不需要代理可留空。",
+            ),
+            (
+                "父任务 GID",
+                self.parent_task_gid_var,
+                None,
+                "Asana 父任务 URL 里的任务数字 ID，新建任务会挂到它下面。",
+            ),
         ]
-        for label, var, browse_cmd in rows:
+        for label, var, browse_cmd, help_text in rows:
             row_frame = ttk.Frame(cfg_frame)
-            row_frame.pack(fill=tk.X, pady=2)
-            ttk.Label(row_frame, text=label + ":", width=15, anchor=tk.E).pack(side=tk.LEFT)
-            entry = ttk.Entry(row_frame, textvariable=var)
-            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+            row_frame.pack(fill=tk.X, pady=4)
+            ttk.Label(row_frame, text=label + ":", width=15, anchor=tk.E).pack(
+                side=tk.LEFT, anchor=tk.N
+            )
+
+            field_frame = ttk.Frame(row_frame)
+            field_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+            entry_row = ttk.Frame(field_frame)
+            entry_row.pack(fill=tk.X)
+            entry = ttk.Entry(entry_row, textvariable=var)
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
             if browse_cmd:
-                ttk.Button(row_frame, text="选择", command=browse_cmd).pack(side=tk.LEFT)
+                ttk.Button(entry_row, text="选择", command=browse_cmd).pack(
+                    side=tk.LEFT, padx=(8, 0)
+                )
+
+            ttk.Label(
+                field_frame,
+                text=help_text,
+                foreground="gray",
+                wraplength=640,
+                justify=tk.LEFT,
+            ).pack(fill=tk.X, pady=(2, 0))
+
+        # --- CP 后台数据源 ---
+        source_frame = ttk.LabelFrame(content, text="前置数据源（CP 后台 → Google Sheet）", padding=10)
+        source_frame.pack(fill=tk.X, **pad)
+
+        source_rows = [
+            (
+                "接口地址",
+                self.cp_adapt_api_url_var,
+                "CP 后台列表接口，默认读取待适配 CP 信息表。",
+            ),
+            (
+                "X-Token",
+                self.cp_adapt_x_token_var,
+                "从浏览器开发者工具或 HAR 请求头复制；登录过期后需要更新。",
+            ),
+            (
+                "固定 token",
+                self.cp_adapt_token_var,
+                "后台接口固定 token 请求头，通常无需修改。",
+            ),
+            (
+                "适配人员",
+                self.cp_adapt_assign_var,
+                "筛选目标适配人，默认 rain。",
+            ),
+        ]
+        for label, var, help_text in source_rows:
+            row_frame = ttk.Frame(source_frame)
+            row_frame.pack(fill=tk.X, pady=4)
+            ttk.Label(row_frame, text=label + ":", width=15, anchor=tk.E).pack(
+                side=tk.LEFT, anchor=tk.N
+            )
+            field_frame = ttk.Frame(row_frame)
+            field_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+            ttk.Entry(field_frame, textvariable=var).pack(fill=tk.X)
+            ttk.Label(
+                field_frame,
+                text=help_text,
+                foreground="gray",
+                wraplength=640,
+                justify=tk.LEFT,
+            ).pack(fill=tk.X, pady=(2, 0))
 
         # --- 操作按钮 ---
-        action_frame = ttk.LabelFrame(parent, text="操作", padding=10)
+        action_frame = ttk.LabelFrame(content, text="操作", padding=10)
         action_frame.pack(fill=tk.X, **pad)
 
         btn_row = ttk.Frame(action_frame)
         btn_row.pack()
+        self._prefill_sync_btn = ttk.Button(
+            btn_row, text="⬇ 写入 Sheet 并同步", command=self._on_start_prefill_and_sync
+        )
+        self._prefill_sync_btn.pack(side=tk.LEFT, padx=3)
         self._sync_btn = ttk.Button(
-            btn_row, text="🔄 开始同步", command=self._on_start_sync
+            btn_row, text="🔄 仅同步 Asana", command=self._on_start_sync
         )
         self._sync_btn.pack(side=tk.LEFT, padx=3)
         self._sync_status = ttk.Label(btn_row, text="就绪", foreground="gray")
         self._sync_status.pack(side=tk.LEFT, padx=10)
 
         # --- 同步输出 ---
-        output_frame = ttk.LabelFrame(parent, text="同步输出", padding=5)
+        output_frame = ttk.LabelFrame(content, text="同步输出", padding=5)
         output_frame.pack(fill=tk.BOTH, expand=True, **pad)
 
         toolbar = ttk.Frame(output_frame)
@@ -386,7 +768,7 @@ class APKToolApp:
         self.sync_output = tk.Text(
             output_frame, wrap=tk.WORD, state=tk.DISABLED,
             font=("Menlo", 11), bg="#1e1e1e", fg="#d4d4d4",
-            insertbackground="white", height=10,
+            insertbackground="white", height=8,
         )
         sync_scrollbar = ttk.Scrollbar(output_frame, command=self.sync_output.yview)
         self.sync_output.configure(yscrollcommand=sync_scrollbar.set)
@@ -406,6 +788,7 @@ class APKToolApp:
         )
         if path:
             self.sa_file_var.set(path)
+            self._save_sync_settings()
 
     def _on_clear_sync_output(self):
         self.sync_output.configure(state=tk.NORMAL)
@@ -433,6 +816,7 @@ class APKToolApp:
         sa_file       = self.sa_file_var.get().strip()
         proxy_url     = self.proxy_url_var.get().strip()
         parent_gid    = self.parent_task_gid_var.get().strip()
+        self._save_sync_settings()
 
         # 基本校验
         missing = []
@@ -453,78 +837,203 @@ class APKToolApp:
         # 禁用按钮
         self._sync_running = True
         self._sync_btn.configure(state=tk.DISABLED)
+        self._prefill_sync_btn.configure(state=tk.DISABLED)
         self._sync_status.config(text="同步中...", foreground="#ffa726")
 
         def _run():
             import traceback
             try:
-                self.root.after(0, lambda: self._sync_log("=" * 50, "cmd"))
-                self.root.after(0, lambda: self._sync_log("  开始 Google Sheets → Asana 同步", "cmd"))
-                self.root.after(0, lambda: self._sync_log("=" * 50, "cmd"))
-                self.root.after(0, lambda: self._sync_log(f"  Sheet    : {sheet_id} / {sheet_name}", "info"))
-                self.root.after(0, lambda: self._sync_log(f"  Project  : {project_gid}", "info"))
-                self.root.after(0, lambda: self._sync_log(f"  SA 文件  : {sa_file}", "info"))
-                self.root.after(0, lambda: self._sync_log(f"  代理     : {proxy_url or '(无)'}", "info"))
-                self.root.after(0, lambda: self._sync_log("", "info"))
+                self._safe_after(0, lambda: self._sync_log("=" * 50, "cmd"))
+                self._safe_after(0, lambda: self._sync_log("  开始 Google Sheets → Asana 同步", "cmd"))
+                self._safe_after(0, lambda: self._sync_log("=" * 50, "cmd"))
+                self._safe_after(0, lambda: self._sync_log(f"  Sheet    : {sheet_id} / {sheet_name}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  Project  : {project_gid}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  SA 文件  : {sa_file}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  代理     : {proxy_url or '(无)'}", "info"))
+                self._safe_after(0, lambda: self._sync_log("", "info"))
 
                 # 1. 构建客户端
-                self.root.after(0, lambda: self._sync_log("[1/3] 初始化认证 ...", "cmd"))
+                self._safe_after(0, lambda: self._sync_log("[1/3] 初始化认证 ...", "cmd"))
                 gs_service, asana_client = build_sync_clients(
                     sa_file=sa_file,
                     asana_pat=asana_pat,
                     proxy_url=proxy_url or None,
                 )
-                self.root.after(0, lambda: self._sync_log("  认证通过 ✓", "done"))
+                self._safe_after(0, lambda: self._sync_log("  认证通过 ✓", "done"))
 
                 # 2. 执行同步
-                self.root.after(0, lambda: self._sync_log("[2/3] 执行同步 ...", "cmd"))
+                self._safe_after(0, lambda: self._sync_log("[2/3] 执行同步 ...", "cmd"))
                 result = sync_packages(
                     gs_service=gs_service,
                     asana_client=asana_client,
                     sheet_id=sheet_id,
                     project_gid=project_gid,
                     sheet_name=sheet_name,
+                    parent_task_gid=parent_gid or None,
                 )
 
                 # 3. 展示结果
-                self.root.after(0, lambda: self._sync_log("[3/3] 同步结果:", "cmd"))
-                self.root.after(0, lambda: self._sync_log(f"  Sheet 匹配日期 : {result['sheet_date']}", "info"))
-                self.root.after(0, lambda: self._sync_log(f"  Asana 区段名称 : {result['section_name']}", "info"))
-                self.root.after(0, lambda: self._sync_log(f"  Asana 区段 GID  : {result['section_gid']}", "info"))
-                self.root.after(0, lambda: self._sync_log(f"  Sheet 筛选包数 : {result['total_packages']}", "info"))
-                self.root.after(0, lambda: self._sync_log(f"  Asana 已有任务 : {result['existing_count']}", "info"))
-                self.root.after(0, lambda: self._sync_log(f"  本次新建任务   : {result['new_count']}", "done"))
-                self.root.after(0, lambda: self._sync_log(f"  本次回填链接   : {result['backfilled_count']}", "info"))
+                self._safe_after(0, lambda: self._sync_log("[3/3] 同步结果:", "cmd"))
+                self._safe_after(0, lambda: self._sync_log(f"  Sheet 匹配日期 : {result['sheet_date']}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  Asana 区段名称 : {result['section_name']}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  Asana 区段 GID  : {result['section_gid']}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  Sheet 筛选包数 : {result['total_packages']}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  Asana 已有任务 : {result['existing_count']}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  本次新建任务   : {result['new_count']}", "done"))
+                self._safe_after(0, lambda: self._sync_log(f"  本次写入描述   : {result['notes_updated_count']}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  本次回填链接   : {result['backfilled_count']}", "info"))
                 if result.get("backfill_skipped_reason"):
-                    self.root.after(0, lambda: self._sync_log(
+                    self._safe_after(0, lambda: self._sync_log(
                         f"  回填跳过原因   : {result['backfill_skipped_reason']}", "error"
                     ))
                 if result["created_gids"]:
-                    self.root.after(0, lambda: self._sync_log(
+                    self._safe_after(0, lambda: self._sync_log(
                         f"  新建任务 GIDs  : {', '.join(result['created_gids'])}", "info"
                     ))
-                self.root.after(0, lambda: self._sync_log("=" * 50, "cmd"))
+                self._safe_after(0, lambda: self._sync_log("=" * 50, "cmd"))
                 if result["new_count"] == 0:
-                    self.root.after(0, lambda: self._sync_log("✓ 幂等：无需新建任务，所有包名已存在。", "done"))
+                    self._safe_after(0, lambda: self._sync_log("✓ 幂等：无需新建任务，所有包名已存在。", "done"))
                 else:
-                    self.root.after(0, lambda: self._sync_log(
+                    self._safe_after(0, lambda: self._sync_log(
                         f"✓ 同步完成：新建 {result['new_count']} 个任务。", "done"
                     ))
-                self.root.after(0, lambda: self._sync_status.config(
+                self._safe_after(0, lambda: self._sync_status.config(
                     text=f"完成 — 新建 {result['new_count']} 个任务", foreground="#81c784"
                 ))
             except ImportError as e:
-                self.root.after(0, lambda: self._sync_log(
+                self._safe_after(0, lambda: self._sync_log(
                     f"缺少依赖: {e}\n请运行: pip install google-auth google-api-python-client asana", "error"
                 ))
-                self.root.after(0, lambda: self._sync_status.config(text="缺少依赖", foreground="#ef5350"))
+                self._safe_after(0, lambda: self._sync_status.config(text="缺少依赖", foreground="#ef5350"))
             except Exception as e:
-                self.root.after(0, lambda: self._sync_log(f"同步失败: {e}", "error"))
-                self.root.after(0, lambda: self._sync_log(traceback.format_exc(), "error"))
-                self.root.after(0, lambda: self._sync_status.config(text="同步失败", foreground="#ef5350"))
+                tb = traceback.format_exc()
+                self._safe_after(0, lambda e=e: self._sync_log(f"同步失败: {e}", "error"))
+                self._safe_after(0, lambda tb=tb: self._sync_log(tb, "error"))
+                self._safe_after(0, lambda: self._sync_status.config(text="同步失败", foreground="#ef5350"))
             finally:
-                self.root.after(0, lambda: self._sync_btn.configure(state=tk.NORMAL))
-                self.root.after(0, lambda: setattr(self, '_sync_running', False))
+                self._safe_after(0, lambda: self._sync_btn.configure(state=tk.NORMAL))
+                self._safe_after(0, lambda: self._prefill_sync_btn.configure(state=tk.NORMAL))
+                self._safe_after(0, lambda: setattr(self, '_sync_running', False))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_start_prefill_and_sync(self):
+        """先拉取 CP 后台数据写入 Sheet，再执行 Google Sheets → Asana 同步。"""
+        if self._sync_running:
+            self._sync_status.config(text="同步已在运行中", foreground="#ef5350")
+            return
+
+        sheet_id      = self.sheet_id_var.get().strip()
+        sheet_name    = self.sheet_name_var.get().strip()
+        project_gid   = self.project_gid_var.get().strip()
+        asana_pat     = self.asana_pat_var.get().strip()
+        sa_file       = self.sa_file_var.get().strip()
+        proxy_url     = self.proxy_url_var.get().strip()
+        parent_gid    = self.parent_task_gid_var.get().strip()
+        api_url       = self.cp_adapt_api_url_var.get().strip()
+        x_token       = self.cp_adapt_x_token_var.get().strip()
+        cp_token      = self.cp_adapt_token_var.get().strip()
+        assign        = self.cp_adapt_assign_var.get().strip() or "rain"
+        self._save_sync_settings()
+
+        missing = []
+        if not sheet_id: missing.append("Sheet ID")
+        if not project_gid: missing.append("Asana 项目 GID")
+        if not asana_pat: missing.append("Asana PAT")
+        if not sa_file: missing.append("SA 密钥文件")
+        if not api_url: missing.append("接口地址")
+        if not x_token: missing.append("X-Token")
+        if not cp_token: missing.append("固定 token")
+        if missing:
+            self._sync_log(f"配置缺失: {', '.join(missing)}", "error")
+            self._sync_status.config(text="配置不完整", foreground="#ef5350")
+            return
+
+        if not os.path.isfile(sa_file):
+            self._sync_log(f"SA 密钥文件不存在: {sa_file}", "error")
+            self._sync_status.config(text="SA 文件不存在", foreground="#ef5350")
+            return
+
+        self._sync_running = True
+        self._sync_btn.configure(state=tk.DISABLED)
+        self._prefill_sync_btn.configure(state=tk.DISABLED)
+        self._sync_status.config(text="写入 Sheet 并同步中...", foreground="#ffa726")
+
+        def _run():
+            import traceback
+            try:
+                self._safe_after(0, lambda: self._sync_log("=" * 50, "cmd"))
+                self._safe_after(0, lambda: self._sync_log("  开始 CP 后台 → Google Sheets → Asana 同步", "cmd"))
+                self._safe_after(0, lambda: self._sync_log("=" * 50, "cmd"))
+                self._safe_after(0, lambda: self._sync_log(f"  Sheet    : {sheet_id} / {sheet_name}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  Project  : {project_gid}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  CP 接口  : {api_url}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  筛选人员 : {assign}", "info"))
+                self._safe_after(0, lambda: self._sync_log("", "info"))
+
+                self._safe_after(0, lambda: self._sync_log("[1/4] 初始化认证 ...", "cmd"))
+                gs_service, asana_client = build_sync_clients(
+                    sa_file=sa_file,
+                    asana_pat=asana_pat,
+                    proxy_url=proxy_url or None,
+                )
+                self._safe_after(0, lambda: self._sync_log("  认证通过 ✓", "done"))
+
+                self._safe_after(0, lambda: self._sync_log("[2/4] 拉取 CP 后台并写入 Sheet ...", "cmd"))
+                prefill_result = sync_cp_adapt_records_to_sheet(
+                    gs_service=gs_service,
+                    sheet_id=sheet_id,
+                    sheet_name=sheet_name,
+                    api_url=api_url,
+                    x_token=x_token,
+                    token=cp_token,
+                    assign=assign,
+                )
+                self._safe_after(0, lambda: self._sync_log(
+                    f"  后台返回 {prefill_result['fetched_count']} / total={prefill_result['reported_total']} 条", "info"
+                ))
+                self._safe_after(0, lambda: self._sync_log(
+                    f"  Sheet 更新 {prefill_result['updated_count']} 行，追加 {prefill_result['appended_count']} 行", "done"
+                ))
+
+                self._safe_after(0, lambda: self._sync_log("[3/4] 执行 Asana 同步 ...", "cmd"))
+                result = sync_packages(
+                    gs_service=gs_service,
+                    asana_client=asana_client,
+                    sheet_id=sheet_id,
+                    project_gid=project_gid,
+                    sheet_name=sheet_name,
+                    parent_task_gid=parent_gid or None,
+                    notes_by_name=prefill_result.get("notes_by_name") or None,
+                )
+
+                self._safe_after(0, lambda: self._sync_log("[4/4] 同步结果:", "cmd"))
+                self._safe_after(0, lambda: self._sync_log(f"  Sheet 匹配日期 : {result['sheet_date']}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  Asana 区段名称 : {result['section_name']}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  Sheet 筛选包数 : {result['total_packages']}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  本次新建任务   : {result['new_count']}", "done"))
+                self._safe_after(0, lambda: self._sync_log(f"  本次写入描述   : {result['notes_updated_count']}", "info"))
+                self._safe_after(0, lambda: self._sync_log(f"  本次回填链接   : {result['backfilled_count']}", "info"))
+                self._safe_after(0, lambda: self._sync_log("=" * 50, "cmd"))
+                self._safe_after(0, lambda: self._sync_log("✓ 完整链路同步完成。", "done"))
+                self._safe_after(0, lambda: self._sync_status.config(
+                    text=f"完成 — 写入 {prefill_result['written_count']} 行，新建 {result['new_count']} 个任务",
+                    foreground="#81c784",
+                ))
+            except ImportError as e:
+                self._safe_after(0, lambda: self._sync_log(
+                    f"缺少依赖: {e}\n请运行: pip install google-auth google-api-python-client asana", "error"
+                ))
+                self._safe_after(0, lambda: self._sync_status.config(text="缺少依赖", foreground="#ef5350"))
+            except Exception as e:
+                tb = traceback.format_exc()
+                self._safe_after(0, lambda e=e: self._sync_log(f"同步失败: {e}", "error"))
+                self._safe_after(0, lambda tb=tb: self._sync_log(tb, "error"))
+                self._safe_after(0, lambda: self._sync_status.config(text="同步失败", foreground="#ef5350"))
+            finally:
+                self._safe_after(0, lambda: self._sync_btn.configure(state=tk.NORMAL))
+                self._safe_after(0, lambda: self._prefill_sync_btn.configure(state=tk.NORMAL))
+                self._safe_after(0, lambda: setattr(self, '_sync_running', False))
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -542,6 +1051,10 @@ class APKToolApp:
         notebook.add(adb_tab, text="ADB 指令")
         self._build_adb_tab(adb_tab)
 
+        action_script_tab = ttk.Frame(notebook)
+        notebook.add(action_script_tab, text="自动化脚本")
+        self._build_action_script_tab(action_script_tab)
+
         sync_tab = ttk.Frame(notebook)
         notebook.add(sync_tab, text="数据同步")
         self._build_sync_tab(sync_tab)
@@ -550,6 +1063,65 @@ class APKToolApp:
             self.root, text="就绪", relief=tk.SUNKEN, anchor=tk.W, padding=(6, 2)
         )
         self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
+
+    # ── 自动化脚本事件 ────────────────────────────────────────────
+
+    def _on_normalize_action_delays(self):
+        raw = self.action_script_text.get("1.0", tk.END).strip()
+        try:
+            following_delay_seconds = float(self.following_action_delay_var.get().strip())
+        except ValueError:
+            msg = "其余动作 delay 必须是数字"
+            self.action_script_status.config(text=msg, foreground="#ef5350")
+            self.status_label.config(text=msg)
+            return
+        if following_delay_seconds <= 0:
+            msg = "其余动作 delay 必须大于 0"
+            self.action_script_status.config(text=msg, foreground="#ef5350")
+            self.status_label.config(text=msg)
+            return
+
+        following_delay_ms = int(round(following_delay_seconds * 1000))
+        try:
+            normalized, stats = normalize_action_script_text(
+                raw,
+                min_delay_ms=following_delay_ms,
+            )
+        except json.JSONDecodeError as e:
+            msg = f"JSON 格式错误: 第 {e.lineno} 行第 {e.colno} 列"
+            self.action_script_status.config(text=msg, foreground="#ef5350")
+            self.status_label.config(text=msg)
+            return
+        except Exception as e:
+            msg = f"调整失败: {e}"
+            self.action_script_status.config(text=msg, foreground="#ef5350")
+            self.status_label.config(text=msg)
+            return
+
+        self.action_script_text.delete("1.0", tk.END)
+        self.action_script_text.insert("1.0", normalized)
+        msg = (
+            f"已调整 {stats['updated_count']} / {stats['delay_count']} 个 delay "
+            f"(首个 >= {stats['first_delay_ms']}ms，其余 >= {stats['min_delay_ms']}ms)"
+        )
+        self.action_script_status.config(text=msg, foreground="#81c784")
+        self.status_label.config(text=msg)
+
+    def _on_copy_action_script(self):
+        text = self.action_script_text.get("1.0", tk.END).strip()
+        if not text:
+            self.action_script_status.config(text="没有可复制的脚本", foreground="#ef5350")
+            self.status_label.config(text="没有可复制的脚本")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.action_script_status.config(text="已复制到剪贴板", foreground="#81c784")
+        self.status_label.config(text="脚本已复制到剪贴板")
+
+    def _on_clear_action_script(self):
+        self.action_script_text.delete("1.0", tk.END)
+        self.action_script_status.config(text="已清空", foreground="gray")
+        self.status_label.config(text="自动化脚本已清空")
 
     # ── 控制台输出 ────────────────────────────────────────────────
 
@@ -589,7 +1161,7 @@ class APKToolApp:
             btn.configure(state=state)
         # 超时保护：30 秒后强制恢复按钮，防止命令卡死导致按钮永久禁用
         if not enabled:
-            self.root.after(30000, lambda: self._set_buttons_state(True))
+            self._safe_after(30000, lambda: self._set_buttons_state(True))
 
     def _cmd_display(self, cmd: list[str]) -> str:
         """将命令转为可读显示，adb 用简写"""
@@ -604,15 +1176,15 @@ class APKToolApp:
         self._console_cmd(self._cmd_display(cmd))
         self._set_buttons_state(False)
         self.status_label.config(text="执行中...")
-        self.root.update()
+        self.root.update_idletasks()
 
         def on_line(line: str):
-            self.root.after(0, self._console_line, line)
+            self._safe_after(0, self._console_line, line)
 
         def on_done(returncode: int):
-            self.root.after(0, self._console_done, returncode)
-            self.root.after(0, self._set_buttons_state, True)
-            self.root.after(0, lambda: self.status_label.config(
+            self._safe_after(0, self._console_done, returncode)
+            self._safe_after(0, self._set_buttons_state, True)
+            self._safe_after(0, lambda: self.status_label.config(
                 text="执行成功" if returncode == 0 else f"执行失败 (exit={returncode})"
             ))
 
@@ -649,6 +1221,17 @@ class APKToolApp:
         except Exception as e:
             self.status_label.config(text=f"生成失败: {e}")
 
+    def _on_parse_fill_url(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            self.status_label.config(text="请输入要解析的 URL")
+            return
+        data = parse_fill_url(url)
+        if not data:
+            self.status_label.config(text="URL 中没有可回填的包名、AppId 或 GP 链接")
+            return
+        self._apply_fill_data(data)
+
     def _on_push_apk(self):
         path = self.url_entry.get().strip()
         if not path:
@@ -656,25 +1239,39 @@ class APKToolApp:
             return
 
         if path.startswith("http://") or path.startswith("https://"):
+            if is_apk_download_url(path):
+                self._start_download_install(path)
+                return
             self._open_url_on_device(path)
             return
 
-        if not os.path.isfile(path):
-            self.status_label.config(text="文件不存在，请检查路径")
+        if not os.path.isfile(path) and not os.path.isdir(path):
+            self.status_label.config(text="文件或目录不存在，请检查路径")
             return
 
         self.status_label.config(text="正在检查设备...")
-        self.root.update()
+        self.root.update_idletasks()
 
         if not check_device():
             self.status_label.config(text="没有已连接的设备")
             return
 
         self.status_label.config(text="正在安装...")
-        self.root.update()
+        self.root.update_idletasks()
 
         ok, msg = push_apk(path)
         self.status_label.config(text=msg)
+
+    def _start_download_install(self, url: str):
+        if not check_device():
+            self.status_label.config(text="没有已连接的设备")
+            return
+        self._set_buttons_state(False)
+        self.status_label.config(text="正在下载...")
+        self.root.update_idletasks()
+        threading.Thread(
+            target=self._do_apkcombo_download, args=(url,), daemon=True
+        ).start()
 
     def _open_url_on_device(self, url: str):
         adb = get_adb_path()
@@ -682,10 +1279,24 @@ class APKToolApp:
             self.status_label.config(text="未找到 ADB 工具，请点击「设置ADB」指定路径")
             return
         self.status_label.config(text="正在打开手机上的应用页面...")
-        self.root.update()
+        self.root.update_idletasks()
+        pkg = extract_google_play_package(url)
+        if pkg:
+            cmd = [
+                adb, "shell", "am", "start",
+                "-a", "android.intent.action.VIEW",
+                "-d", f"market://details?id={pkg}",
+                "-p", "com.android.vending",
+            ]
+        else:
+            cmd = [
+                adb, "shell", "am", "start",
+                "-a", "android.intent.action.VIEW",
+                "-d", url,
+            ]
         try:
             subprocess.run(
-                [adb, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url],
+                cmd,
                 capture_output=True, text=True, timeout=15
             )
             self.status_label.config(text="已在手机上打开页面，请在手机上完成下载安装")
@@ -698,8 +1309,16 @@ class APKToolApp:
             filetypes=[("APK/XAPK files", "*.apk *.xapk"), ("APK files", "*.apk"), ("XAPK files", "*.xapk"), ("All files", "*.*")]
         )
         if path:
-            self.url_entry.delete(0, tk.END)
-            self.url_entry.insert(0, path)
+            self._set_install_path(path)
+
+    def _on_browse_apk_dir(self):
+        path = filedialog.askdirectory(title="选择 APK 拆分目录")
+        if path:
+            self._set_install_path(path)
+
+    def _set_install_path(self, path: str):
+        self.url_entry.delete(0, tk.END)
+        self.url_entry.insert(0, path)
 
     def _on_set_adb(self):
         path = filedialog.askopenfilename(
@@ -715,46 +1334,40 @@ class APKToolApp:
         if not url:
             self.status_label.config(text="请输入 APKCombo 下载链接")
             return
-        if not check_device():
-            self.status_label.config(text="没有已连接的设备")
+
+        if os.path.isfile(url) or os.path.isdir(url):
+            self._on_push_apk()
             return
 
         # 如果是直链(.apk/.xapk) → 直接下载安装
-        if url.endswith(".apk") or url.endswith(".xapk"):
-            self._set_buttons_state(False)
-            self.status_label.config(text="正在下载...")
-            self.root.update()
-            threading.Thread(
-                target=self._do_apkcombo_download, args=(url,), daemon=True
-            ).start()
+        if url.startswith("http://") or url.startswith("https://"):
+            pkg_match = re.search(r"[?&]id=([^&]+)", url)
+            if pkg_match and not is_apk_download_url(url):
+                pkg = pkg_match.group(1)
+                import webbrowser
+                webbrowser.open(f"https://apkcombo.com/{pkg}/download/apk")
+                self.status_label.config(
+                    text="已在电脑浏览器打开 apkcombo，下载后选择 xapk 文件并点「推送安装」"
+                )
+                return
+            self._start_download_install(url)
             return
 
-        # Google Play 链接 → 在电脑浏览器打开 apkcombo 下载页
-        pkg_match = re.search(r"[?&]id=([^&]+)", url)
-        if pkg_match:
-            pkg = pkg_match.group(1)
-            import webbrowser
-            webbrowser.open(f"https://apkcombo.com/{pkg}/download/apk")
-            self.status_label.config(
-                text="已在电脑浏览器打开 apkcombo，下载后选择 xapk 文件并点「推送安装」"
-            )
-            return
-
-        self.status_label.config(text="无法识别链接格式，请粘贴 .apk/.xapk 直链或 Google Play 地址")
+        self.status_label.config(text="无法识别链接格式，请粘贴本地 APK/XAPK 路径、下载直链或 Google Play 地址")
 
     def _do_apkcombo_download(self, url):
         ok, msg = download_and_install(
             url,
-            on_progress=lambda pct, text: self.root.after(
+            on_progress=lambda pct, text: self._safe_after(
                 0, lambda: self.status_label.config(text=text)
             )
         )
-        self.root.after(0, lambda: self.status_label.config(
+        self._safe_after(0, lambda: self.status_label.config(
             text=f"安装{'成功' if ok else '失败'}: {msg}"
         ))
-        self.root.after(0, lambda: self._set_buttons_state(True))
+        self._safe_after(0, lambda: self._set_buttons_state(True))
         if ok:
-            self.root.after(0, lambda: self._console_line(f"[安装成功] {msg}", ""))
+            self._safe_after(0, lambda: self._console_line(f"[安装成功] {msg}", ""))
 
     def _on_apkpure_search(self):
         pkg = self.apkpure_pkg_entry.get().strip()
@@ -766,7 +1379,7 @@ class APKToolApp:
             return
 
         self.status_label.config(text="正在 APKPure 中搜索...")
-        self.root.update()
+        self.root.update_idletasks()
 
         adb = get_adb_path()
         # 在手机端串联执行：打开 APKPure → 等加载 → 触发搜索 → 输入包名 → 回车
@@ -783,6 +1396,50 @@ class APKToolApp:
         self._run_command(cmd)
 
     # ── ADB 指令事件 ──────────────────────────────────────────────
+
+    def _remember_path_setting(self, key: str, value: str):
+        self._settings[key] = value
+        try:
+            save_gui_settings(self._settings)
+        except OSError as e:
+            self.status_label.config(text=f"路径记忆保存失败: {e}")
+
+    def _sync_settings_map(self) -> dict[str, tk.StringVar]:
+        return {
+            "sync_sheet_id": self.sheet_id_var,
+            "sync_sheet_name": self.sheet_name_var,
+            "sync_project_gid": self.project_gid_var,
+            "sync_asana_pat": self.asana_pat_var,
+            "sync_sa_file": self.sa_file_var,
+            "sync_proxy_url": self.proxy_url_var,
+            "sync_parent_task_gid": self.parent_task_gid_var,
+            "sync_cp_adapt_api_url": self.cp_adapt_api_url_var,
+            "sync_cp_adapt_x_token": self.cp_adapt_x_token_var,
+            "sync_cp_adapt_token": self.cp_adapt_token_var,
+            "sync_cp_adapt_assign": self.cp_adapt_assign_var,
+        }
+
+    def _setup_sync_settings_memory(self):
+        for var in self._sync_settings_map().values():
+            var.trace_add("write", lambda *_args: self._schedule_sync_settings_save())
+
+    def _schedule_sync_settings_save(self):
+        if self._sync_settings_after_id:
+            try:
+                self.root.after_cancel(self._sync_settings_after_id)
+            except tk.TclError:
+                pass
+        self._sync_settings_after_id = self._safe_after(300, self._save_sync_settings)
+
+    def _save_sync_settings(self):
+        self._sync_settings_after_id = None
+        for key, var in self._sync_settings_map().items():
+            self._settings[key] = var.get()
+        try:
+            save_gui_settings(self._settings)
+        except OSError as e:
+            if hasattr(self, "status_label"):
+                self.status_label.config(text=f"同步配置记忆保存失败: {e}")
 
     def _on_load_config(self):
         config_path = self.config_path_var.get().strip()
@@ -850,11 +1507,13 @@ class APKToolApp:
         )
         if path:
             self.config_path_var.set(path)
+            self._remember_path_setting("config_path", path)
 
     def _on_browse_work_dir(self):
         path = filedialog.askdirectory(title="选择工作目录 (包含 zygote_build.sh)")
         if path:
             self.work_dir_var.set(path)
+            self._remember_path_setting("work_dir", path)
 
     def _on_cd_work_dir(self):
         """cd 到工作目录 —— 设定工作上下文"""
@@ -867,10 +1526,12 @@ class APKToolApp:
         self._console_cmd(f"cd {work_dir}")
         self._console_line(f"(当前工作目录已设定为: {work_dir})", "done")
         self.status_label.config(text=f"工作目录: {work_dir}")
+        self._remember_path_setting("work_dir", work_dir)
         # 尝试自动读取该目录下的 config.json
         cfg = os.path.join(work_dir, "config.json")
         if os.path.isfile(cfg):
             self.config_path_var.set(cfg)
+            self._remember_path_setting("config_path", cfg)
 
     def _on_push_config(self):
         if not check_device():
@@ -881,6 +1542,13 @@ class APKToolApp:
             self.status_label.config(text=f"文件不存在: {config_path}")
             return
         cmd = build_push_config_cmd(config_path)
+        self._run_command(cmd)
+
+    def _on_fix_zygotehole_permissions(self):
+        if not check_device():
+            self.status_label.config(text="没有已连接的设备")
+            return
+        cmd = build_fix_zygotehole_permissions_cmd()
         self._run_command(cmd)
 
     def _on_zygote_build(self):
@@ -907,19 +1575,19 @@ class APKToolApp:
         cmd = build_get_uid_cmd(pkg)
 
         def on_line(line: str):
-            self.root.after(0, self._console_line, line)
-            for m in re.finditer(r"userId=(\d+)", line):
-                uid = m.group(1)
-                self.root.after(0, lambda u=uid: self._set_uid(u))
+            self._safe_after(0, self._console_line, line)
+            uid = extract_uid_from_dumpsys(line)
+            if uid:
+                self._safe_after(0, lambda u=uid: self._set_uid(u))
 
         self._console_cmd(self._cmd_display(cmd))
         self._set_buttons_state(False)
         self.status_label.config(text="查询 UID...")
-        self.root.update()
+        self.root.update_idletasks()
 
         def on_done(returncode: int):
-            self.root.after(0, self._console_done, returncode)
-            self.root.after(0, self._set_buttons_state, True)
+            self._safe_after(0, self._console_done, returncode)
+            self._safe_after(0, self._set_buttons_state, True)
 
         run_stream(cmd, on_line, on_done)
 
@@ -1029,7 +1697,7 @@ class APKToolApp:
                     if self._logcat_proc is None:
                         break
                     if pattern in line:
-                        self.root.after(0, self._console_line, line.rstrip())
+                        self._safe_after(0, self._console_line, line.rstrip())
             except Exception:
                 pass
 
@@ -1065,15 +1733,15 @@ class APKToolApp:
 
         def _run():
             result = extract_logcat_fields()
-            self.root.after(0, lambda: self._show_fields_popup(result))
-            self.root.after(0, lambda: self._set_buttons_state(True))
+            self._safe_after(0, lambda: self._show_fields_popup(result))
+            self._safe_after(0, lambda: self._set_buttons_state(True))
             if not result.get("ok"):
-                self.root.after(0, lambda: self._console_line(
+                self._safe_after(0, lambda: self._console_line(
                     f"[提取失败] {result.get('error', '未知错误')}", "error"
                 ))
             else:
                 sdk_count = len(result.get("SDK列表", []))
-                self.root.after(0, lambda: self._console_line(
+                self._safe_after(0, lambda: self._console_line(
                     f"[提取完成] SDK:{sdk_count}个 | 判断:{result.get('最终判断','')}",
                     "done"
                 ))
@@ -1092,8 +1760,8 @@ class APKToolApp:
         # 创建弹窗
         popup = tk.Toplevel(self.root)
         popup.title("🔍 聚合参数提取结果")
-        popup.geometry("700x600")
-        popup.minsize(600, 480)
+        popup.geometry("920x720")
+        popup.minsize(760, 620)
         popup.resizable(True, True)
         popup.configure(bg="#ffffff")
         popup.transient(self.root)
@@ -1110,18 +1778,25 @@ class APKToolApp:
             ("归因平台", data.get("归因平台", "")),
         ]
 
-        canvas = tk.Canvas(popup, bg="#ffffff", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(popup, orient="vertical", command=canvas.yview)
+        content_frame = ttk.Frame(popup)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(content_frame, bg="#ffffff", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(content_frame, orient="vertical", command=canvas.yview)
         scroll_frame = ttk.Frame(canvas)
+        canvas_window = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
 
         scroll_frame.bind(
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.bind(
+            "<Configure>",
+            lambda e: canvas.itemconfigure(canvas_window, width=e.width)
+        )
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=16, pady=12)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=16, pady=(12, 8))
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         def _add_row(parent, label, value, copy_text=None):
@@ -1131,7 +1806,8 @@ class APKToolApp:
             lbl.pack(side=tk.LEFT, padx=(0, 8))
             if value:
                 val_label = tk.Label(row_frame, text=value, anchor=tk.W,
-                                     font=("Menlo", 11), fg="#333333", bg="#ffffff")
+                                     font=("Menlo", 11), fg="#333333", bg="#ffffff",
+                                     wraplength=620, justify=tk.LEFT)
                 val_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 if copy_text:
                     ttk.Button(row_frame, text="复制",
@@ -1167,8 +1843,8 @@ class APKToolApp:
         raw_text.pack(fill=tk.BOTH, expand=True)
 
         # 底部按钮
-        btn_frame = ttk.Frame(scroll_frame)
-        btn_frame.pack(fill=tk.X, pady=(12, 0))
+        btn_frame = ttk.Frame(popup, padding=(16, 8, 16, 12))
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
         ttk.Button(
             btn_frame, text="📋 一键复制全部",
@@ -1176,22 +1852,24 @@ class APKToolApp:
         ).pack(side=tk.LEFT, padx=2)
 
         ttk.Button(
+            btn_frame, text="🔗 跳转后台",
+            command=lambda: self._open_backend_url(data)
+        ).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(
             btn_frame, text="关闭",
             command=popup.destroy
         ).pack(side=tk.RIGHT, padx=2)
 
-    @staticmethod
-    def _copy_to_clipboard(text: str):
+    def _copy_to_clipboard(self, text: str):
         """复制到剪贴板"""
-        root = tk.Tk()
-        root.withdraw()
-        root.clipboard_clear()
-        root.clipboard_append(text)
-        root.update()
-        root.destroy()
+        if self._closing or not self._root_exists():
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
 
-    @staticmethod
-    def _copy_all_fields(data: dict):
+    def _copy_all_fields(self, data: dict):
         """复制全部字段（格式化，含 SDK 名称前缀）"""
         lines = [
             f"最终判断:{data.get('最终判断', '')}",
@@ -1208,9 +1886,15 @@ class APKToolApp:
             f"归因平台:{data.get('归因平台', '')}",
         ]
         text = "\n".join(lines)
-        root = tk.Tk()
-        root.withdraw()
-        root.clipboard_clear()
-        root.clipboard_append(text)
-        root.update()
-        root.destroy()
+        self._copy_to_clipboard(text)
+
+    def _open_backend_url(self, data: dict):
+        """构造后台 URL 并在浏览器打开，自动填写适配信息"""
+        import webbrowser
+        pkg = self.pkg_entry.get().strip()
+        if not pkg:
+            self.status_label.config(text="请先在「配置」中填写包名")
+            return
+        url = build_backend_url(data, pkg)
+        webbrowser.open(url)
+        self.status_label.config(text="已在浏览器打开后台页面，请确认信息后提交")

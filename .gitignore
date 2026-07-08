@@ -1,10 +1,38 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+auto_asana/.venv/
+
+# macOS
+.DS_Store
+
+# Build outputs
 build/
 dist/
-*.spec
-__pycache__/
-.DS_Store
+*.egg-info/
+
+# Runtime logs
 *.log
-*.har
+
+# Local app state
+gui_settings.json
+
+# Local Claude settings
 .claude/
-ip_whitelist.json
-auto_asana/
+auto_asana/.claude/
+.claude/settings.local.json
+auto_asana/.claude/settings.local.json
+
+# HTTP captures
+*.har
+
+# Temporary files
+*.tmp
+*.temp
