@@ -407,7 +407,7 @@ def get_adb_path() -> str | None:
     return None
 
 
-def _run_adb(args: list[str]) -> subprocess.CompletedProcess:
+def _run_adb(args: list[str], timeout: float = 8) -> subprocess.CompletedProcess:
     adb = get_adb_path()
     if not adb:
         raise FileNotFoundError("adb")
@@ -417,24 +417,25 @@ def _run_adb(args: list[str]) -> subprocess.CompletedProcess:
         text=True,
         encoding="utf-8",
         errors="replace",
+        timeout=timeout,
     )
 
 
 def check_device() -> bool:
     try:
-        result = _run_adb(["devices"])
+        result = _run_adb(["devices"], timeout=3)
         lines = result.stdout.strip().split("\n")[1:]
         return any("\tdevice" in line for line in lines)
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
 
 def get_device_list() -> list[str]:
     try:
-        result = _run_adb(["devices"])
+        result = _run_adb(["devices"], timeout=3)
         lines = result.stdout.strip().split("\n")[1:]
         return [line.split("\t")[0] for line in lines if "\tdevice" in line]
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
 
 
@@ -686,7 +687,10 @@ def get_app_uid(package_name: str) -> tuple[bool, str]:
     if not package_name.strip():
         return False, "请输入包名"
     try:
-        result = _run_adb(["shell", "dumpsys", "package", package_name.strip()])
+        result = _run_adb(
+            ["shell", "dumpsys", "package", package_name.strip()],
+            timeout=10,
+        )
         output = result.stdout
         uid = extract_uid_from_dumpsys(output, package_name.strip())
         if uid:
@@ -694,6 +698,8 @@ def get_app_uid(package_name: str) -> tuple[bool, str]:
         return False, f"未找到包名 {package_name} 的 UID，请确认应用已安装"
     except FileNotFoundError:
         return False, "未找到 ADB 工具"
+    except subprocess.TimeoutExpired:
+        return False, "查询 UID 超时，请检查设备连接或 ADB 状态"
 
 
 def clear_app_cache(package_name: str) -> tuple[bool, str]:
@@ -701,13 +707,15 @@ def clear_app_cache(package_name: str) -> tuple[bool, str]:
     if not package_name.strip():
         return False, "请输入包名"
     try:
-        result = _run_adb(["shell", "pm", "clear", package_name.strip()])
+        result = _run_adb(["shell", "pm", "clear", package_name.strip()], timeout=20)
         output = (result.stdout + result.stderr).strip()
         if result.returncode == 0 and "Success" in output:
             return True, f"缓存清除成功\n{output}"
         return False, f"清除失败\n{output}"
     except FileNotFoundError:
         return False, "未找到 ADB 工具"
+    except subprocess.TimeoutExpired:
+        return False, "清除缓存超时，请检查设备连接或应用状态"
 
 
 def force_stop_app(package_name: str) -> tuple[bool, str]:
@@ -715,12 +723,14 @@ def force_stop_app(package_name: str) -> tuple[bool, str]:
     if not package_name.strip():
         return False, "请输入包名"
     try:
-        result = _run_adb(["shell", "am", "force-stop", package_name.strip()])
+        result = _run_adb(["shell", "am", "force-stop", package_name.strip()], timeout=15)
         if result.returncode == 0:
             return True, f"已强制停止 {package_name}"
         return False, f"停止失败: {result.stderr.strip()}"
     except FileNotFoundError:
         return False, "未找到 ADB 工具"
+    except subprocess.TimeoutExpired:
+        return False, "强制停止超时，请检查设备连接"
 
 
 def logcat_dump(filter_pattern: str, uid: str | None = None) -> tuple[bool, str]:
@@ -796,6 +806,7 @@ def run_stream(cmd: list[str], on_line, on_done, cwd=None, timeout=None):
                 # 看门狗：超时后强制杀进程
                 def _kill():
                     if proc and proc.poll() is None:
+                        on_line(f"[超时] 命令超过 {timeout} 秒未结束，已终止")
                         proc.kill()
                 timer = threading.Timer(timeout, _kill)
                 timer.start()

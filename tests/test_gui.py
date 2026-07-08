@@ -2,6 +2,36 @@ import pytest
 from unittest.mock import patch, MagicMock
 import tkinter as tk
 import json
+import time
+
+
+def wait_until(predicate, root=None, timeout=1.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if root is not None:
+            try:
+                root.update()
+            except tk.TclError:
+                pass
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class ImmediateThread:
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+        self.daemon = daemon
+
+    def start(self):
+        if self._target:
+            self._target(*self._args, **self._kwargs)
+
+    def join(self, timeout=None):
+        return None
 
 
 class TestAppInit:
@@ -255,7 +285,9 @@ class TestPushApkAction:
                 mock_run.return_value.returncode = 0
                 app = APKToolApp(root)
                 app.url_entry.insert(0, "https://play.google.com/store/apps/details?id=com.test.app")
-                app._on_push_apk()
+                with patch("gui.threading.Thread", ImmediateThread):
+                    app._on_push_apk()
+                root.update()
                 cmd = mock_run.call_args.args[0]
                 assert "market://details?id=com.test.app" in cmd
                 assert "com.android.vending" in cmd
@@ -310,7 +342,9 @@ class TestPushApkAction:
                 mock_isdir.return_value = True
                 app = APKToolApp(root)
                 app.url_entry.insert(0, "/tmp/split-apks")
-                app._on_push_apk()
+                with patch("gui.threading.Thread", ImmediateThread):
+                    app._on_push_apk()
+                root.update()
                 mock_push.assert_called_once_with("/tmp/split-apks")
                 assert "安装成功" in app.status_label.cget("text")
         finally:
@@ -331,7 +365,9 @@ class TestPushApkAction:
                 mock_isdir.return_value = False
                 app = APKToolApp(root)
                 app.url_entry.insert(0, "/tmp/app.xapk")
-                app._on_apkcombo_download()
+                with patch("gui.threading.Thread", ImmediateThread):
+                    app._on_apkcombo_download()
+                root.update()
                 mock_push.assert_called_once_with("/tmp/app.xapk")
                 assert "安装成功" in app.status_label.cget("text")
         finally:
@@ -461,7 +497,9 @@ class TestAdbCommandActions:
                 app._on_zygote_build()
 
                 mock_build.assert_called_once_with(str(work_dir))
-                mock_run.assert_called_once_with(expected_cmd, cwd=str(work_dir))
+                mock_run.assert_called_once_with(
+                    expected_cmd, cwd=str(work_dir), timeout=180
+                )
         finally:
             root.destroy()
 

@@ -114,6 +114,10 @@ class APKToolApp:
         self._after_ids: set[str] = set()
         self._settings = load_gui_settings()
         self._sync_settings_after_id: str | None = None
+        self._command_state_token = 0
+        self._button_restore_after_id: str | None = None
+        self._console_line_count = 0
+        self._console_max_lines = 1200
 
         # ── 数据同步配置 ──
         self.sheet_id_var = tk.StringVar(
@@ -1129,6 +1133,8 @@ class APKToolApp:
         """输出命令提示符"""
         self.output_text.configure(state=tk.NORMAL)
         self.output_text.insert(tk.END, f"$ {text}\n", "cmd")
+        self._console_line_count += 1
+        self._trim_console_if_needed()
         self.output_text.see(tk.END)
         self.output_text.configure(state=tk.DISABLED)
 
@@ -1136,6 +1142,8 @@ class APKToolApp:
         """实时追加一行"""
         self.output_text.configure(state=tk.NORMAL)
         self.output_text.insert(tk.END, text + "\n", tag)
+        self._console_line_count += 1
+        self._trim_console_if_needed()
         self.output_text.see(tk.END)
         self.output_text.configure(state=tk.DISABLED)
 
@@ -1144,24 +1152,60 @@ class APKToolApp:
         msg = f"[完成, exit={returncode}]\n"
         self.output_text.configure(state=tk.NORMAL)
         self.output_text.insert(tk.END, msg, tag)
+        self._console_line_count += 1
+        self._trim_console_if_needed()
         self.output_text.see(tk.END)
         self.output_text.configure(state=tk.DISABLED)
 
     def _on_clear_output(self):
         self.output_text.configure(state=tk.NORMAL)
         self.output_text.delete("1.0", tk.END)
+        self._console_line_count = 0
         self.output_text.configure(state=tk.DISABLED)
+
+    def _trim_console_if_needed(self):
+        """限制控制台文本体积，避免长时间 logcat 后 Tk Text 变慢。"""
+        if self._console_line_count <= self._console_max_lines:
+            return
+        try:
+            total_lines = int(self.output_text.index("end-1c").split(".")[0])
+        except (tk.TclError, ValueError):
+            return
+        if total_lines <= self._console_max_lines:
+            self._console_line_count = total_lines
+            return
+        delete_to = max(1, total_lines - self._console_max_lines + 1)
+        self.output_text.delete("1.0", f"{delete_to}.0")
+        self._console_line_count = self._console_max_lines
 
     # ── 通用命令执行 ──────────────────────────────────────────────
 
-    def _set_buttons_state(self, enabled: bool):
+    def _set_buttons_state(self, enabled: bool, token: int | None = None,
+                           auto_restore_ms: int = 45000):
+        if token is not None and token != self._command_state_token:
+            return
         self._running_command = not enabled
         state = tk.NORMAL if enabled else tk.DISABLED
         for btn in self._op_buttons:
             btn.configure(state=state)
-        # 超时保护：30 秒后强制恢复按钮，防止命令卡死导致按钮永久禁用
+
+        if self._button_restore_after_id:
+            try:
+                self.root.after_cancel(self._button_restore_after_id)
+            except tk.TclError:
+                pass
+            finally:
+                self._after_ids.discard(self._button_restore_after_id)
+                self._button_restore_after_id = None
+
         if not enabled:
-            self._safe_after(30000, lambda: self._set_buttons_state(True))
+            self._command_state_token += 1
+            token = self._command_state_token
+            self._button_restore_after_id = self._safe_after(
+                auto_restore_ms,
+                lambda t=token: self._set_buttons_state(True, token=t),
+            )
+        return self._command_state_token
 
     def _cmd_display(self, cmd: list[str]) -> str:
         """将命令转为可读显示，adb 用简写"""
@@ -1171,10 +1215,13 @@ class APKToolApp:
             result = result.replace(adb_path, "adb")
         return result
 
-    def _run_command(self, cmd: list[str], cwd=None):
+    def _run_command(self, cmd: list[str], cwd=None, timeout: int = 45):
         """在控制台中显示命令并流式执行"""
         self._console_cmd(self._cmd_display(cmd))
-        self._set_buttons_state(False)
+        token = self._set_buttons_state(
+            False,
+            auto_restore_ms=(timeout + 5) * 1000 if timeout else 60000,
+        )
         self.status_label.config(text="执行中...")
         self.root.update_idletasks()
 
@@ -1183,12 +1230,12 @@ class APKToolApp:
 
         def on_done(returncode: int):
             self._safe_after(0, self._console_done, returncode)
-            self._safe_after(0, self._set_buttons_state, True)
+            self._safe_after(0, self._set_buttons_state, True, token)
             self._safe_after(0, lambda: self.status_label.config(
                 text="执行成功" if returncode == 0 else f"执行失败 (exit={returncode})"
             ))
 
-        run_stream(cmd, on_line, on_done, cwd=cwd)
+        run_stream(cmd, on_line, on_done, cwd=cwd, timeout=timeout)
 
     def _maybe_auto_uid(self):
         """如果没有缓存 UID，尝试自动获取"""
@@ -1252,15 +1299,19 @@ class APKToolApp:
         self.status_label.config(text="正在检查设备...")
         self.root.update_idletasks()
 
-        if not check_device():
-            self.status_label.config(text="没有已连接的设备")
-            return
+        def _run_install():
+            if not check_device():
+                self._safe_after(0, lambda: self.status_label.config(text="没有已连接的设备"))
+                return
+            self._safe_after(0, lambda: self.status_label.config(text="正在安装..."))
+            ok, msg = push_apk(path)
+            self._safe_after(0, lambda: self.status_label.config(text=msg))
+            if ok:
+                self._safe_after(0, lambda: self._console_line(f"[安装成功] {msg}", "done"))
+            else:
+                self._safe_after(0, lambda: self._console_line(f"[安装失败] {msg}", "error"))
 
-        self.status_label.config(text="正在安装...")
-        self.root.update_idletasks()
-
-        ok, msg = push_apk(path)
-        self.status_label.config(text=msg)
+        threading.Thread(target=_run_install, daemon=True).start()
 
     def _start_download_install(self, url: str):
         if not check_device():
@@ -1280,28 +1331,34 @@ class APKToolApp:
             return
         self.status_label.config(text="正在打开手机上的应用页面...")
         self.root.update_idletasks()
-        pkg = extract_google_play_package(url)
-        if pkg:
-            cmd = [
-                adb, "shell", "am", "start",
-                "-a", "android.intent.action.VIEW",
-                "-d", f"market://details?id={pkg}",
-                "-p", "com.android.vending",
-            ]
-        else:
-            cmd = [
-                adb, "shell", "am", "start",
-                "-a", "android.intent.action.VIEW",
-                "-d", url,
-            ]
-        try:
-            subprocess.run(
-                cmd,
-                capture_output=True, text=True, timeout=15
-            )
-            self.status_label.config(text="已在手机上打开页面，请在手机上完成下载安装")
-        except subprocess.TimeoutExpired:
-            self.status_label.config(text="操作超时，请重试")
+
+        def _run_open():
+            pkg = extract_google_play_package(url)
+            if pkg:
+                cmd = [
+                    adb, "shell", "am", "start",
+                    "-a", "android.intent.action.VIEW",
+                    "-d", f"market://details?id={pkg}",
+                    "-p", "com.android.vending",
+                ]
+            else:
+                cmd = [
+                    adb, "shell", "am", "start",
+                    "-a", "android.intent.action.VIEW",
+                    "-d", url,
+                ]
+            try:
+                subprocess.run(
+                    cmd,
+                    capture_output=True, text=True, timeout=15
+                )
+                self._safe_after(0, lambda: self.status_label.config(
+                    text="已在手机上打开页面，请在手机上完成下载安装"
+                ))
+            except subprocess.TimeoutExpired:
+                self._safe_after(0, lambda: self.status_label.config(text="操作超时，请重试"))
+
+        threading.Thread(target=_run_open, daemon=True).start()
 
     def _on_browse(self):
         path = filedialog.askopenfilename(
@@ -1561,7 +1618,7 @@ class APKToolApp:
             self.status_label.config(text=f"脚本不存在: {script_path}")
             return
         cmd = build_zygote_build_cmd(work_dir)
-        self._run_command(cmd, cwd=work_dir)
+        self._run_command(cmd, cwd=work_dir, timeout=180)
 
     def _on_get_uid(self):
         if not check_device():
@@ -1581,15 +1638,15 @@ class APKToolApp:
                 self._safe_after(0, lambda u=uid: self._set_uid(u))
 
         self._console_cmd(self._cmd_display(cmd))
-        self._set_buttons_state(False)
+        token = self._set_buttons_state(False, auto_restore_ms=50000)
         self.status_label.config(text="查询 UID...")
         self.root.update_idletasks()
 
         def on_done(returncode: int):
             self._safe_after(0, self._console_done, returncode)
-            self._safe_after(0, self._set_buttons_state, True)
+            self._safe_after(0, self._set_buttons_state, True, token)
 
-        run_stream(cmd, on_line, on_done)
+        run_stream(cmd, on_line, on_done, timeout=45)
 
     def _set_uid(self, uid: str):
         self._cached_uid = uid
@@ -1727,14 +1784,14 @@ class APKToolApp:
             self.status_label.config(text="没有已连接的设备")
             return
 
-        self._set_buttons_state(False)
+        token = self._set_buttons_state(False, auto_restore_ms=50000)
         self.status_label.config(text="正在提取聚合参数...")
         self._console_cmd("adb logcat -d | grep ZGSDK.AutoDetector (字段提取)")
 
         def _run():
             result = extract_logcat_fields()
             self._safe_after(0, lambda: self._show_fields_popup(result))
-            self._safe_after(0, lambda: self._set_buttons_state(True))
+            self._safe_after(0, lambda: self._set_buttons_state(True, token))
             if not result.get("ok"):
                 self._safe_after(0, lambda: self._console_line(
                     f"[提取失败] {result.get('error', '未知错误')}", "error"
