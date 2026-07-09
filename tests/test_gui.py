@@ -569,6 +569,7 @@ class TestActionDelayTool:
 
                 with patch("gui.check_device", return_value=True), \
                      patch("gui.list_third_party_packages", return_value=["com.keep", "com.remove"]), \
+                     patch("gui.save_gui_settings"), \
                      patch.object(app, "_console_line") as mock_line, \
                      patch("gui.threading.Thread", ImmediateThread):
                     app._on_preview_third_party_cleanup()
@@ -592,6 +593,7 @@ class TestActionDelayTool:
                      patch("gui.list_third_party_packages", return_value=["com.keep", "com.remove"]), \
                      patch("gui.messagebox.askyesno", return_value=True) as mock_confirm, \
                      patch("gui.build_bulk_uninstall_cmd", return_value=expected_cmd) as mock_build, \
+                     patch("gui.save_gui_settings"), \
                      patch.object(app, "_run_command") as mock_run, \
                      patch("gui.threading.Thread", ImmediateThread):
                     app._on_cleanup_third_party_packages()

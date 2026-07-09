@@ -11,6 +11,9 @@ import copy
 
 DEFAULT_KEEP_THIRD_PARTY_PACKAGES = [
     "com.github.kr328.clash",
+    "com.google.android.contactkeys",
+    "com.google.android.safetycore",
+    "com.google.ar.core",
     "org.telegram.messenger",
 ]
 
