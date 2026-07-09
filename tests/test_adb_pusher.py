@@ -121,6 +121,25 @@ class TestApkDownloadUrl:
 
 
 class TestAdbCommandBuilders:
+    def test_packages_to_uninstall_keeps_whitelisted_packages(self):
+        from adb_pusher import packages_to_uninstall
+
+        assert packages_to_uninstall(
+            ["com.keep", "com.remove", "com.other"],
+            ["com.keep", "com.other"],
+        ) == ["com.remove"]
+
+    def test_build_bulk_uninstall_cmd_filters_invalid_package_names(self):
+        from adb_pusher import build_bulk_uninstall_cmd
+
+        with patch("adb_pusher.get_adb_path", return_value="/usr/bin/adb"):
+            cmd = build_bulk_uninstall_cmd(["com.good.app", "bad name", "org.ok"])
+
+        assert cmd[:4] == ["/usr/bin/adb", "shell", "sh", "-c"]
+        assert "pm uninstall com.good.app" in cmd[4]
+        assert "pm uninstall org.ok" in cmd[4]
+        assert "bad name" not in cmd[4]
+
     def test_build_fix_zygotehole_permissions_cmd(self):
         from adb_pusher import build_fix_zygotehole_permissions_cmd
 

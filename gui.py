@@ -6,7 +6,7 @@ import time
 import traceback
 import urllib.request
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 from PIL import Image, ImageTk
 import os
@@ -33,12 +33,14 @@ from adb_pusher import (
     run_stream, cmd_to_str, clear_logcat_buffer,
     build_push_config_cmd, build_fix_zygotehole_permissions_cmd, build_zygote_build_cmd,
     build_get_uid_cmd, build_clear_cache_cmd, build_force_stop_cmd,
-    build_open_app_cmd, build_logcat_cmd,
+    build_open_app_cmd, build_logcat_cmd, build_bulk_uninstall_cmd,
+    list_third_party_packages, packages_to_uninstall,
     extract_logcat_fields, download_and_install,
     build_backend_url, extract_uid_from_dumpsys, parse_fill_url,
     extract_google_play_package, is_apk_download_url,
     normalize_action_script_text,
     DEFAULT_FOLLOWING_ACTION_MIN_DELAY_MS,
+    DEFAULT_KEEP_THIRD_PARTY_PACKAGES,
 )
 
 CONFIG_DEFAULT = os.path.expanduser(
@@ -166,6 +168,13 @@ class APKToolApp:
         self.work_dir_var = tk.StringVar(
             value=get_remembered_path(self._settings, "work_dir", WORK_DIR_DEFAULT)
         )
+        self.cleanup_keep_packages_var = tk.StringVar(
+            value=get_remembered_text(
+                self._settings,
+                "cleanup_keep_packages",
+                ", ".join(DEFAULT_KEEP_THIRD_PARTY_PACKAGES),
+            )
+        )
 
         self._build_ui()
         self._setup_sync_settings_memory()
@@ -187,7 +196,7 @@ class APKToolApp:
     def _root_exists(self) -> bool:
         try:
             return bool(self.root.winfo_exists())
-        except tk.TclError:
+        except (tk.TclError, RuntimeError):
             return False
 
     def _safe_after(self, delay_ms: int, callback, *args):
@@ -494,6 +503,32 @@ class APKToolApp:
             b = ttk.Button(btn_row2, text=text, command=cmd)
             b.pack(side=tk.LEFT, padx=2)
             self._op_buttons.append(b)
+
+        cleanup_frame = ttk.LabelFrame(parent, text="第三方包清理", padding=10)
+        cleanup_frame.pack(fill=tk.X, **pad)
+
+        cleanup_row = ttk.Frame(cleanup_frame)
+        cleanup_row.pack(fill=tk.X, pady=2)
+        ttk.Label(cleanup_row, text="保留包名:").pack(side=tk.LEFT)
+        self.cleanup_keep_entry = ttk.Entry(
+            cleanup_row, textvariable=self.cleanup_keep_packages_var
+        )
+        self.cleanup_keep_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        cleanup_btn_row = ttk.Frame(cleanup_frame)
+        cleanup_btn_row.pack(fill=tk.X, pady=(6, 0))
+        for text, cmd in [
+            ("预览清理", self._on_preview_third_party_cleanup),
+            ("一键清理第三方包", self._on_cleanup_third_party_packages),
+        ]:
+            b = ttk.Button(cleanup_btn_row, text=text, command=cmd)
+            b.pack(side=tk.LEFT, padx=2)
+            self._op_buttons.append(b)
+        ttk.Label(
+            cleanup_btn_row,
+            text="当前包名输入框里的包会自动保留",
+            foreground="gray",
+        ).pack(side=tk.LEFT, padx=8)
 
         # --- Logcat 区域 ---
         logcat_frame = ttk.LabelFrame(parent, text="Logcat 实时监听", padding=10)
@@ -1461,6 +1496,13 @@ class APKToolApp:
         except OSError as e:
             self.status_label.config(text=f"路径记忆保存失败: {e}")
 
+    def _remember_cleanup_keep_packages(self):
+        self._settings["cleanup_keep_packages"] = self.cleanup_keep_packages_var.get()
+        try:
+            save_gui_settings(self._settings)
+        except OSError as e:
+            self.status_label.config(text=f"清理白名单保存失败: {e}")
+
     def _sync_settings_map(self) -> dict[str, tk.StringVar]:
         return {
             "sync_sheet_id": self.sheet_id_var,
@@ -1693,6 +1735,96 @@ class APKToolApp:
             return
         cmd = build_clear_cache_cmd("com.android.vending")
         self._run_command(cmd)
+
+    def _cleanup_keep_packages(self) -> list[str]:
+        raw = self.cleanup_keep_packages_var.get()
+        packages = [
+            item.strip()
+            for item in re.split(r"[\s,，;；]+", raw)
+            if item.strip()
+        ]
+        current_pkg = self.pkg_entry.get().strip()
+        if current_pkg:
+            packages.append(current_pkg)
+        return sorted(set(packages))
+
+    def _load_third_party_cleanup_plan(self, on_done):
+        keep = self._cleanup_keep_packages()
+        self._remember_cleanup_keep_packages()
+        self.status_label.config(text="正在扫描第三方应用...")
+        self._console_cmd("adb shell pm list packages -3")
+        token = self._set_buttons_state(False, auto_restore_ms=90000)
+
+        def _run():
+            try:
+                installed = list_third_party_packages()
+                targets = packages_to_uninstall(installed, keep)
+                self._safe_after(0, on_done, installed, keep, targets, token)
+            except Exception as e:
+                self._safe_after(0, self._console_line, f"[扫描失败] {e}", "error")
+                self._safe_after(0, self._set_buttons_state, True, token)
+                self._safe_after(0, lambda: self.status_label.config(text=f"扫描失败: {e}"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_preview_third_party_cleanup(self):
+        if not check_device():
+            self.status_label.config(text="没有已连接的设备")
+            return
+
+        def _show_preview(installed, keep, targets, token):
+            self._console_line(
+                f"[清理预览] 第三方包 {len(installed)} 个，保留 {len(set(keep))} 个，将卸载 {len(targets)} 个",
+                "done",
+            )
+            if keep:
+                self._console_line("[保留] " + ", ".join(sorted(set(keep))), "logline")
+            for pkg in targets:
+                self._console_line(f"[将卸载] {pkg}", "logline")
+            self._set_buttons_state(True, token)
+            self.status_label.config(text=f"预览完成：将卸载 {len(targets)} 个第三方包")
+
+        self._load_third_party_cleanup_plan(_show_preview)
+
+    def _on_cleanup_third_party_packages(self):
+        if not check_device():
+            self.status_label.config(text="没有已连接的设备")
+            return
+
+        def _confirm_and_run(installed, keep, targets, token):
+            if not targets:
+                self._console_line(
+                    f"[清理] 第三方包 {len(installed)} 个，没有需要卸载的包",
+                    "done",
+                )
+                self._set_buttons_state(True, token)
+                self.status_label.config(text="没有需要清理的第三方包")
+                return
+
+            preview = "\n".join(targets[:30])
+            if len(targets) > 30:
+                preview += f"\n... 还有 {len(targets) - 30} 个"
+            ok = messagebox.askyesno(
+                "确认清理第三方包",
+                (
+                    f"将卸载 {len(targets)} 个第三方包，保留 {len(set(keep))} 个。\n\n"
+                    f"{preview}\n\n确认继续？"
+                ),
+            )
+            if not ok:
+                self._console_line("[清理取消] 未卸载任何应用", "done")
+                self._set_buttons_state(True, token)
+                self.status_label.config(text="已取消第三方包清理")
+                return
+
+            self._console_line(
+                f"[开始清理] 卸载 {len(targets)} 个第三方包；保留: {', '.join(sorted(set(keep))) or '(无)'}",
+                "cmd",
+            )
+            cmd = build_bulk_uninstall_cmd(targets)
+            self._run_command(cmd, timeout=max(60, len(targets) * 6))
+
+        self._load_third_party_cleanup_plan(_confirm_and_run)
 
     # ── Logcat 流式监听 ───────────────────────────────────────────
 

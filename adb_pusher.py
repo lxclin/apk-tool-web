@@ -9,6 +9,11 @@ import urllib.parse
 import json
 import copy
 
+DEFAULT_KEEP_THIRD_PARTY_PACKAGES = [
+    "com.github.kr328.clash",
+    "org.telegram.messenger",
+]
+
 # 常见 adb 安装位置
 _COMMON_ADB_PATHS = [
     "/opt/homebrew/bin/adb",
@@ -437,6 +442,28 @@ def get_device_list() -> list[str]:
         return [line.split("\t")[0] for line in lines if "\tdevice" in line]
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
+
+
+def list_third_party_packages() -> list[str]:
+    """列出设备上的第三方包名。"""
+    result = _run_adb(["shell", "pm", "list", "packages", "-3"], timeout=15)
+    packages = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("package:"):
+            pkg = line.removeprefix("package:").strip()
+            if pkg:
+                packages.append(pkg)
+    return sorted(set(packages))
+
+
+def packages_to_uninstall(
+    installed_packages: list[str],
+    keep_packages: list[str] | set[str],
+) -> list[str]:
+    """根据保留白名单计算需要卸载的第三方包。"""
+    keep = {pkg.strip() for pkg in keep_packages if pkg and pkg.strip()}
+    return sorted(pkg for pkg in set(installed_packages) if pkg not in keep)
 
 
 def push_apk(apk_path: str) -> tuple[bool, str]:
@@ -902,6 +929,22 @@ def build_logcat_cmd(uid: str | None = None) -> list[str]:
     if uid:
         cmd.extend(["--uid", uid])
     return cmd
+
+
+def build_bulk_uninstall_cmd(packages: list[str]) -> list[str]:
+    adb = get_adb_path()
+    safe_packages = [
+        pkg.strip()
+        for pkg in packages
+        if pkg and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.]*", pkg.strip())
+    ]
+    if not safe_packages:
+        return [adb, "shell", "true"]
+    body = "; ".join(
+        f"echo '[卸载] {pkg}'; pm uninstall {shlex.quote(pkg)}"
+        for pkg in safe_packages
+    )
+    return [adb, "shell", "sh", "-c", body]
 
 
 def build_backend_url(fields: dict, package_name: str) -> str:

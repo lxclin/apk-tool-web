@@ -163,6 +163,8 @@ class TestAppInit:
                     "打开应用",
                     "清空 Play Store 缓存",
                     "修复 zygotehole 权限",
+                    "预览清理",
+                    "一键清理第三方包",
                 ]
         finally:
             root.destroy()
@@ -535,6 +537,69 @@ class TestActionDelayTool:
                 assert hasattr(app, "following_action_delay_var")
                 assert hasattr(app, "_on_normalize_action_delays")
                 assert hasattr(app, "_on_copy_action_script")
+        finally:
+            root.destroy()
+
+    def test_cleanup_keep_packages_includes_current_package(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.cleanup_keep_packages_var.set("com.keep.one, com.keep.two")
+                app.pkg_entry.insert(0, "com.current.app")
+
+                assert app._cleanup_keep_packages() == [
+                    "com.current.app",
+                    "com.keep.one",
+                    "com.keep.two",
+                ]
+        finally:
+            root.destroy()
+
+    def test_preview_third_party_cleanup_lists_targets(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.cleanup_keep_packages_var.set("com.keep")
+
+                with patch("gui.check_device", return_value=True), \
+                     patch("gui.list_third_party_packages", return_value=["com.keep", "com.remove"]), \
+                     patch.object(app, "_console_line") as mock_line, \
+                     patch("gui.threading.Thread", ImmediateThread):
+                    app._on_preview_third_party_cleanup()
+                    root.update()
+
+                assert any("[将卸载] com.remove" in call.args[0] for call in mock_line.call_args_list)
+        finally:
+            root.destroy()
+
+    def test_cleanup_third_party_packages_confirms_and_runs_bulk_command(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            expected_cmd = ["adb", "shell", "sh", "-c", "pm uninstall com.remove"]
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.cleanup_keep_packages_var.set("com.keep")
+
+                with patch("gui.check_device", return_value=True), \
+                     patch("gui.list_third_party_packages", return_value=["com.keep", "com.remove"]), \
+                     patch("gui.messagebox.askyesno", return_value=True) as mock_confirm, \
+                     patch("gui.build_bulk_uninstall_cmd", return_value=expected_cmd) as mock_build, \
+                     patch.object(app, "_run_command") as mock_run, \
+                     patch("gui.threading.Thread", ImmediateThread):
+                    app._on_cleanup_third_party_packages()
+                    root.update()
+
+                mock_confirm.assert_called_once()
+                mock_build.assert_called_once_with(["com.remove"])
+                mock_run.assert_called_once_with(expected_cmd, timeout=60)
         finally:
             root.destroy()
 
