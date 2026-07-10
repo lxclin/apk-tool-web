@@ -121,6 +121,20 @@ class TestApkDownloadUrl:
 
 
 class TestAdbCommandBuilders:
+    def test_build_clear_cache_cmd_stops_app_and_clears_cache_only(self):
+        from adb_pusher import build_clear_cache_cmd
+
+        with patch("adb_pusher.get_adb_path", return_value="/usr/bin/adb"):
+            cmd = build_clear_cache_cmd("com.example.app")
+
+        assert cmd == [
+            "/usr/bin/adb",
+            "shell",
+            "sh",
+            "-c",
+            "am force-stop com.example.app; pm clear --cache-only com.example.app",
+        ]
+
     def test_packages_to_uninstall_keeps_whitelisted_packages(self):
         from adb_pusher import packages_to_uninstall
 

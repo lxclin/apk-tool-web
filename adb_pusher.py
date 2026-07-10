@@ -914,7 +914,14 @@ def build_get_uid_cmd(package_name: str) -> list[str]:
 
 def build_clear_cache_cmd(package_name: str) -> list[str]:
     adb = get_adb_path()
-    return [adb, "shell", "pm", "clear", package_name]
+    pkg = shlex.quote(package_name)
+    return [
+        adb,
+        "shell",
+        "sh",
+        "-c",
+        f"am force-stop {pkg}; pm clear --cache-only {pkg}",
+    ]
 
 
 def build_force_stop_cmd(package_name: str) -> list[str]:
