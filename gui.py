@@ -120,6 +120,7 @@ class APKToolApp:
         self._button_restore_after_id: str | None = None
         self._console_line_count = 0
         self._console_max_lines = 1200
+        self._current_command_proc: subprocess.Popen | None = None
         self._op_buttons: list[ttk.Button] = []
 
         # ── 数据同步配置 ──
@@ -528,6 +529,14 @@ class APKToolApp:
             b = ttk.Button(btn_row2, text=text, command=cmd)
             b.pack(side=tk.LEFT, padx=2)
             self._op_buttons.append(b)
+
+        stop_row = ttk.Frame(action_frame)
+        stop_row.pack(fill=tk.X, pady=(6, 2))
+        self._stop_command_btn = ttk.Button(
+            stop_row, text="停止当前命令", command=self._on_stop_current_command
+        )
+        self._stop_command_btn.pack(side=tk.LEFT, padx=2)
+        self._stop_command_btn.configure(state=tk.DISABLED)
 
         # --- Logcat 区域 ---
         logcat_frame = ttk.LabelFrame(parent, text="Logcat 实时监听", padding=10)
@@ -1222,6 +1231,7 @@ class APKToolApp:
         state = tk.NORMAL if enabled else tk.DISABLED
         for btn in self._op_buttons:
             btn.configure(state=state)
+        self._set_stop_command_state(not enabled and self._has_running_command_proc())
 
         if self._button_restore_after_id:
             try:
@@ -1240,6 +1250,15 @@ class APKToolApp:
                 lambda t=token: self._set_buttons_state(True, token=t),
             )
         return self._command_state_token
+
+    def _has_running_command_proc(self) -> bool:
+        proc = self._current_command_proc
+        return proc is not None and proc.poll() is None
+
+    def _set_stop_command_state(self, enabled: bool):
+        stop_btn = getattr(self, "_stop_command_btn", None)
+        if stop_btn is not None:
+            stop_btn.configure(state=tk.NORMAL if enabled else tk.DISABLED)
 
     def _cmd_display(self, cmd: list[str]) -> str:
         """将命令转为可读显示，adb 用简写"""
@@ -1262,14 +1281,46 @@ class APKToolApp:
         def on_line(line: str):
             self._safe_after(0, self._console_line, line)
 
+        cmd_proc: dict[str, subprocess.Popen | None] = {"proc": None}
+
+        def on_proc(proc: subprocess.Popen):
+            cmd_proc["proc"] = proc
+            self._current_command_proc = proc
+            self._safe_after(0, self._set_stop_command_state, True)
+
         def on_done(returncode: int):
             self._safe_after(0, self._console_done, returncode)
+            if self._current_command_proc is cmd_proc["proc"]:
+                self._current_command_proc = None
             self._safe_after(0, self._set_buttons_state, True, token)
             self._safe_after(0, lambda: self.status_label.config(
                 text="执行成功" if returncode == 0 else f"执行失败 (exit={returncode})"
             ))
 
-        run_stream(cmd, on_line, on_done, cwd=cwd, timeout=timeout)
+        run_stream(cmd, on_line, on_done, cwd=cwd, timeout=timeout, on_proc=on_proc)
+
+    def _on_stop_current_command(self):
+        proc = self._current_command_proc
+        if proc is None or proc.poll() is not None:
+            self._console_line("[停止] 当前没有正在执行的命令", "done")
+            self._set_stop_command_state(False)
+            return
+
+        self._console_line("[停止] 正在终止当前命令...", "cmd")
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+            self._console_line("[停止] 已终止当前命令", "done")
+        except Exception as e:
+            self._console_line(f"[停止失败] {e}", "error")
+        finally:
+            self._current_command_proc = None
+            self._set_buttons_state(True)
+            self.status_label.config(text="已停止当前命令")
 
     def _maybe_auto_uid(self):
         """如果没有缓存 UID，尝试自动获取"""
@@ -1683,11 +1734,20 @@ class APKToolApp:
         self.status_label.config(text="查询 UID...")
         self.root.update_idletasks()
 
+        cmd_proc: dict[str, subprocess.Popen | None] = {"proc": None}
+
+        def on_proc(proc: subprocess.Popen):
+            cmd_proc["proc"] = proc
+            self._current_command_proc = proc
+            self._safe_after(0, self._set_stop_command_state, True)
+
         def on_done(returncode: int):
             self._safe_after(0, self._console_done, returncode)
+            if self._current_command_proc is cmd_proc["proc"]:
+                self._current_command_proc = None
             self._safe_after(0, self._set_buttons_state, True, token)
 
-        run_stream(cmd, on_line, on_done, timeout=45)
+        run_stream(cmd, on_line, on_done, timeout=25, on_proc=on_proc)
 
     def _set_uid(self, uid: str):
         self._cached_uid = uid
@@ -1704,7 +1764,7 @@ class APKToolApp:
             self.status_label.config(text="请输入包名")
             return
         cmd = build_clear_cache_cmd(pkg)
-        self._run_command(cmd)
+        self._run_command(cmd, timeout=15)
 
     def _on_force_stop(self):
         if not check_device():
@@ -1715,7 +1775,7 @@ class APKToolApp:
             self.status_label.config(text="请输入包名")
             return
         cmd = build_force_stop_cmd(pkg)
-        self._run_command(cmd)
+        self._run_command(cmd, timeout=10)
 
     def _on_open_app(self):
         if not check_device():
@@ -1726,14 +1786,14 @@ class APKToolApp:
             self.status_label.config(text="请输入包名")
             return
         cmd = build_open_app_cmd(pkg)
-        self._run_command(cmd)
+        self._run_command(cmd, timeout=15)
 
     def _on_clear_play_store(self):
         if not check_device():
             self.status_label.config(text="没有已连接的设备")
             return
         cmd = build_clear_cache_cmd("com.android.vending")
-        self._run_command(cmd)
+        self._run_command(cmd, timeout=15)
 
     def _cleanup_keep_packages(self) -> list[str]:
         raw = self.cleanup_keep_packages_var.get()

@@ -816,7 +816,7 @@ def stop_logcat_stream(proc: subprocess.Popen, timeout: float = 3) -> None:
         proc.kill()
 
 
-def run_stream(cmd: list[str], on_line, on_done, cwd=None, timeout=None):
+def run_stream(cmd: list[str], on_line, on_done, cwd=None, timeout=None, on_proc=None):
     """后台线程逐行执行命令。timeout 覆盖整个执行周期（含 stdout 读取）"""
 
     def _run():
@@ -831,6 +831,8 @@ def run_stream(cmd: list[str], on_line, on_done, cwd=None, timeout=None):
                 bufsize=1,
                 cwd=cwd,
             )
+            if on_proc:
+                on_proc(proc)
 
             if timeout:
                 # 看门狗：超时后强制杀进程

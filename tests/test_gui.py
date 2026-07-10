@@ -144,6 +144,7 @@ class TestAppInit:
                 assert hasattr(app, "output_text")
                 assert hasattr(app, "uid_var")
                 assert hasattr(app, "_on_fix_zygotehole_permissions")
+                assert hasattr(app, "_stop_command_btn")
         finally:
             root.destroy()
 
@@ -166,6 +167,48 @@ class TestAppInit:
                     "清空 Play Store 缓存",
                     "修复 zygotehole 权限",
                 ]
+        finally:
+            root.destroy()
+
+    def test_clear_cache_uses_short_timeout(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            expected_cmd = ["adb", "shell", "pm", "clear", "com.example.app"]
+            with patch("gui.check_device", return_value=True), \
+                 patch("gui.build_clear_cache_cmd", return_value=expected_cmd) as mock_build, \
+                 patch.object(APKToolApp, "_run_command") as mock_run, \
+                 patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.pkg_entry.delete(0, tk.END)
+                app.pkg_entry.insert(0, "com.example.app")
+
+                app._on_clear_cache()
+
+                mock_build.assert_called_once_with("com.example.app")
+                mock_run.assert_called_once_with(expected_cmd, timeout=15)
+        finally:
+            root.destroy()
+
+    def test_stop_current_command_terminates_proc_and_restores_buttons(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                proc = MagicMock()
+                proc.poll.return_value = None
+                app._current_command_proc = proc
+                app._set_buttons_state(False)
+
+                app._on_stop_current_command()
+
+                proc.terminate.assert_called_once_with()
+                proc.wait.assert_called_once_with(timeout=1)
+                assert app._current_command_proc is None
+                assert str(app._stop_command_btn.cget("state")) == tk.DISABLED
         finally:
             root.destroy()
 
