@@ -155,6 +155,8 @@ class TestAppInit:
                 app = APKToolApp(root)
                 labels = [button.cget("text") for button in app._op_buttons]
                 assert labels == [
+                    "预览清理",
+                    "一键清理第三方包",
                     "推送 Config",
                     "执行 zygote_build",
                     "获取应用 UID",
@@ -163,8 +165,6 @@ class TestAppInit:
                     "打开应用",
                     "清空 Play Store 缓存",
                     "修复 zygotehole 权限",
-                    "预览清理",
-                    "一键清理第三方包",
                 ]
         finally:
             root.destroy()

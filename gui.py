@@ -120,6 +120,7 @@ class APKToolApp:
         self._button_restore_after_id: str | None = None
         self._console_line_count = 0
         self._console_max_lines = 1200
+        self._op_buttons: list[ttk.Button] = []
 
         # ── 数据同步配置 ──
         self.sheet_id_var = tk.StringVar(
@@ -333,6 +334,32 @@ class APKToolApp:
         self.apkpure_pkg_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         ttk.Button(search_row, text="搜索安装", command=self._on_apkpure_search).pack(side=tk.LEFT)
 
+        cleanup_frame = ttk.LabelFrame(top, text="第三方包清理", padding=10)
+        cleanup_frame.pack(fill=tk.X, pady=(10, 0))
+
+        cleanup_row = ttk.Frame(cleanup_frame)
+        cleanup_row.pack(fill=tk.X, pady=2)
+        ttk.Label(cleanup_row, text="保留包名:").pack(side=tk.LEFT)
+        self.cleanup_keep_entry = ttk.Entry(
+            cleanup_row, textvariable=self.cleanup_keep_packages_var
+        )
+        self.cleanup_keep_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        cleanup_btn_row = ttk.Frame(cleanup_frame)
+        cleanup_btn_row.pack(fill=tk.X, pady=(6, 0))
+        for text, cmd in [
+            ("预览清理", self._on_preview_third_party_cleanup),
+            ("一键清理第三方包", self._on_cleanup_third_party_packages),
+        ]:
+            b = ttk.Button(cleanup_btn_row, text=text, command=cmd)
+            b.pack(side=tk.LEFT, padx=2)
+            self._op_buttons.append(b)
+        ttk.Label(
+            cleanup_btn_row,
+            text="ADB 页包名输入框里的包会自动保留",
+            foreground="gray",
+        ).pack(side=tk.LEFT, padx=8)
+
         qr_frame = ttk.LabelFrame(parent, text="二维码", padding=10)
         qr_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.qr_label = ttk.Label(qr_frame)
@@ -476,8 +503,6 @@ class APKToolApp:
         action_frame = ttk.LabelFrame(parent, text="操作指令", padding=10)
         action_frame.pack(fill=tk.X, **pad)
 
-        self._op_buttons: list[ttk.Button] = []
-
         # 第一行：4 个按钮
         btn_row1 = ttk.Frame(action_frame)
         btn_row1.pack(fill=tk.X, pady=2)
@@ -503,32 +528,6 @@ class APKToolApp:
             b = ttk.Button(btn_row2, text=text, command=cmd)
             b.pack(side=tk.LEFT, padx=2)
             self._op_buttons.append(b)
-
-        cleanup_frame = ttk.LabelFrame(parent, text="第三方包清理", padding=10)
-        cleanup_frame.pack(fill=tk.X, **pad)
-
-        cleanup_row = ttk.Frame(cleanup_frame)
-        cleanup_row.pack(fill=tk.X, pady=2)
-        ttk.Label(cleanup_row, text="保留包名:").pack(side=tk.LEFT)
-        self.cleanup_keep_entry = ttk.Entry(
-            cleanup_row, textvariable=self.cleanup_keep_packages_var
-        )
-        self.cleanup_keep_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-
-        cleanup_btn_row = ttk.Frame(cleanup_frame)
-        cleanup_btn_row.pack(fill=tk.X, pady=(6, 0))
-        for text, cmd in [
-            ("预览清理", self._on_preview_third_party_cleanup),
-            ("一键清理第三方包", self._on_cleanup_third_party_packages),
-        ]:
-            b = ttk.Button(cleanup_btn_row, text=text, command=cmd)
-            b.pack(side=tk.LEFT, padx=2)
-            self._op_buttons.append(b)
-        ttk.Label(
-            cleanup_btn_row,
-            text="当前包名输入框里的包会自动保留",
-            foreground="gray",
-        ).pack(side=tk.LEFT, padx=8)
 
         # --- Logcat 区域 ---
         logcat_frame = ttk.LabelFrame(parent, text="Logcat 实时监听", padding=10)
