@@ -123,6 +123,7 @@ class APKToolApp:
         self._current_command_proc: subprocess.Popen | None = None
         self._op_buttons: list[ttk.Button] = []
         self.cleanup_preview_var = tk.StringVar(value="未预览")
+        self._syncing_cleanup_keep_text = False
 
         # ── 数据同步配置 ──
         self.sheet_id_var = tk.StringVar(
@@ -341,11 +342,31 @@ class APKToolApp:
 
         cleanup_row = ttk.Frame(cleanup_frame)
         cleanup_row.pack(fill=tk.X, pady=2)
-        ttk.Label(cleanup_row, text="保留包名:").pack(side=tk.LEFT)
-        self.cleanup_keep_entry = ttk.Entry(
-            cleanup_row, textvariable=self.cleanup_keep_packages_var
+        ttk.Label(cleanup_row, text="保留包名:").pack(side=tk.LEFT, anchor=tk.N, pady=4)
+
+        keep_text_frame = ttk.Frame(cleanup_row)
+        keep_text_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.cleanup_keep_entry = tk.Text(
+            keep_text_frame,
+            height=3,
+            wrap=tk.WORD,
+            font=("Menlo", 10),
+            bg="white",
+            fg="black",
+            insertbackground="black",
+            relief=tk.SOLID,
+            borderwidth=1,
         )
-        self.cleanup_keep_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        keep_scrollbar = ttk.Scrollbar(
+            keep_text_frame, command=self.cleanup_keep_entry.yview
+        )
+        self.cleanup_keep_entry.configure(yscrollcommand=keep_scrollbar.set)
+        self.cleanup_keep_entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        keep_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.cleanup_keep_entry.insert("1.0", self.cleanup_keep_packages_var.get())
+        self.cleanup_keep_entry.bind("<KeyRelease>", self._on_cleanup_keep_text_changed)
+        self.cleanup_keep_entry.bind("<FocusOut>", self._on_cleanup_keep_text_changed)
+        self.cleanup_keep_packages_var.trace_add("write", self._on_cleanup_keep_var_changed)
 
         cleanup_btn_row = ttk.Frame(cleanup_frame)
         cleanup_btn_row.pack(fill=tk.X, pady=(6, 0))
@@ -1590,7 +1611,7 @@ class APKToolApp:
             self.status_label.config(text=f"路径记忆保存失败: {e}")
 
     def _remember_cleanup_keep_packages(self):
-        self._settings["cleanup_keep_packages"] = self.cleanup_keep_packages_var.get()
+        self._settings["cleanup_keep_packages"] = self._cleanup_keep_packages_text()
         try:
             save_gui_settings(self._settings)
         except OSError as e:
@@ -1864,7 +1885,7 @@ class APKToolApp:
         self._run_command(cmd, timeout=8, disable_buttons=False)
 
     def _cleanup_keep_packages(self) -> list[str]:
-        raw = self.cleanup_keep_packages_var.get()
+        raw = self._cleanup_keep_packages_text()
         packages = [
             item.strip()
             for item in re.split(r"[\s,，;；]+", raw)
@@ -1874,6 +1895,38 @@ class APKToolApp:
         if current_pkg:
             packages.append(current_pkg)
         return sorted(set(packages))
+
+    def _cleanup_keep_packages_text(self) -> str:
+        entry = getattr(self, "cleanup_keep_entry", None)
+        if entry is not None:
+            return entry.get("1.0", "end-1c")
+        return self.cleanup_keep_packages_var.get()
+
+    def _on_cleanup_keep_text_changed(self, _event=None):
+        if self._syncing_cleanup_keep_text:
+            return
+        self._syncing_cleanup_keep_text = True
+        try:
+            self.cleanup_keep_packages_var.set(self._cleanup_keep_packages_text())
+        finally:
+            self._syncing_cleanup_keep_text = False
+
+    def _on_cleanup_keep_var_changed(self, *_args):
+        if self._syncing_cleanup_keep_text:
+            return
+        entry = getattr(self, "cleanup_keep_entry", None)
+        if entry is None:
+            return
+        value = self.cleanup_keep_packages_var.get()
+        current = entry.get("1.0", "end-1c")
+        if current == value:
+            return
+        self._syncing_cleanup_keep_text = True
+        try:
+            entry.delete("1.0", tk.END)
+            entry.insert("1.0", value)
+        finally:
+            self._syncing_cleanup_keep_text = False
 
     def _load_third_party_cleanup_plan(self, on_done):
         keep = self._cleanup_keep_packages()

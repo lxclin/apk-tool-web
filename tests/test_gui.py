@@ -625,6 +625,28 @@ class TestActionDelayTool:
                     "com.keep.one",
                     "com.keep.two",
                 ]
+                assert int(app.cleanup_keep_entry.cget("height")) >= 3
+        finally:
+            root.destroy()
+
+    def test_cleanup_keep_packages_reads_multiline_editor(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.cleanup_keep_entry.delete("1.0", tk.END)
+                app.cleanup_keep_entry.insert(
+                    "1.0",
+                    "com.keep.one\ncom.keep.two, com.keep.three",
+                )
+
+                assert app._cleanup_keep_packages() == [
+                    "com.keep.one",
+                    "com.keep.three",
+                    "com.keep.two",
+                ]
         finally:
             root.destroy()
 
