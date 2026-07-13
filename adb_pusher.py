@@ -734,10 +734,22 @@ def get_app_uid(package_name: str) -> tuple[bool, str]:
 
 def clear_app_cache(package_name: str) -> tuple[bool, str]:
     """清除应用缓存"""
-    if not package_name.strip():
+    package_name = package_name.strip()
+    if not package_name:
         return False, "请输入包名"
     try:
-        result = _run_adb(["shell", "pm", "clear", package_name.strip()], timeout=20)
+        result = _run_adb(
+            [
+                "shell",
+                "sh",
+                "-c",
+                (
+                    f"am force-stop {shlex.quote(package_name)}; "
+                    f"pm clear --cache-only {shlex.quote(package_name)}"
+                ),
+            ],
+            timeout=8,
+        )
         output = (result.stdout + result.stderr).strip()
         if result.returncode == 0 and "Success" in output:
             return True, f"缓存清除成功\n{output}"

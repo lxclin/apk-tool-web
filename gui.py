@@ -1300,13 +1300,21 @@ class APKToolApp:
             result = result.replace(adb_path, "adb")
         return result
 
-    def _run_command(self, cmd: list[str], cwd=None, timeout: int = 45):
+    def _run_command(
+        self,
+        cmd: list[str],
+        cwd=None,
+        timeout: int = 45,
+        disable_buttons: bool = True,
+    ):
         """在控制台中显示命令并流式执行"""
         self._console_cmd(self._cmd_display(cmd))
-        token = self._set_buttons_state(
-            False,
-            auto_restore_ms=(timeout + 5) * 1000 if timeout else 60000,
-        )
+        token = None
+        if disable_buttons:
+            token = self._set_buttons_state(
+                False,
+                auto_restore_ms=(timeout + 5) * 1000 if timeout else 60000,
+            )
         self.status_label.config(text="执行中...")
         self.root.update_idletasks()
 
@@ -1324,7 +1332,10 @@ class APKToolApp:
             self._safe_after(0, self._console_done, returncode)
             if self._current_command_proc is cmd_proc["proc"]:
                 self._current_command_proc = None
-            self._safe_after(0, self._set_buttons_state, True, token)
+            if disable_buttons:
+                self._safe_after(0, self._set_buttons_state, True, token)
+            else:
+                self._safe_after(0, self._set_stop_command_state, False)
             self._safe_after(0, lambda: self.status_label.config(
                 text="执行成功" if returncode == 0 else f"执行失败 (exit={returncode})"
             ))
@@ -1753,33 +1764,27 @@ class APKToolApp:
             self.status_label.config(text="请输入包名")
             return
 
-        cmd = build_get_uid_cmd(pkg)
-
-        def on_line(line: str):
-            self._safe_after(0, self._console_line, line)
-            uid = extract_uid_from_dumpsys(line)
-            if uid:
-                self._safe_after(0, lambda u=uid: self._set_uid(u))
-
-        self._console_cmd(self._cmd_display(cmd))
         token = self._set_buttons_state(False, auto_restore_ms=50000)
+        self._console_cmd(f"查询 UID: {pkg}")
         self.status_label.config(text="查询 UID...")
         self.root.update_idletasks()
 
-        cmd_proc: dict[str, subprocess.Popen | None] = {"proc": None}
+        def _run():
+            ok, msg = get_app_uid(pkg)
 
-        def on_proc(proc: subprocess.Popen):
-            cmd_proc["proc"] = proc
-            self._current_command_proc = proc
-            self._safe_after(0, self._set_stop_command_state, True)
+            def _finish():
+                if ok:
+                    self._set_uid(msg)
+                    self._console_line(f"[UID] {pkg}: {msg}", "done")
+                    self.status_label.config(text=f"UID: {msg}")
+                else:
+                    self._console_line(f"[UID 查询失败] {msg}", "error")
+                    self.status_label.config(text=msg)
+                self._set_buttons_state(True, token)
 
-        def on_done(returncode: int):
-            self._safe_after(0, self._console_done, returncode)
-            if self._current_command_proc is cmd_proc["proc"]:
-                self._current_command_proc = None
-            self._safe_after(0, self._set_buttons_state, True, token)
+            self._safe_after(0, _finish)
 
-        run_stream(cmd, on_line, on_done, timeout=25, on_proc=on_proc)
+        threading.Thread(target=_run, daemon=True).start()
 
     def _set_uid(self, uid: str):
         self._cached_uid = uid
@@ -1827,7 +1832,7 @@ class APKToolApp:
             self.status_label.config(text="请输入包名")
             return
         cmd = build_clear_cache_cmd(pkg)
-        self._run_command(cmd, timeout=15)
+        self._run_command(cmd, timeout=8, disable_buttons=False)
 
     def _on_force_stop(self):
         if not check_device():
@@ -1838,7 +1843,7 @@ class APKToolApp:
             self.status_label.config(text="请输入包名")
             return
         cmd = build_force_stop_cmd(pkg)
-        self._run_command(cmd, timeout=10)
+        self._run_command(cmd, timeout=8, disable_buttons=False)
 
     def _on_open_app(self):
         if not check_device():
@@ -1849,14 +1854,14 @@ class APKToolApp:
             self.status_label.config(text="请输入包名")
             return
         cmd = build_open_app_cmd(pkg)
-        self._run_command(cmd, timeout=15)
+        self._run_command(cmd, timeout=10, disable_buttons=False)
 
     def _on_clear_play_store(self):
         if not check_device():
             self.status_label.config(text="没有已连接的设备")
             return
         cmd = build_clear_cache_cmd("com.android.vending")
-        self._run_command(cmd, timeout=15)
+        self._run_command(cmd, timeout=8, disable_buttons=False)
 
     def _cleanup_keep_packages(self) -> list[str]:
         raw = self.cleanup_keep_packages_var.get()

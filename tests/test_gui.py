@@ -171,7 +171,7 @@ class TestAppInit:
         finally:
             root.destroy()
 
-    def test_clear_cache_uses_short_timeout(self):
+    def test_clear_cache_keeps_buttons_enabled(self):
         root = tk.Tk()
         try:
             from gui import APKToolApp
@@ -188,7 +188,33 @@ class TestAppInit:
                 app._on_clear_cache()
 
                 mock_build.assert_called_once_with("com.example.app")
-                mock_run.assert_called_once_with(expected_cmd, timeout=15)
+                mock_run.assert_called_once_with(
+                    expected_cmd, timeout=8, disable_buttons=False
+                )
+        finally:
+            root.destroy()
+
+    def test_get_uid_outputs_only_uid_summary(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.pkg_entry.delete(0, tk.END)
+                app.pkg_entry.insert(0, "com.example.app")
+
+                with patch("gui.check_device", return_value=True), \
+                     patch("gui.get_app_uid", return_value=(True, "10323")) as mock_get_uid, \
+                     patch("gui.threading.Thread", ImmediateThread):
+                    app._on_get_uid()
+                    root.update()
+
+                mock_get_uid.assert_called_once_with("com.example.app")
+                assert app.uid_var.get() == "10323"
+                output = app.output_text.get("1.0", tk.END)
+                assert "[UID] com.example.app: 10323" in output
+                assert "ContentProvider" not in output
         finally:
             root.destroy()
 
