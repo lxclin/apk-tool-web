@@ -122,6 +122,7 @@ class APKToolApp:
         self._console_max_lines = 1200
         self._current_command_proc: subprocess.Popen | None = None
         self._op_buttons: list[ttk.Button] = []
+        self.cleanup_preview_var = tk.StringVar(value="未预览")
 
         # ── 数据同步配置 ──
         self.sheet_id_var = tk.StringVar(
@@ -360,6 +361,37 @@ class APKToolApp:
             text="ADB 页包名输入框里的包会自动保留",
             foreground="gray",
         ).pack(side=tk.LEFT, padx=8)
+
+        self.cleanup_preview_label = ttk.Label(
+            cleanup_frame,
+            textvariable=self.cleanup_preview_var,
+            foreground="gray",
+            anchor=tk.W,
+        )
+        self.cleanup_preview_label.pack(fill=tk.X, pady=(8, 4))
+
+        preview_frame = ttk.Frame(cleanup_frame)
+        preview_frame.pack(fill=tk.BOTH, expand=True)
+        self.cleanup_preview_text = tk.Text(
+            preview_frame,
+            height=7,
+            wrap=tk.NONE,
+            state=tk.DISABLED,
+            font=("Menlo", 10),
+            bg="#1e1e1e",
+            fg="#d4d4d4",
+            insertbackground="white",
+        )
+        preview_scrollbar = ttk.Scrollbar(
+            preview_frame, command=self.cleanup_preview_text.yview
+        )
+        self.cleanup_preview_text.configure(yscrollcommand=preview_scrollbar.set)
+        self.cleanup_preview_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        preview_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.cleanup_preview_text.tag_config("done", foreground="#81c784")
+        self.cleanup_preview_text.tag_config("error", foreground="#ef5350")
+        self.cleanup_preview_text.tag_config("keep", foreground="#6acbff")
+        self.cleanup_preview_text.tag_config("target", foreground="#ffb74d")
 
         qr_frame = ttk.LabelFrame(parent, text="二维码", padding=10)
         qr_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -1755,6 +1787,37 @@ class APKToolApp:
         self.uid_label.configure(foreground="black")
         self.status_label.config(text=f"UID: {uid}")
 
+    def _set_cleanup_preview(self, lines: list[tuple[str, str]]):
+        preview_text = getattr(self, "cleanup_preview_text", None)
+        if preview_text is None:
+            return
+        preview_text.configure(state=tk.NORMAL)
+        preview_text.delete("1.0", tk.END)
+        for text, tag in lines:
+            preview_text.insert(tk.END, text + "\n", tag)
+        preview_text.configure(state=tk.DISABLED)
+
+    def _render_cleanup_preview(self, installed, keep, targets):
+        keep_set = sorted(set(keep))
+        target_count = len(targets)
+        self.cleanup_preview_var.set(
+            f"预览完成：第三方包 {len(installed)} 个，保留 {len(keep_set)} 个，将卸载 {target_count} 个"
+        )
+
+        lines: list[tuple[str, str]] = []
+        if target_count == 0:
+            lines.append(("没有需要卸载的第三方包", "done"))
+        else:
+            lines.append(("将卸载:", "target"))
+            lines.extend((pkg, "target") for pkg in targets)
+
+        if keep_set:
+            lines.append(("", ""))
+            lines.append(("保留:", "keep"))
+            lines.extend((pkg, "keep") for pkg in keep_set)
+
+        self._set_cleanup_preview(lines)
+
     def _on_clear_cache(self):
         if not check_device():
             self.status_label.config(text="没有已连接的设备")
@@ -1811,6 +1874,8 @@ class APKToolApp:
         keep = self._cleanup_keep_packages()
         self._remember_cleanup_keep_packages()
         self.status_label.config(text="正在扫描第三方应用...")
+        self.cleanup_preview_var.set("正在扫描第三方应用...")
+        self._set_cleanup_preview([("adb shell pm list packages -3", "keep")])
         self._console_cmd("adb shell pm list packages -3")
         token = self._set_buttons_state(False, auto_restore_ms=90000)
 
@@ -1821,6 +1886,8 @@ class APKToolApp:
                 self._safe_after(0, on_done, installed, keep, targets, token)
             except Exception as e:
                 self._safe_after(0, self._console_line, f"[扫描失败] {e}", "error")
+                self._safe_after(0, lambda err=e: self.cleanup_preview_var.set(f"扫描失败: {err}"))
+                self._safe_after(0, self._set_cleanup_preview, [(f"[扫描失败] {e}", "error")])
                 self._safe_after(0, self._set_buttons_state, True, token)
                 self._safe_after(0, lambda: self.status_label.config(text=f"扫描失败: {e}"))
 
@@ -1832,6 +1899,7 @@ class APKToolApp:
             return
 
         def _show_preview(installed, keep, targets, token):
+            self._render_cleanup_preview(installed, keep, targets)
             self._console_line(
                 f"[清理预览] 第三方包 {len(installed)} 个，保留 {len(set(keep))} 个，将卸载 {len(targets)} 个",
                 "done",
@@ -1851,6 +1919,7 @@ class APKToolApp:
             return
 
         def _confirm_and_run(installed, keep, targets, token):
+            self._render_cleanup_preview(installed, keep, targets)
             if not targets:
                 self._console_line(
                     f"[清理] 第三方包 {len(installed)} 个，没有需要卸载的包",

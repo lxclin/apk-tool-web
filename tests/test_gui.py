@@ -145,6 +145,7 @@ class TestAppInit:
                 assert hasattr(app, "uid_var")
                 assert hasattr(app, "_on_fix_zygotehole_permissions")
                 assert hasattr(app, "_stop_command_btn")
+                assert hasattr(app, "cleanup_preview_text")
         finally:
             root.destroy()
 
@@ -619,6 +620,12 @@ class TestActionDelayTool:
                     root.update()
 
                 assert any("[将卸载] com.remove" in call.args[0] for call in mock_line.call_args_list)
+                preview = app.cleanup_preview_text.get("1.0", tk.END)
+                assert "将卸载:" in preview
+                assert "com.remove" in preview
+                assert "保留:" in preview
+                assert "com.keep" in preview
+                assert "将卸载 1 个" in app.cleanup_preview_var.get()
         finally:
             root.destroy()
 
