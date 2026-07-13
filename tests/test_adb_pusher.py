@@ -105,6 +105,46 @@ class TestPushApk:
         assert "成功" in msg
         mock_install_xapk.assert_called_once_with(str(downloaded))
 
+    def test_install_multiple_uses_long_timeout(self, tmp_path):
+        from adb_pusher import _install_apks
+
+        apk_paths = [
+            tmp_path / "base.apk",
+            tmp_path / "config.arm64_v8a.apk",
+            tmp_path / "config.en.apk",
+            tmp_path / "config.xxhdpi.apk",
+        ]
+        for path in apk_paths:
+            path.write_text("fake apk")
+
+        with patch(
+            "adb_pusher._run_adb",
+            return_value=MagicMock(returncode=0, stdout="Success", stderr=""),
+        ) as mock_run:
+            ok, msg = _install_apks([str(path) for path in apk_paths])
+
+        assert ok is True
+        assert "4 个 APK" in msg
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["timeout"] == 120
+
+    def test_install_multiple_timeout_has_short_message(self, tmp_path):
+        from adb_pusher import _install_apks
+
+        apk_paths = [tmp_path / "base.apk", tmp_path / "config.en.apk"]
+        for path in apk_paths:
+            path.write_text("fake apk")
+
+        with patch(
+            "adb_pusher._run_adb",
+            side_effect=subprocess.TimeoutExpired("adb install-multiple", 90),
+        ):
+            ok, msg = _install_apks([str(path) for path in apk_paths])
+
+        assert ok is False
+        assert "拆分 APK 安装超时" in msg
+        assert str(tmp_path) not in msg
+
 
 class TestApkDownloadUrl:
     def test_detects_xapk_url_with_query_and_uppercase_extension(self):

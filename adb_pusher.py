@@ -30,6 +30,8 @@ _adb_path: str | None = None
 
 FIRST_ACTION_MIN_DELAY_MS = 15000
 DEFAULT_FOLLOWING_ACTION_MIN_DELAY_MS = 5000
+APK_INSTALL_TIMEOUT_SECONDS = 90
+SPLIT_APK_INSTALL_TIMEOUT_SECONDS_PER_APK = 30
 ZYGOTEHOLE_PERMISSION_FIX_SCRIPT = (
     "chmod 777 /data/local/tmp/zygotehole/config.json; "
     "chmod 444 /data/local/tmp/zygotehole/zygotehole.apk; "
@@ -558,16 +560,31 @@ def _collect_apks(root_dir: str, recursive: bool = True) -> list[str]:
 
 def _install_apks(apk_list: list[str]) -> tuple[bool, str]:
     """安装多个 APK（拆分 APK）"""
-    if len(apk_list) == 1:
-        result = _run_adb(["install", "-r", apk_list[0]])
-        if result.returncode == 0:
-            return True, "安装成功"
-        return False, f"安装失败: {result.stderr.strip() or result.stdout.strip()}"
+    try:
+        if len(apk_list) == 1:
+            result = _run_adb(
+                ["install", "-r", apk_list[0]],
+                timeout=APK_INSTALL_TIMEOUT_SECONDS,
+            )
+            if result.returncode == 0:
+                return True, "安装成功"
+            return False, f"安装失败: {result.stderr.strip() or result.stdout.strip()}"
 
-    result = _run_adb(["install-multiple", "-r"] + _sort_apks_for_install(apk_list))
-    if result.returncode == 0:
-        return True, f"安装成功 ({len(apk_list)} 个 APK)"
-    return False, f"安装失败: {result.stderr.strip() or result.stdout.strip()}"
+        timeout = max(
+            APK_INSTALL_TIMEOUT_SECONDS,
+            len(apk_list) * SPLIT_APK_INSTALL_TIMEOUT_SECONDS_PER_APK,
+        )
+        result = _run_adb(
+            ["install-multiple", "-r"] + _sort_apks_for_install(apk_list),
+            timeout=timeout,
+        )
+        if result.returncode == 0:
+            return True, f"安装成功 ({len(apk_list)} 个 APK)"
+        return False, f"安装失败: {result.stderr.strip() or result.stdout.strip()}"
+    except subprocess.TimeoutExpired:
+        if len(apk_list) == 1:
+            return False, f"安装超时：已等待 {APK_INSTALL_TIMEOUT_SECONDS} 秒"
+        return False, f"拆分 APK 安装超时：共 {len(apk_list)} 个 APK，请检查设备连接或稍后重试"
 
 
 def _install_xapk(xapk_path: str) -> tuple[bool, str]:
