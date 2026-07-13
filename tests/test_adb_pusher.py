@@ -121,7 +121,7 @@ class TestApkDownloadUrl:
 
 
 class TestAdbCommandBuilders:
-    def test_clear_app_cache_stops_app_and_uses_cache_only(self):
+    def test_clear_app_cache_stops_app_and_clears_data(self):
         from adb_pusher import clear_app_cache
 
         force_stop = MagicMock(returncode=0, stdout="", stderr="")
@@ -137,12 +137,12 @@ class TestAdbCommandBuilders:
         assert mock_run.call_args_list == [
             call(["shell", "am", "force-stop", "com.example.app"], timeout=5),
             call(
-                ["shell", "pm", "clear", "--cache-only", "com.example.app"],
+                ["shell", "pm", "clear", "com.example.app"],
                 timeout=8,
             ),
         ]
 
-    def test_build_clear_cache_cmd_stops_app_and_clears_cache_only(self):
+    def test_build_clear_cache_cmd_stops_app_and_clears_data(self):
         from adb_pusher import build_clear_cache_cmd
 
         with patch("adb_pusher.get_adb_path", return_value="/usr/bin/adb"):
@@ -153,7 +153,7 @@ class TestAdbCommandBuilders:
             "-c",
             (
                 "/usr/bin/adb shell am force-stop com.example.app && "
-                "/usr/bin/adb shell pm clear --cache-only com.example.app"
+                "/usr/bin/adb shell pm clear com.example.app"
             ),
         ]
 

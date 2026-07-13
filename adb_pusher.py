@@ -740,7 +740,7 @@ def clear_app_cache(package_name: str) -> tuple[bool, str]:
     try:
         _run_adb(["shell", "am", "force-stop", package_name], timeout=5)
         result = _run_adb(
-            ["shell", "pm", "clear", "--cache-only", package_name],
+            ["shell", "pm", "clear", package_name],
             timeout=8,
         )
         output = (result.stdout + result.stderr).strip()
@@ -925,7 +925,7 @@ def build_clear_cache_cmd(package_name: str) -> list[str]:
         "sh",
         "-c",
         f"{adb_cmd} shell am force-stop {pkg} && "
-        f"{adb_cmd} shell pm clear --cache-only {pkg}",
+        f"{adb_cmd} shell pm clear {pkg}",
     ]
 
 
