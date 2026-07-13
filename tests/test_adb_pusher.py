@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 import subprocess
 
 
@@ -124,21 +124,23 @@ class TestAdbCommandBuilders:
     def test_clear_app_cache_stops_app_and_uses_cache_only(self):
         from adb_pusher import clear_app_cache
 
-        result = MagicMock(returncode=0, stdout="Success\n", stderr="")
-        with patch("adb_pusher._run_adb", return_value=result) as mock_run:
+        force_stop = MagicMock(returncode=0, stdout="", stderr="")
+        clear_cache = MagicMock(returncode=0, stdout="Success\n", stderr="")
+        with patch(
+            "adb_pusher._run_adb",
+            side_effect=[force_stop, clear_cache],
+        ) as mock_run:
             ok, msg = clear_app_cache("com.example.app")
 
         assert ok is True
-        assert "缓存清除成功" in msg
-        mock_run.assert_called_once_with(
-            [
-                "shell",
-                "sh",
-                "-c",
-                "am force-stop com.example.app; pm clear --cache-only com.example.app",
-            ],
-            timeout=8,
-        )
+        assert msg == "缓存清除成功"
+        assert mock_run.call_args_list == [
+            call(["shell", "am", "force-stop", "com.example.app"], timeout=5),
+            call(
+                ["shell", "pm", "clear", "--cache-only", "com.example.app"],
+                timeout=8,
+            ),
+        ]
 
     def test_build_clear_cache_cmd_stops_app_and_clears_cache_only(self):
         from adb_pusher import build_clear_cache_cmd
@@ -147,11 +149,12 @@ class TestAdbCommandBuilders:
             cmd = build_clear_cache_cmd("com.example.app")
 
         assert cmd == [
-            "/usr/bin/adb",
-            "shell",
             "sh",
             "-c",
-            "am force-stop com.example.app; pm clear --cache-only com.example.app",
+            (
+                "/usr/bin/adb shell am force-stop com.example.app && "
+                "/usr/bin/adb shell pm clear --cache-only com.example.app"
+            ),
         ]
 
     def test_packages_to_uninstall_keeps_whitelisted_packages(self):

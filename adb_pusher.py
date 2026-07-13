@@ -738,21 +738,14 @@ def clear_app_cache(package_name: str) -> tuple[bool, str]:
     if not package_name:
         return False, "请输入包名"
     try:
+        _run_adb(["shell", "am", "force-stop", package_name], timeout=5)
         result = _run_adb(
-            [
-                "shell",
-                "sh",
-                "-c",
-                (
-                    f"am force-stop {shlex.quote(package_name)}; "
-                    f"pm clear --cache-only {shlex.quote(package_name)}"
-                ),
-            ],
+            ["shell", "pm", "clear", "--cache-only", package_name],
             timeout=8,
         )
         output = (result.stdout + result.stderr).strip()
         if result.returncode == 0 and "Success" in output:
-            return True, f"缓存清除成功\n{output}"
+            return True, "缓存清除成功"
         return False, f"清除失败\n{output}"
     except FileNotFoundError:
         return False, "未找到 ADB 工具"
@@ -926,13 +919,13 @@ def build_get_uid_cmd(package_name: str) -> list[str]:
 
 def build_clear_cache_cmd(package_name: str) -> list[str]:
     adb = get_adb_path()
+    adb_cmd = shlex.quote(adb)
     pkg = shlex.quote(package_name)
     return [
-        adb,
-        "shell",
         "sh",
         "-c",
-        f"am force-stop {pkg}; pm clear --cache-only {pkg}",
+        f"{adb_cmd} shell am force-stop {pkg} && "
+        f"{adb_cmd} shell pm clear --cache-only {pkg}",
     ]
 
 
