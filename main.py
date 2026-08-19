@@ -8,7 +8,8 @@ def create_root():
 
 def main():
     root = create_root()
-    APKToolApp(root)
+    app = APKToolApp(root)
+    app.start_background_services()
     root.mainloop()
 
 

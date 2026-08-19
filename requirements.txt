@@ -5,3 +5,5 @@ fastapi>=0.100.0
 uvicorn>=0.23.0
 websockets
 python-multipart
+requests>=2.31.0
+asana>=5.0.0

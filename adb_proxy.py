@@ -16,12 +16,39 @@ import urllib.parse
 import urllib.error
 import tempfile
 import zipfile
+from datetime import date
 from pathlib import Path
 
 import websockets
 from websockets.asyncio.server import serve as ws_serve
 
-from adb_pusher import download_artifact_filename, parse_autodetector_fields
+from adb_pusher import (
+    PackageRuntimeMonitor,
+    build_apkcombo_search_url,
+    download_artifact_filename,
+    get_app_uid,
+    parse_autodetector_fields,
+    set_adb_path as set_core_adb_path,
+)
+from ad_replay import (
+    DEFAULT_REPLAY_TIMEOUT_SECONDS,
+    ReplayExpectation,
+    build_replay_failure_comment,
+    run_ad_replay_check,
+    validate_replay_timeout,
+)
+from automation_adaptation import (
+    add_automation_comment_once,
+    attribution_gate_issue,
+    build_aggregation_assessment,
+    detect_aggregation_with_one_retry,
+    has_aggregation_type,
+    submit_backend_via_api,
+    update_asana_aggregation_notes,
+)
+from daily_summary import generate_daily_asana_summary
+from auto_asana.main import build_asana_client
+from web_precheck import load_today_precheck_tasks, run_web_precheck
 
 
 # ── ADB 路径 ─────────────────────────────────────────────────────
@@ -106,6 +133,7 @@ def _init_adb() -> str:
 
 
 _adb_path = _init_adb()
+set_core_adb_path(_adb_path)
 
 
 def _find_adb() -> str:
@@ -466,6 +494,7 @@ async def handle_connection(ws):
     global _logcat_proc
     _connected_ws.add(ws)
     logcat_task: asyncio.Task | None = None
+    automation_stop_event = threading.Event()
 
     # 推送初始设备状态 + 最新回填数据（如果有）
     try:
@@ -535,12 +564,13 @@ async def handle_connection(ws):
                     asyncio.create_task(_run_cmd_ws(ws, cmd, timeout=15))
 
                 elif action == "open_apkcombo":
-                    if not pkg:
-                        await ws.send(json.dumps({"type": "error", "text": "无法提取包名"}))
+                    target_url = build_apkcombo_search_url(url or pkg)
+                    if not target_url:
+                        await ws.send(json.dumps({"type": "error", "text": "无法识别 Google Play 链接或包名"}))
                         continue
                     cmd = [_find_adb(), "shell", "am", "start", "-a",
                            "android.intent.action.VIEW", "-d",
-                           f"https://apkcombo.com/downloader/#package={pkg}"]
+                           target_url]
                     await ws.send(json.dumps({"type": "cmd_display", "text": _cmd_display(cmd)}))
                     asyncio.create_task(_run_cmd_ws(ws, cmd, timeout=15))
 
@@ -633,6 +663,339 @@ async def handle_connection(ws):
                 await ws.send(json.dumps({"type": "cmd_display", "text": "adb logcat -d | grep ZGSDK.AutoDetector (字段提取)"}))
                 extracted = _extract_fields()
                 await ws.send(json.dumps({"type": "extracted_fields", **extracted}))
+
+            elif msg_type == "automation_extract_fields":
+                request_id = str(msg.get("request_id") or "")
+                package_name = str(msg.get("package_name") or "").strip()
+                task_gid = str(msg.get("task_gid") or "").strip()
+                asana_pat = str(msg.get("asana_pat") or "").strip()
+                loop = asyncio.get_running_loop()
+                automation_stop_event.clear()
+
+                def _detection_progress(text: str):
+                    asyncio.run_coroutine_threadsafe(
+                        ws.send(json.dumps({
+                            "type": "automation_progress",
+                            "request_id": request_id,
+                            "text": text,
+                        }, ensure_ascii=False)),
+                        loop,
+                    )
+
+                runtime_monitor = PackageRuntimeMonitor(package_name)
+                result = await asyncio.to_thread(
+                    detect_aggregation_with_one_retry,
+                    package_name,
+                    _extract_fields,
+                    stop_event=automation_stop_event,
+                    on_progress=_detection_progress,
+                    runtime_check=runtime_monitor.poll,
+                    runtime_reset=runtime_monitor.reset,
+                )
+                if isinstance(result.get("fields"), dict):
+                    result["assessment"] = build_aggregation_assessment(
+                        result["fields"]
+                    )
+                if (
+                    result.get("code") in {
+                        "AGGREGATION_TYPE_EMPTY",
+                        "AF_KEY_EMPTY",
+                        "AD_IDS_EMPTY",
+                        "UNSUPPORTED_ATTRIBUTION",
+                        "APP_CRASHED",
+                        "APP_EXITED_DURING_AUTOMATION",
+                        "AGGREGATION_RESULT_INCOMPLETE",
+                    }
+                    and task_gid
+                    and asana_pat
+                ):
+                    try:
+                        client = build_asana_client(asana_pat)
+                        await asyncio.to_thread(
+                            add_automation_comment_once,
+                            client,
+                            task_gid,
+                            result.get("code"),
+                            f"{result.get('message')}\n包名：{package_name}"
+                            + (
+                                "\n关键崩溃日志：\n"
+                                + str((result.get("runtime") or {}).get("summary"))
+                                if (result.get("runtime") or {}).get("summary")
+                                else ""
+                            ),
+                        )
+                    except Exception as exc:
+                        result["comment_error"] = str(exc)
+                await ws.send(json.dumps({
+                    "type": "automation_result",
+                    "request_id": request_id,
+                    **result,
+                }, ensure_ascii=False))
+
+            elif msg_type == "automation_asana_fill":
+                request_id = str(msg.get("request_id") or "")
+                try:
+                    client = build_asana_client(str(msg.get("asana_pat") or ""))
+                    merged = await asyncio.to_thread(
+                        update_asana_aggregation_notes,
+                        client,
+                        str(msg.get("task_gid") or ""),
+                        str(msg.get("existing_notes") or ""),
+                        dict(msg.get("fields") or {}),
+                        allow_unsupported_attribution=bool(
+                            msg.get("allow_unsupported_attribution")
+                        ),
+                    )
+                    await ws.send(json.dumps({
+                        "type": "automation_result",
+                        "request_id": request_id,
+                        "ok": True,
+                        "code": "ASANA_FILLED",
+                        "message": "聚合参数已回填至 Asana 描述",
+                        "notes": merged,
+                    }, ensure_ascii=False))
+                except Exception as exc:
+                    await ws.send(json.dumps({
+                        "type": "automation_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "code": "ASANA_FILL_FAILED",
+                        "error": str(exc),
+                    }, ensure_ascii=False))
+
+            elif msg_type == "automation_backend_submit":
+                request_id = str(msg.get("request_id") or "")
+                package_name = str(msg.get("package_name") or "")
+                task_gid = str(msg.get("task_gid") or "")
+                asana_pat = str(msg.get("asana_pat") or "")
+                result = await asyncio.to_thread(
+                    submit_backend_via_api,
+                    dict(msg.get("fields") or {}),
+                    package_name,
+                    api_url=str(msg.get("api_url") or ""),
+                    x_token=str(msg.get("x_token") or ""),
+                    token=str(msg.get("token") or ""),
+                    user_name=str(msg.get("user_name") or "rain"),
+                    stop_event=automation_stop_event,
+                    allow_unsupported_attribution=bool(
+                        msg.get("allow_unsupported_attribution")
+                    ),
+                )
+                if (
+                    result.get("ok")
+                    and msg.get("allow_unsupported_attribution")
+                    and task_gid
+                    and asana_pat
+                ):
+                    issue = attribution_gate_issue(dict(msg.get("fields") or {}))
+                    if issue:
+                        try:
+                            client = build_asana_client(asana_pat)
+                            await asyncio.to_thread(
+                                add_automation_comment_once,
+                                client,
+                                task_gid,
+                                issue[0],
+                                f"{issue[1]}\n包名：{package_name}",
+                            )
+                        except Exception as exc:
+                            result["comment_error"] = str(exc)
+                if not result.get("ok") and task_gid and asana_pat:
+                    try:
+                        client = build_asana_client(asana_pat)
+                        await asyncio.to_thread(
+                            add_automation_comment_once,
+                            client,
+                            task_gid,
+                            result.get("code", "BACKEND_SUBMIT_FAILED"),
+                            result.get("message", "后台自动提交失败"),
+                        )
+                    except Exception as exc:
+                        result["comment_error"] = str(exc)
+                await ws.send(json.dumps({
+                    "type": "automation_result",
+                    "request_id": request_id,
+                    **result,
+                }, ensure_ascii=False))
+
+            elif msg_type == "automation_replay":
+                request_id = str(msg.get("request_id") or "")
+                package_name = str(msg.get("package_name") or "").strip()
+                task_gid = str(msg.get("task_gid") or "")
+                asana_pat = str(msg.get("asana_pat") or "")
+                loop = asyncio.get_running_loop()
+                automation_stop_event.clear()
+
+                def _automation_progress(text: str):
+                    asyncio.run_coroutine_threadsafe(
+                        ws.send(json.dumps({
+                            "type": "automation_progress",
+                            "request_id": request_id,
+                            "text": text,
+                        }, ensure_ascii=False)),
+                        loop,
+                    )
+
+                try:
+                    timeout = validate_replay_timeout(
+                        msg.get("timeout_seconds", DEFAULT_REPLAY_TIMEOUT_SECONDS)
+                    )
+                    expectation = ReplayExpectation.from_values(
+                        msg.get("interstitial_ids"),
+                        msg.get("rewarded_ids"),
+                        msg.get("aggregation_verdict"),
+                    )
+                    uid_ok, uid = await asyncio.to_thread(get_app_uid, package_name)
+                    if not uid_ok:
+                        raise RuntimeError(uid)
+                    result = await asyncio.to_thread(
+                        run_ad_replay_check,
+                        package_name,
+                        uid,
+                        expectation,
+                        timeout,
+                        stop_event=automation_stop_event,
+                        on_progress=_automation_progress,
+                    )
+                    if not result.get("ok") and task_gid and asana_pat:
+                        comment = build_replay_failure_comment(package_name, result)
+                        comment = "\n".join(comment.splitlines()[1:])
+                        try:
+                            client = build_asana_client(asana_pat)
+                            await asyncio.to_thread(
+                                add_automation_comment_once,
+                                client,
+                                task_gid,
+                                result.get("code", "AD_REPLAY_FAILED"),
+                                comment,
+                            )
+                        except Exception as exc:
+                            result["comment_error"] = str(exc)
+                    await ws.send(json.dumps({
+                        "type": "automation_result",
+                        "request_id": request_id,
+                        **result,
+                    }, ensure_ascii=False))
+                except Exception as exc:
+                    if task_gid and asana_pat:
+                        try:
+                            client = build_asana_client(asana_pat)
+                            await asyncio.to_thread(
+                                add_automation_comment_once,
+                                client,
+                                task_gid,
+                                "AD_REPLAY_FAILED",
+                                (
+                                    "聚合广告回放检测执行失败，需要测试人员确认\n"
+                                    f"包名：{package_name}\n失败原因：{exc}"
+                                ),
+                            )
+                        except Exception:
+                            pass
+                    await ws.send(json.dumps({
+                        "type": "automation_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "code": "AD_REPLAY_FAILED",
+                        "error": str(exc),
+                    }, ensure_ascii=False))
+
+            elif msg_type == "automation_stop":
+                automation_stop_event.set()
+                await ws.send(json.dumps({
+                    "type": "automation_progress",
+                    "request_id": str(msg.get("request_id") or ""),
+                    "text": "已请求停止自动化回放监听",
+                }, ensure_ascii=False))
+
+            elif msg_type == "asana_today_tasks":
+                request_id = str(msg.get("request_id") or "")
+                try:
+                    result = await asyncio.to_thread(
+                        load_today_precheck_tasks,
+                        str(msg.get("project_gid") or ""),
+                        str(msg.get("asana_pat") or ""),
+                    )
+                    await ws.send(json.dumps({
+                        "type": "asana_today_tasks_result",
+                        "request_id": request_id,
+                        "ok": True,
+                        **result,
+                    }, ensure_ascii=False))
+                except Exception as exc:
+                    await ws.send(json.dumps({
+                        "type": "asana_today_tasks_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": str(exc),
+                    }, ensure_ascii=False))
+
+            elif msg_type == "daily_summary_generate":
+                request_id = str(msg.get("request_id") or "")
+                try:
+                    target_date = date.fromisoformat(str(msg.get("date") or ""))
+                    client = build_asana_client(str(msg.get("asana_pat") or ""))
+                    result = await asyncio.to_thread(
+                        generate_daily_asana_summary,
+                        client,
+                        str(msg.get("project_gid") or ""),
+                        target_date,
+                    )
+                    await ws.send(json.dumps({
+                        "type": "daily_summary_result",
+                        "request_id": request_id,
+                        **result,
+                    }, ensure_ascii=False))
+                except Exception as exc:
+                    await ws.send(json.dumps({
+                        "type": "daily_summary_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": str(exc),
+                    }, ensure_ascii=False))
+
+            elif msg_type == "play_precheck":
+                request_id = str(msg.get("request_id") or "")
+                loop = asyncio.get_running_loop()
+
+                def _progress(text: str):
+                    asyncio.run_coroutine_threadsafe(
+                        ws.send(json.dumps({
+                            "type": "play_precheck_progress",
+                            "request_id": request_id,
+                            "text": text,
+                        }, ensure_ascii=False)),
+                        loop,
+                    )
+
+                try:
+                    result = await asyncio.to_thread(
+                        run_web_precheck,
+                        str(msg.get("value") or ""),
+                        auto_install=bool(msg.get("auto_install", False)),
+                        launch_check=bool(msg.get("launch_check", True)),
+                        observation_seconds=int(msg.get("observation_seconds", 20)),
+                        task_gid=str(msg.get("task_gid") or ""),
+                        asana_pat=str(msg.get("asana_pat") or ""),
+                        backend_api_url=str(msg.get("backend_api_url") or ""),
+                        backend_x_token=str(msg.get("backend_x_token") or ""),
+                        backend_token=str(msg.get("backend_token") or ""),
+                        backend_user_name=str(msg.get("backend_user_name") or "rain"),
+                        on_progress=_progress,
+                    )
+                    await ws.send(json.dumps({
+                        "type": "play_precheck_result",
+                        "request_id": request_id,
+                        "ok": True,
+                        "result": result,
+                    }, ensure_ascii=False))
+                except Exception as exc:
+                    await ws.send(json.dumps({
+                        "type": "play_precheck_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": str(exc),
+                    }, ensure_ascii=False))
 
             else:
                 await ws.send(json.dumps({"type": "error", "text": f"未知消息类型: {msg_type}"}))

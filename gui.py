@@ -10,11 +10,15 @@ from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 from PIL import Image, ImageTk
 import os
+import selectors
 import subprocess
 
 from qr_generator import generate_qr
 from auto_asana.main import (
+    add_precheck_comment_once,
+    build_asana_client,
     build_sync_clients,
+    get_asana_tasks_for_date,
     sync_packages,
     sync_cp_adapt_records_to_sheet,
     SHEET_ID as DEFAULT_SHEET_ID,
@@ -38,10 +42,44 @@ from adb_pusher import (
     extract_logcat_fields, download_and_install,
     build_backend_url, extract_uid_from_dumpsys, parse_fill_url,
     extract_google_play_package, is_apk_download_url,
+    build_apkcombo_search_url,
     normalize_action_script_text,
+    normalize_optional_parameter,
     DEFAULT_FOLLOWING_ACTION_MIN_DELAY_MS,
     DEFAULT_KEEP_THIRD_PARTY_PACKAGES,
+    cancel_zygotehole_injection,
+    install_google_play_app,
+    is_package_installed,
+    open_google_play_page,
+    run_app_launch_precheck,
+    PackageRuntimeMonitor,
+    dismiss_notification_permission_dialog,
+    run_google_play_precheck,
 )
+from ad_replay import (
+    DEFAULT_REPLAY_TIMEOUT_SECONDS,
+    ReplayExpectation,
+    build_replay_failure_comment,
+    run_ad_replay_check,
+    validate_replay_timeout,
+)
+from automation_adaptation import (
+    add_automation_comment_once,
+    attribution_gate_issue,
+    build_aggregation_assessment,
+    clear_backend_adaptation_via_api,
+    detect_aggregation_with_one_retry,
+    detection_field_issue,
+    format_aggregation_fields,
+    has_explicit_attribution,
+    has_aggregation_type,
+    is_inferred_aggregation_result,
+    submit_backend_via_api,
+    submit_precheck_blacklist_via_api,
+    update_asana_aggregation_notes,
+    INFERRED_AGGREGATION_FAILURE_NOTE,
+)
+from daily_summary import generate_daily_asana_summary
 
 CONFIG_DEFAULT = os.path.expanduser(
     "~/Documents/适配动作与聚合参数获取_260629/config.json"
@@ -52,6 +90,18 @@ WORK_DIR_DEFAULT = os.path.expanduser(
 
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "gui_settings.json")
 CRASH_LOG = os.path.join(os.path.dirname(__file__), "gui_crash.log")
+AUTOMATION_AGGREGATION_TASK_UUID = "mediation_test_snow"
+AUTOMATION_INFRASTRUCTURE_FAILURE_CODES = frozenset(
+    {
+        "ADB_NOT_FOUND",
+        "ADB_UNAUTHORIZED",
+        "ADB_OFFLINE",
+        "ADB_NO_DEVICE",
+        "ADB_SERVER_TIMEOUT",
+        "LOGCAT_READ_TIMEOUT",
+        "LOGCAT_READ_FAILED",
+    }
+)
 
 
 def load_gui_settings(settings_path: str = SETTINGS_PATH) -> dict:
@@ -77,6 +127,32 @@ def get_remembered_path(settings: dict, key: str, default: str) -> str:
 def get_remembered_text(settings: dict, key: str, default: str) -> str:
     value = settings.get(key)
     return value if isinstance(value, str) else default
+
+
+def extract_asana_task_gid(value: str) -> str:
+    """Extract the task GID from a pasted Asana task URL or a raw GID."""
+    text = (value or "").strip()
+    if re.fullmatch(r"\d+", text):
+        return text
+
+    # Inbox activity links identify the actual task after /item/.  The
+    # trailing /story/ number is an activity/comment GID and must be ignored.
+    match = re.search(r"/(?:item|task)/(\d+)(?=[/?#]|$)", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    # Canonical Asana links commonly use /0/<project_gid>/<task_gid>.
+    match = re.search(
+        r"app\.asana\.com/(?:0|1)/(\d+)/(\d+)(?=[/?#]|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(2)
+
+    raise ValueError(
+        "未从地址中找到 Asana 任务 GID；请粘贴包含 /item/、/task/ 的任务地址"
+    )
 
 
 def _setup_crash_log():
@@ -112,6 +188,12 @@ class APKToolApp:
         self._last_fill_data: dict = {}
         self._fill_poller_running = True
         self._sync_running = False
+        self._precheck_running = False
+        self._precheck_cancel_requested = False
+        self._precheck_auto_adapt_btn = None
+        self._precheck_tasks: dict[str, object] = {}
+        self._precheck_new_task_gids: set[str] = set()
+        self._precheck_manual_selection = False
         self._closing = False
         self._after_ids: set[str] = set()
         self._settings = load_gui_settings()
@@ -123,6 +205,34 @@ class APKToolApp:
         self._current_command_proc: subprocess.Popen | None = None
         self._op_buttons: list[ttk.Button] = []
         self.cleanup_preview_var = tk.StringVar(value="未预览")
+        self.precheck_auto_install_var = tk.BooleanVar(value=True)
+        self.precheck_download_limit_var = tk.StringVar(value="6")
+        self.precheck_download_cooldown_var = tk.StringVar(value="60")
+        self.precheck_launch_check_var = tk.BooleanVar(value=True)
+        self.precheck_launch_observation_var = tk.StringVar(value="20")
+        self.automation_task_gid_var = tk.StringVar(value="")
+        self.automation_package_var = tk.StringVar(value="")
+        self.automation_appid_var = tk.StringVar(value="")
+        self.automation_replay_timeout_var = tk.StringVar(
+            value=str(DEFAULT_REPLAY_TIMEOUT_SECONDS)
+        )
+        self._automation_task_notes = ""
+        self._automation_precheck_item_id = ""
+        self._automation_fields: dict = {}
+        # Incremented whenever the current automation task/field extraction
+        # context changes.  Delayed Tk callbacks from package A must not paint
+        # its fields back onto package B after the batch switches tasks.
+        self._automation_context_version = 0
+        self._automation_running = False
+        self._automation_stop_event = threading.Event()
+        self._automation_pause_event = threading.Event()
+        self._automation_batch_active = False
+        self._automation_batch_btn = None
+        self._automation_pause_btn = None
+        self._daily_summary_running = False
+        self.daily_summary_date_var = tk.StringVar(
+            value=datetime.now().strftime("%Y-%m-%d")
+        )
         self._syncing_cleanup_keep_text = False
 
         # ── 数据同步配置 ──
@@ -149,6 +259,7 @@ class APKToolApp:
                 self._settings, "sync_parent_task_gid", DEFAULT_PARENT_TASK_GID
             )
         )
+        self.parent_task_url_var = tk.StringVar(value="")
         self.cp_adapt_api_url_var = tk.StringVar(
             value=get_remembered_text(
                 self._settings, "sync_cp_adapt_api_url", DEFAULT_CP_ADAPT_LIST_URL
@@ -186,11 +297,13 @@ class APKToolApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Destroy>", self._on_root_destroy, add="+")
 
-        # 后台轮询 HTTP /fill/latest，接收适配表回填数据
-        self._fill_poller = threading.Thread(
-            target=self._fill_poller_loop, daemon=True
-        )
-        self._fill_poller.start()
+        # 由 main() 在窗口构建完成后启动，避免仅构建窗口的调用方产生
+        # 不必要的网络轮询线程。
+        self._fill_poller: threading.Thread | None = None
+
+    def start_background_services(self):
+        """Start long-running desktop services after the UI is ready."""
+        self._start_fill_poller()
 
     def _on_root_destroy(self, event):
         if event.widget is self.root:
@@ -206,6 +319,9 @@ class APKToolApp:
     def _safe_after(self, delay_ms: int, callback, *args):
         """Schedule a Tk callback only while the main window is alive."""
         if self._closing or not self._root_exists():
+            return None
+        if delay_ms == 0 and threading.current_thread() is threading.main_thread():
+            callback(*args)
             return None
 
         after_id = None
@@ -250,6 +366,7 @@ class APKToolApp:
             self._logcat_proc = None
             self._logcat_thread = None
             self._active_pattern = None
+        self._automation_stop_event.set()
         self._cancel_pending_afters()
         try:
             self.root.destroy()
@@ -272,6 +389,16 @@ class APKToolApp:
             except Exception:
                 pass
             time.sleep(2)
+
+    def _start_fill_poller(self):
+        if self._closing or not self._fill_poller_running:
+            return
+        if self._fill_poller is not None and self._fill_poller.is_alive():
+            return
+        self._fill_poller = threading.Thread(
+            target=self._fill_poller_loop, daemon=True
+        )
+        self._fill_poller.start()
 
     def _apply_fill_data(self, data: dict):
         """将回填数据写入输入框"""
@@ -418,6 +545,1365 @@ class APKToolApp:
         qr_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.qr_label = ttk.Label(qr_frame)
         self.qr_label.pack()
+
+    # ── Google Play 页面预检 Tab ────────────────────────────────
+
+    def _build_precheck_tab(self, parent: ttk.Frame):
+        pad = {"padx": 10, "pady": 6}
+        today_section = f"{datetime.now().month}.{datetime.now().day}执行"
+
+        intro = ttk.LabelFrame(parent, text="预检说明", padding=10)
+        intro.pack(fill=tk.X, **pad)
+        ttk.Label(
+            intro,
+            text=(
+                "优先读取手机 UI 控件，信息不足时自动使用内存截图 OCR，不保留正常截图。"
+                "检测到加黑结论后，自动使用“数据同步”页后台凭证提交加黑原因并刷新缓存；"
+                "提交失败会保留明确状态和 Asana 失败评论。"
+            ),
+            foreground="gray",
+            wraplength=800,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+        asana_frame = ttk.LabelFrame(
+            parent, text=f"今日 Asana 任务（仅 {today_section}）", padding=8
+        )
+        asana_frame.pack(fill=tk.BOTH, expand=False, **pad)
+        asana_toolbar = ttk.Frame(asana_frame)
+        asana_toolbar.pack(fill=tk.X, pady=(0, 5))
+        self._precheck_load_asana_btn = ttk.Button(
+            asana_toolbar,
+            text="读取今日任务",
+            command=self._on_load_today_asana_tasks,
+        )
+        self._precheck_load_asana_btn.pack(side=tk.LEFT)
+        self._precheck_batch_btn = ttk.Button(
+            asana_toolbar,
+            text="批量预检今日待处理",
+            command=self._on_start_batch_precheck,
+        )
+        self._precheck_batch_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self._precheck_auto_adapt_btn = ttk.Button(
+            asana_toolbar,
+            text="批量预检并自动适配",
+            command=self._on_start_precheck_then_automation,
+        )
+        self._precheck_auto_adapt_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self._precheck_stop_btn = ttk.Button(
+            asana_toolbar,
+            text="停止",
+            command=self._on_stop_batch_precheck,
+            state=tk.DISABLED,
+        )
+        self._precheck_stop_btn.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(
+            asana_toolbar,
+            text="自动跳过已完成任务",
+            foreground="gray",
+        ).pack(side=tk.LEFT, padx=10)
+        self._precheck_asana_status = ttk.Label(
+            asana_toolbar, text="尚未读取", foreground="gray"
+        )
+        self._precheck_asana_status.pack(side=tk.RIGHT)
+
+        task_table_frame = ttk.Frame(asana_frame)
+        task_table_frame.pack(fill=tk.BOTH, expand=True)
+        self.precheck_task_tree = ttk.Treeview(
+            task_table_frame,
+            columns=("order", "package", "gp", "status"),
+            show="headings",
+            height=6,
+            selectmode="browse",
+        )
+        self.precheck_task_tree.heading("order", text="顺序")
+        self.precheck_task_tree.heading("package", text="包名")
+        self.precheck_task_tree.heading("gp", text="GP 链接")
+        self.precheck_task_tree.heading("status", text="任务状态")
+        self.precheck_task_tree.column(
+            "order", width=48, minwidth=48, anchor=tk.CENTER, stretch=False
+        )
+        self.precheck_task_tree.column("package", width=260, minwidth=220)
+        self.precheck_task_tree.column("gp", width=390, minwidth=280)
+        # Statuses such as "APKCombo待确认" and "已加黑(后台)" were clipped
+        # by the old fixed 80 px column. Keep enough reserved space for the
+        # complete workflow state while allowing package/GP columns to absorb
+        # window resizing.
+        self.precheck_task_tree.column(
+            "status", width=180, minwidth=160, anchor=tk.W, stretch=False
+        )
+        task_scrollbar = ttk.Scrollbar(
+            task_table_frame, orient=tk.VERTICAL, command=self.precheck_task_tree.yview
+        )
+        self.precheck_task_tree.configure(yscrollcommand=task_scrollbar.set)
+        self.precheck_task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        task_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.precheck_task_tree.bind("<<TreeviewSelect>>", self._on_precheck_task_selected)
+
+        inspect_frame = ttk.LabelFrame(parent, text="页面检查", padding=10)
+        inspect_frame.pack(fill=tk.X, **pad)
+        ttk.Label(inspect_frame, text="GP 链接或包名:").pack(anchor=tk.W)
+        input_row = ttk.Frame(inspect_frame)
+        input_row.pack(fill=tk.X, pady=(4, 6))
+        self.precheck_input = ttk.Entry(input_row)
+        self.precheck_input.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            input_row, text="从 APK 工具带入", command=self._on_precheck_use_apk_input
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        action_row = ttk.Frame(inspect_frame)
+        action_row.pack(fill=tk.X)
+        ttk.Button(
+            action_row, text="只打开页面", command=self._on_precheck_open_page
+        ).pack(side=tk.LEFT)
+        self._precheck_start_btn = ttk.Button(
+            action_row, text="开始页面预检", command=self._on_start_precheck
+        )
+        self._precheck_start_btn.pack(side=tk.LEFT, padx=6)
+        ttk.Checkbutton(
+            action_row,
+            text="检测到广告后自动下载安装",
+            variable=self.precheck_auto_install_var,
+        ).pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Label(action_row, text="单批上限").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            action_row,
+            from_=1,
+            to=10,
+            width=3,
+            textvariable=self.precheck_download_limit_var,
+        ).pack(side=tk.LEFT, padx=(3, 3))
+        ttk.Label(action_row, text="个，间隔").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            action_row,
+            from_=0,
+            to=600,
+            increment=10,
+            width=4,
+            textvariable=self.precheck_download_cooldown_var,
+        ).pack(side=tk.LEFT, padx=(3, 3))
+        ttk.Label(action_row, text="秒").pack(side=tk.LEFT, padx=(0, 6))
+        self._precheck_status = ttk.Label(action_row, text="就绪", foreground="gray")
+        self._precheck_status.pack(side=tk.LEFT, padx=8)
+
+        launch_row = ttk.Frame(inspect_frame)
+        launch_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Checkbutton(
+            launch_row,
+            text="安装完成后启动应用检查闪退",
+            variable=self.precheck_launch_check_var,
+        ).pack(side=tk.LEFT)
+        ttk.Label(launch_row, text="观察").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Spinbox(
+            launch_row,
+            from_=5,
+            to=120,
+            increment=5,
+            width=4,
+            textvariable=self.precheck_launch_observation_var,
+        ).pack(side=tk.LEFT, padx=3)
+        ttk.Label(
+            launch_row,
+            text="秒；检查结束后自动强制停止应用，再处理下一条",
+            foreground="gray",
+        ).pack(side=tk.LEFT)
+
+        result_frame = ttk.LabelFrame(parent, text="预检结果", padding=8)
+        result_frame.pack(fill=tk.BOTH, expand=True, **pad)
+        self._precheck_result_title = ttk.Label(
+            result_frame, text="等待检查", font=("TkDefaultFont", 13, "bold")
+        )
+        self._precheck_result_title.pack(anchor=tk.W, pady=(0, 5))
+        output_wrap = ttk.Frame(result_frame)
+        output_wrap.pack(fill=tk.BOTH, expand=True)
+        self.precheck_output = tk.Text(
+            output_wrap,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            height=10,
+            font=("Menlo", 10),
+            bg="#1e1e1e",
+            fg="#d4d4d4",
+            insertbackground="white",
+        )
+        result_scrollbar = ttk.Scrollbar(output_wrap, command=self.precheck_output.yview)
+        self.precheck_output.configure(yscrollcommand=result_scrollbar.set)
+        self.precheck_output.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        result_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _set_precheck_input(self, value: str):
+        if not value:
+            return
+        self.precheck_input.delete(0, tk.END)
+        self.precheck_input.insert(0, value)
+
+    def _on_precheck_use_apk_input(self):
+        self._set_precheck_input(self.url_entry.get().strip())
+
+    def _on_precheck_task_selected(self, _event=None):
+        if _event is not None:
+            self._precheck_manual_selection = True
+        selected = self.precheck_task_tree.selection()
+        if not selected:
+            return
+        task = self._precheck_tasks.get(selected[0])
+        if task is None:
+            return
+        value = getattr(task, "gp_link", "") or getattr(task, "package_name", "")
+        self._set_precheck_input(value)
+
+    def _selected_precheck_task(self):
+        selected = self.precheck_task_tree.selection()
+        if not selected:
+            return None, None
+        item_id = selected[0]
+        return item_id, self._precheck_tasks.get(item_id)
+
+    def _precheck_batch_queue_from_selection(self):
+        """Return only newly discovered tasks unless an old row is selected."""
+        ordered_item_ids = list(self.precheck_task_tree.get_children())
+        selected = self.precheck_task_tree.selection()
+        start_index = 0
+        if selected and selected[0] in ordered_item_ids:
+            start_index = ordered_item_ids.index(selected[0])
+        selected_gid = ""
+        if selected:
+            selected_task = self._precheck_tasks.get(selected[0])
+            selected_gid = str(getattr(selected_task, "gid", "") or "")
+        if not self._precheck_new_task_gids and not self._precheck_manual_selection:
+            return [], start_index + 1
+        new_only = bool(self._precheck_new_task_gids) and (
+            not selected_gid or selected_gid in self._precheck_new_task_gids
+        )
+        queue = []
+        for item_id in ordered_item_ids[start_index:]:
+            task = self._precheck_tasks.get(item_id)
+            gid = str(getattr(task, "gid", "") or "")
+            values = self.precheck_task_tree.item(item_id, "values")
+            status = str(values[3] or "") if len(values) >= 4 else ""
+            if (
+                task is None
+                or getattr(task, "completed", False)
+                or getattr(task, "workflow_terminal", False)
+                or (new_only and gid not in self._precheck_new_task_gids)
+                or (new_only and status != "新增待预检")
+            ):
+                continue
+            queue.append((item_id, task))
+        return queue, start_index + 1
+
+    def _precheck_seen_key(self) -> str:
+        project_gid = self.project_gid_var.get().strip()
+        return f"{project_gid}:{datetime.now().date().isoformat()}"
+
+    def _known_precheck_gids(self) -> set[str]:
+        records = self._settings.get("precheck_seen_task_gids")
+        if not isinstance(records, dict):
+            return set()
+        values = records.get(self._precheck_seen_key())
+        return {str(value) for value in values} if isinstance(values, list) else set()
+
+    def _remember_precheck_gids(self, gids: set[str]):
+        records = self._settings.get("precheck_seen_task_gids")
+        records = dict(records) if isinstance(records, dict) else {}
+        records[self._precheck_seen_key()] = sorted(gids)
+        # Keep the settings file bounded while preserving recent workdays.
+        if len(records) > 14:
+            records = dict(sorted(records.items())[-14:])
+        self._settings["precheck_seen_task_gids"] = records
+        try:
+            save_gui_settings(self._settings)
+        except OSError as exc:
+            self._precheck_asana_status.config(
+                text=f"任务增量记录保存失败: {exc}", foreground="#ef5350"
+            )
+
+    def _pending_precheck_gids(self) -> set[str]:
+        records = self._settings.get("precheck_pending_task_gids")
+        if not isinstance(records, dict):
+            return set()
+        values = records.get(self._precheck_seen_key())
+        return {str(value) for value in values} if isinstance(values, list) else set()
+
+    def _remember_pending_precheck_gids(self, gids: set[str]):
+        records = self._settings.get("precheck_pending_task_gids")
+        records = dict(records) if isinstance(records, dict) else {}
+        records[self._precheck_seen_key()] = sorted(gids)
+        if len(records) > 14:
+            records = dict(sorted(records.items())[-14:])
+        self._settings["precheck_pending_task_gids"] = records
+        try:
+            save_gui_settings(self._settings)
+        except OSError as exc:
+            self._precheck_asana_status.config(
+                text=f"增量待办记录保存失败: {exc}", foreground="#ef5350"
+            )
+
+    def _set_precheck_task_status(self, item_id: str, status: str):
+        if not item_id or not self.precheck_task_tree.exists(item_id):
+            return
+        values = list(self.precheck_task_tree.item(item_id, "values"))
+        if len(values) >= 4:
+            values[3] = status
+            self.precheck_task_tree.item(item_id, values=values)
+        task = self._precheck_tasks.get(item_id)
+        gid = str(getattr(task, "gid", "") or "")
+        active_statuses = {
+            "新增待预检",
+            "检查中",
+            "下载中",
+            "补下载中",
+            "启动检查",
+            "后台下载中",
+            "待补下载",
+            "下载已暂停",
+        }
+        if gid in self._precheck_new_task_gids and status not in active_statuses:
+            self._precheck_new_task_gids.discard(gid)
+            self._remember_pending_precheck_gids(self._precheck_new_task_gids)
+
+    def _refresh_completed_background_downloads(self) -> int:
+        """Replace stale download states when the package is now installed."""
+        background_statuses = {
+            "下载中",
+            "后台下载中",
+            "补下载中",
+            "待补下载",
+            "下载已暂停",
+        }
+        refreshed = 0
+        for item_id in self.precheck_task_tree.get_children():
+            values = self.precheck_task_tree.item(item_id, "values")
+            status = str(values[3] if len(values) >= 4 else "").strip()
+            if status not in background_statuses:
+                continue
+            task = self._precheck_tasks.get(item_id)
+            package_name = str(getattr(task, "package_name", "") or "").strip()
+            if package_name and is_package_installed(package_name):
+                self._set_precheck_task_status(item_id, "安装完成")
+                refreshed += 1
+        if refreshed:
+            self._precheck_status.config(
+                text=f"已检测到 {refreshed} 个后台下载包体安装完成",
+                foreground="#2e7d32",
+            )
+        return refreshed
+
+    @staticmethod
+    def _precheck_task_status_for_result(result: dict) -> str:
+        backend_blacklist = result.get("backend_blacklist") or {}
+        if result.get("code") in {"IAP_ONLY", "JAPANESE_PACKAGE"} and backend_blacklist:
+            return "已加黑(后台)" if backend_blacklist.get("ok") else "加黑提交失败"
+        review_monetization = result.get("code") == "NO_ADS_OR_IAP"
+        launch_result = result.get("launch_result") or {}
+        if launch_result:
+            launch_status = {
+                "LAUNCH_OK": "启动正常",
+                "APP_CRASHED": "包体闪退",
+                "APP_EXITED": "启动异常",
+                "LAUNCH_FAILED": "启动失败",
+            }.get(launch_result.get("code"), "启动异常")
+            if review_monetization and launch_result.get("ok"):
+                return "待人工检查"
+            return launch_status
+        install_result = result.get("install_result") or {}
+        if install_result:
+            install_code = install_result.get("code")
+            if install_code in {
+                "DOWNLOAD_LIMIT_REACHED",
+                "DOWNLOAD_DEFERRED",
+            }:
+                return "待补下载"
+            if install_code == "DOWNLOAD_PAUSED":
+                return "下载已暂停"
+            if install_code == "DOWNLOAD_STARTED":
+                return "后台下载中"
+            if install_result.get("ok"):
+                if review_monetization:
+                    return "待人工检查"
+                if install_code == "ALREADY_INSTALLED":
+                    return "已安装"
+                return "安装完成"
+            return "安装失败"
+        return {
+            "HAS_ADS": "有广告",
+            "GOOGLE_NO_PACKAGE": "google无包",
+            "ALL_NETWORK_NO_PACKAGE": "全网无包",
+            "APKCOMBO_AVAILABLE": "APKCombo有包",
+            "APKCOMBO_CHECK_FAILED": "APKCombo待确认",
+            "IAP_ONLY": "已加黑",
+            "JAPANESE_PACKAGE": "已加黑",
+            "NO_ADS_OR_IAP": "待人工检查",
+            "DEVICE_UNSUPPORTED": "设备不支持",
+            "COUNTRY_UNSUPPORTED": "地区不支持",
+            "UNKNOWN": "待人工",
+            "NO_DEVICE": "未执行",
+        }.get(result.get("code"), "失败")
+
+    def _submit_precheck_blacklist(self, result: dict) -> dict:
+        if result.get("code") not in {"IAP_ONLY", "JAPANESE_PACKAGE"}:
+            return result
+        backend_result = submit_precheck_blacklist_via_api(
+            result,
+            api_url=self.cp_adapt_api_url_var.get().strip(),
+            x_token=self.cp_adapt_x_token_var.get().strip(),
+            token=self.cp_adapt_token_var.get().strip(),
+            user_name=self.cp_adapt_assign_var.get().strip() or "rain",
+        )
+        return {**result, "backend_blacklist": backend_result}
+
+    def _install_after_precheck(
+        self,
+        result: dict,
+        return_after_start: bool = False,
+    ) -> dict:
+        """Install one app after a successful ads precheck in a worker thread."""
+        if (
+            result.get("continue_adaptation") is not True
+            and result.get("code") not in {"HAS_ADS", "NO_ADS_OR_IAP"}
+        ):
+            return result
+
+        def _progress(message: str):
+            self._safe_after(
+                0,
+                lambda message=message: self._precheck_status.config(
+                    text=message, foreground="#1976d2"
+                ),
+            )
+
+        install_result = install_google_play_app(
+            result.get("package_name", ""),
+            on_progress=_progress,
+            return_after_start=return_after_start,
+        )
+        return {**result, "install_result": install_result}
+
+    def _launch_check_after_install(
+        self,
+        result: dict,
+        observation_seconds: int,
+    ) -> dict:
+        install_result = result.get("install_result") or {}
+        if not install_result.get("ok"):
+            return result
+
+        def _progress(message: str):
+            self._safe_after(
+                0,
+                lambda message=message: self._precheck_status.config(
+                    text=message, foreground="#7b1fa2"
+                ),
+            )
+
+        launch_result = run_app_launch_precheck(
+            result.get("package_name", ""),
+            observation_seconds=observation_seconds,
+            on_progress=_progress,
+        )
+        return {**result, "launch_result": launch_result}
+
+    @staticmethod
+    def _comment_result_for_precheck(result: dict) -> dict:
+        launch_result = result.get("launch_result") or {}
+        if launch_result and not launch_result.get("ok"):
+            summary = str(launch_result.get("summary") or "").strip()
+            detail = str(launch_result.get("message") or "应用启动预检失败")
+            if summary:
+                detail += "\n崩溃摘要：\n" + summary[-1800:]
+            return {
+                "code": launch_result.get("code", "LAUNCH_FAILED"),
+                "package_name": result.get("package_name", ""),
+                "detail": detail,
+            }
+        install_result = result.get("install_result") or {}
+        if (
+            install_result
+            and install_result.get("code") not in {
+                "DOWNLOAD_LIMIT_REACHED",
+                "DOWNLOAD_DEFERRED",
+                "DOWNLOAD_PAUSED",
+                "DOWNLOAD_STARTED",
+            }
+            and not install_result.get("ok")
+        ):
+            return {
+                "code": "INSTALL_FAILED",
+                "package_name": result.get("package_name", ""),
+                "detail": install_result.get("message", "自动下载安装失败"),
+            }
+        return result
+
+    def _select_precheck_item(self, item_id: str):
+        if not self.precheck_task_tree.exists(item_id):
+            return
+        self.precheck_task_tree.selection_set(item_id)
+        self.precheck_task_tree.focus(item_id)
+        self.precheck_task_tree.see(item_id)
+        self._on_precheck_task_selected()
+
+    def _render_today_asana_tasks(self, result: dict):
+        self._precheck_manual_selection = False
+        previous_statuses = {}
+        for item_id in self.precheck_task_tree.get_children():
+            task = self._precheck_tasks.get(item_id)
+            values = self.precheck_task_tree.item(item_id, "values")
+            gid = str(getattr(task, "gid", "") or "")
+            if gid and len(values) >= 4:
+                previous_statuses[gid] = str(values[3] or "")
+        for item_id in self.precheck_task_tree.get_children():
+            self.precheck_task_tree.delete(item_id)
+        self._precheck_tasks.clear()
+
+        tasks = result.get("tasks", [])
+        known_gids = self._known_precheck_gids()
+        current_gids = {
+            str(getattr(task, "gid", "") or "") for task in tasks
+            if getattr(task, "gid", "")
+        }
+        eligible_gids = {
+            str(getattr(task, "gid", "") or "")
+            for task in tasks
+            if getattr(task, "gid", "")
+            and not getattr(task, "completed", False)
+            and not getattr(task, "workflow_terminal", False)
+            and not getattr(task, "workflow_status", "")
+        }
+        pending_gids = self._pending_precheck_gids() & eligible_gids
+        self._precheck_new_task_gids = (eligible_gids - known_gids) | pending_gids
+        # On the first read of a workday there is no baseline, so all current
+        # eligible tasks are the initial batch. Subsequent reads contain only
+        # genuinely new Task GIDs in this set.
+        self._remember_precheck_gids(known_gids | current_gids)
+        self._remember_pending_precheck_gids(self._precheck_new_task_gids)
+        first_incomplete = None
+        for index, task in enumerate(tasks, start=1):
+            if task.completed:
+                status = "已完成"
+            elif getattr(task, "workflow_status", ""):
+                status = str(task.workflow_status)
+            else:
+                gid = str(getattr(task, "gid", "") or "")
+                status = previous_statuses.get(gid) or (
+                    "新增待预检" if gid in self._precheck_new_task_gids else "待处理"
+                )
+            item_id = self.precheck_task_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    index,
+                    task.package_name or task.name,
+                    task.gp_link or "未填写",
+                    status,
+                ),
+            )
+            self._precheck_tasks[item_id] = task
+            if (
+                first_incomplete is None
+                and not task.completed
+                and not getattr(task, "workflow_terminal", False)
+                and str(getattr(task, "gid", "") or "") in self._precheck_new_task_gids
+            ):
+                first_incomplete = item_id
+
+        # A package can finish after the previous batch's finite monitoring
+        # window. Re-reading today's tasks must reconcile those stale local
+        # download states against the device instead of preserving them
+        # forever as "后台下载中".
+        self._refresh_completed_background_downloads()
+
+        section_name = result.get("section_name", "")
+        if tasks:
+            comment_errors = result.get("comment_status_errors") or []
+            restored = sum(
+                bool(getattr(task, "workflow_status", "")) for task in tasks
+            )
+            status_text = (
+                f"{section_name} · {len(tasks)} 个任务（建立日期递减），"
+                f"本次新增 {len(self._precheck_new_task_gids)} 个，"
+                f"评论恢复 {restored} 个状态"
+            )
+            if comment_errors:
+                status_text += f"，{len(comment_errors)} 个评论读取失败"
+            self._precheck_asana_status.config(
+                text=status_text,
+                foreground="#ef6c00" if comment_errors else "#2e7d32",
+            )
+            selected = first_incomplete or self.precheck_task_tree.get_children()[0]
+            self.precheck_task_tree.selection_set(selected)
+            self.precheck_task_tree.focus(selected)
+            self.precheck_task_tree.see(selected)
+            self._on_precheck_task_selected()
+        else:
+            self._precheck_asana_status.config(
+                text=f"{section_name} 没有任务", foreground="#ef5350"
+            )
+
+    def _on_load_today_asana_tasks(self):
+        if self._precheck_running:
+            return
+        project_gid = self.project_gid_var.get().strip()
+        asana_pat = self.asana_pat_var.get().strip()
+        if not project_gid or not asana_pat:
+            self._precheck_asana_status.config(
+                text="请先在数据同步页填写项目 GID 和 Asana PAT", foreground="#ef5350"
+            )
+            return
+
+        self._precheck_running = True
+        self._precheck_load_asana_btn.configure(state=tk.DISABLED)
+        self._precheck_asana_status.config(text="正在读取今日任务...", foreground="#ffa726")
+
+        def _run():
+            try:
+                client = build_asana_client(asana_pat)
+                result = get_asana_tasks_for_date(
+                    client,
+                    project_gid,
+                    today=datetime.now().date(),
+                )
+                self._safe_after(0, self._render_today_asana_tasks, result)
+            except Exception as exc:
+                self._safe_after(
+                    0,
+                    lambda exc=exc: self._precheck_asana_status.config(
+                        text=f"读取失败: {exc}", foreground="#ef5350"
+                    ),
+                )
+            finally:
+                self._safe_after(
+                    0, lambda: self._precheck_load_asana_btn.configure(state=tk.NORMAL)
+                )
+                self._safe_after(0, lambda: setattr(self, "_precheck_running", False))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_stop_batch_precheck(self):
+        if self._precheck_running:
+            self._precheck_cancel_requested = True
+            self._precheck_status.config(
+                text="将在当前任务结束后停止...", foreground="#ef6c00"
+            )
+
+    def _on_start_precheck_then_automation(self):
+        """Precheck pending rows, then adapt every installed eligible row."""
+        if self._precheck_running:
+            return
+        if self._automation_running:
+            self._precheck_status.config(
+                text="自动化适配队列正在运行", foreground="#ef6c00"
+            )
+            return
+
+        # Refresh late Google Play installations before deciding whether the
+        # visible list contains an automation-eligible installed package.
+        self._refresh_completed_background_downloads()
+
+        queue, _ = self._precheck_batch_queue_from_selection()
+        if not queue:
+            # This also makes the combined entry useful after the operator has
+            # already completed precheck and installation in an earlier run.
+            if self._automation_eligible_precheck_tasks():
+                self._precheck_status.config(
+                    text="没有新的待预检任务，直接启动已安装合格任务队列",
+                    foreground="#1976d2",
+                )
+                self._automation_run_eligible_batch()
+            else:
+                self._precheck_status.config(
+                    text="没有待预检任务，也没有可自动适配的已安装任务",
+                    foreground="#ef5350",
+                )
+            return
+        self._on_start_batch_precheck(start_automation_after=True)
+
+    def _start_automation_after_precheck(self):
+        eligible_count = len(self._automation_eligible_precheck_tasks())
+        if not eligible_count:
+            self._precheck_status.config(
+                text="批量预检完成，但没有已安装且合格的自动适配任务",
+                foreground="#ef6c00",
+            )
+            return
+        self._precheck_status.config(
+            text=f"批量预检完成，开始自动适配 {eligible_count} 个合格任务",
+            foreground="#1976d2",
+        )
+        self._automation_run_eligible_batch()
+
+    def _on_start_batch_precheck(self, *, start_automation_after: bool = False):
+        if self._precheck_running:
+            return
+        self._refresh_completed_background_downloads()
+        project_gid = self.project_gid_var.get().strip()
+        asana_pat = self.asana_pat_var.get().strip()
+        if not project_gid or not asana_pat:
+            self._precheck_status.config(
+                text="请先在数据同步页填写 Asana 项目 GID 和 PAT",
+                foreground="#ef5350",
+            )
+            return
+
+        auto_install = self.precheck_auto_install_var.get()
+        launch_check = self.precheck_launch_check_var.get()
+        try:
+            download_limit = int(self.precheck_download_limit_var.get().strip())
+            download_cooldown = int(
+                self.precheck_download_cooldown_var.get().strip()
+            )
+            launch_observation = int(
+                self.precheck_launch_observation_var.get().strip()
+            )
+        except ValueError:
+            self._precheck_status.config(
+                text="下载上限和安装间隔必须是整数", foreground="#ef5350"
+            )
+            return
+        if download_limit < 1 or download_limit > 10 or download_cooldown < 0:
+            self._precheck_status.config(
+                text="单批下载上限需为 1-10，安装间隔不能小于 0",
+                foreground="#ef5350",
+            )
+            return
+        if launch_observation < 5 or launch_observation > 120:
+            self._precheck_status.config(
+                text="启动观察时间需为 5-120 秒", foreground="#ef5350"
+            )
+            return
+
+        queue, batch_start_position = self._precheck_batch_queue_from_selection()
+        if not queue:
+            self._precheck_status.config(
+                text="选中项及其后没有待处理任务", foreground="#ef5350"
+            )
+            return
+
+        self._precheck_running = True
+        self._precheck_cancel_requested = False
+        self._precheck_load_asana_btn.configure(state=tk.DISABLED)
+        self._precheck_batch_btn.configure(state=tk.DISABLED)
+        if self._precheck_auto_adapt_btn is not None:
+            self._precheck_auto_adapt_btn.configure(state=tk.DISABLED)
+        self._precheck_start_btn.configure(state=tk.DISABLED)
+        self._precheck_stop_btn.configure(state=tk.NORMAL)
+        self._precheck_status.config(
+            text=(
+                f"从列表第 {batch_start_position} 项开始，"
+                f"准备批量预检 {len(queue)} 个待处理任务..."
+            ),
+            foreground="#ffa726",
+        )
+
+        def _run():
+            processed = 0
+            new_downloads = 0
+            downloaded_total = 0
+            deferred_downloads = []
+            pending_downloads = []
+            remaining_background_downloads = 0
+            backend_blacklist_failures = 0
+            batch_completed = False
+            try:
+                client = build_asana_client(asana_pat)
+                total = len(queue)
+                for position, (item_id, task) in enumerate(queue, start=1):
+                    if self._precheck_cancel_requested:
+                        break
+                    value = getattr(task, "gp_link", "") or getattr(task, "package_name", "")
+                    self._safe_after(0, self._select_precheck_item, item_id)
+                    self._safe_after(0, self._set_precheck_task_status, item_id, "检查中")
+                    self._safe_after(
+                        0,
+                        lambda position=position, total=total: self._precheck_status.config(
+                            text=f"正在检查 {position}/{total}...", foreground="#ffa726"
+                        ),
+                    )
+
+                    result = run_google_play_precheck(value, verify_apkcombo=True)
+                    result = self._submit_precheck_blacklist(result)
+                    backend_blacklist = result.get("backend_blacklist") or {}
+                    if backend_blacklist and not backend_blacklist.get("ok"):
+                        backend_blacklist_failures += 1
+                    if auto_install and (
+                        result.get("continue_adaptation") is True
+                        or result.get("code") in {"HAS_ADS", "NO_ADS_OR_IAP"}
+                    ):
+                        if new_downloads >= download_limit:
+                            deferred_downloads.append((item_id, task, result))
+                            result = {
+                                **result,
+                                "install_result": {
+                                    "ok": None,
+                                    "code": "DOWNLOAD_DEFERRED",
+                                    "message": (
+                                        f"已达到本轮下载上限 {download_limit} 个；"
+                                        "全部页面预检完成后自动补下载"
+                                    ),
+                                },
+                            }
+                        else:
+                            self._safe_after(
+                                0, self._set_precheck_task_status, item_id, "下载中"
+                            )
+                            result = self._install_after_precheck(result, True)
+                            install_result = result.get("install_result") or {}
+                            if install_result.get("code") in {
+                                "DOWNLOAD_STARTED",
+                                "INSTALLED",
+                            }:
+                                new_downloads += 1
+                                downloaded_total += 1
+                            if install_result.get("code") == "DOWNLOAD_STARTED":
+                                pending_downloads.append((item_id, task, result))
+                            if launch_check and install_result.get("ok"):
+                                self._safe_after(
+                                    0,
+                                    self._set_precheck_task_status,
+                                    item_id,
+                                    "启动检查",
+                                )
+                                result = self._launch_check_after_install(
+                                    result,
+                                    launch_observation,
+                                )
+
+                    status = self._precheck_task_status_for_result(result)
+                    comment_error = ""
+                    if result.get("code") not in {"NO_DEVICE", "OPEN_FAILED"}:
+                        try:
+                            add_precheck_comment_once(
+                                client,
+                                task.gid,
+                                self._comment_result_for_precheck(result),
+                            )
+                            backend_blacklist = result.get("backend_blacklist") or {}
+                            if backend_blacklist and not backend_blacklist.get("ok"):
+                                add_automation_comment_once(
+                                    client,
+                                    task.gid,
+                                    backend_blacklist.get(
+                                        "code", "PRECHECK_BLACKLIST_SUBMIT_FAILED"
+                                    ),
+                                    backend_blacklist.get(
+                                        "message", "预检后台标记提交失败，需要人工处理"
+                                    ),
+                                )
+                        except Exception as exc:
+                            comment_error = str(exc)
+                            status = "评论失败"
+
+                    self._safe_after(0, self._set_precheck_task_status, item_id, status)
+                    self._safe_after(0, self._render_precheck_result, result)
+                    if comment_error:
+                        self._safe_after(
+                            0,
+                            lambda comment_error=comment_error: self._precheck_status.config(
+                                text=f"Asana 评论失败: {comment_error}", foreground="#ef5350"
+                            ),
+                        )
+                    processed += 1
+
+                    if result.get("code") == "NO_DEVICE":
+                        break
+
+                    install_result = result.get("install_result") or {}
+                    if (
+                        install_result.get("code") in {
+                            "DOWNLOAD_STARTED",
+                            "INSTALLED",
+                        }
+                        and download_cooldown > 0
+                        and position < total
+                    ):
+                        remaining = download_cooldown
+                        while remaining > 0 and not self._precheck_cancel_requested:
+                            self._safe_after(
+                                0,
+                                lambda remaining=remaining: self._precheck_status.config(
+                                    text=f"安装冷却中，{remaining} 秒后继续预检...",
+                                    foreground="#1976d2",
+                                ),
+                            )
+                            sleep_for = min(5, remaining)
+                            time.sleep(sleep_for)
+                            remaining -= sleep_for
+
+                # 第二阶段：页面全部检查完成后，回头处理因本轮上限而延后的下载。
+                if (
+                    deferred_downloads
+                    and not self._precheck_cancel_requested
+                ):
+                    new_downloads = 0
+                    deferred_total = len(deferred_downloads)
+                    self._safe_after(
+                        0,
+                        lambda deferred_total=deferred_total: self._precheck_status.config(
+                            text=f"页面预检已完成，开始补下载 {deferred_total} 个任务...",
+                            foreground="#1976d2",
+                        ),
+                    )
+                    for deferred_position, (item_id, task, base_result) in enumerate(
+                        deferred_downloads,
+                        start=1,
+                    ):
+                        if self._precheck_cancel_requested:
+                            break
+                        value = (
+                            getattr(task, "gp_link", "")
+                            or getattr(task, "package_name", "")
+                        )
+                        self._safe_after(0, self._select_precheck_item, item_id)
+                        self._safe_after(
+                            0, self._set_precheck_task_status, item_id, "补下载中"
+                        )
+                        self._safe_after(
+                            0,
+                            lambda deferred_position=deferred_position,
+                            deferred_total=deferred_total: self._precheck_status.config(
+                                text=(
+                                    f"正在补下载 {deferred_position}/{deferred_total}..."
+                                ),
+                                foreground="#1976d2",
+                            ),
+                        )
+
+                        opened, open_message, _ = open_google_play_page(value)
+                        if opened:
+                            result = self._install_after_precheck(base_result, True)
+                        else:
+                            result = {
+                                **base_result,
+                                "install_result": {
+                                    "ok": False,
+                                    "code": "OPEN_FAILED",
+                                    "message": open_message,
+                                },
+                            }
+
+                        install_result = result.get("install_result") or {}
+                        if install_result.get("code") in {
+                            "DOWNLOAD_STARTED",
+                            "INSTALLED",
+                        }:
+                            new_downloads += 1
+                            downloaded_total += 1
+                        if install_result.get("code") == "DOWNLOAD_STARTED":
+                            pending_downloads.append((item_id, task, result))
+
+                        if launch_check and install_result.get("ok"):
+                            self._safe_after(
+                                0,
+                                self._set_precheck_task_status,
+                                item_id,
+                                "启动检查",
+                            )
+                            result = self._launch_check_after_install(
+                                result,
+                                launch_observation,
+                            )
+
+                        status = self._precheck_task_status_for_result(result)
+                        try:
+                            add_precheck_comment_once(
+                                client,
+                                task.gid,
+                                self._comment_result_for_precheck(result),
+                            )
+                        except Exception:
+                            status = "评论失败"
+                        self._safe_after(
+                            0, self._set_precheck_task_status, item_id, status
+                        )
+                        self._safe_after(0, self._render_precheck_result, result)
+
+                        if new_downloads >= download_limit:
+                            new_downloads = 0
+                        if (
+                            install_result.get("code") in {
+                                "DOWNLOAD_STARTED",
+                                "INSTALLED",
+                            }
+                            and download_cooldown > 0
+                            and deferred_position < deferred_total
+                        ):
+                            remaining = download_cooldown
+                            while (
+                                remaining > 0
+                                and not self._precheck_cancel_requested
+                            ):
+                                self._safe_after(
+                                    0,
+                                    lambda remaining=remaining: self._precheck_status.config(
+                                        text=f"补下载冷却中，{remaining} 秒后继续...",
+                                        foreground="#1976d2",
+                                    ),
+                                )
+                                sleep_for = min(5, remaining)
+                                time.sleep(sleep_for)
+                                remaining -= sleep_for
+
+                # 所有可下载任务都已发起后，统一监控安装状态。
+                # 任何大包都不会阻塞其他包发起下载；谁先安装完就先检查谁。
+                if launch_check and pending_downloads and not self._precheck_cancel_requested:
+                    pending_remaining = list(pending_downloads)
+                    monitor_deadline = time.monotonic() + 600
+                    while (
+                        pending_remaining
+                        and time.monotonic() < monitor_deadline
+                        and not self._precheck_cancel_requested
+                    ):
+                        self._safe_after(
+                            0,
+                            lambda count=len(pending_remaining): self._precheck_status.config(
+                                text=f"已发起全部下载，正在后台等待 {count} 个包体安装...",
+                                foreground="#1976d2",
+                            ),
+                        )
+                        installed_this_round = []
+                        for item_id, task, pending_result in pending_remaining:
+                            package_name = pending_result.get("package_name", "")
+                            if not package_name or not is_package_installed(package_name):
+                                continue
+                            result = {
+                                **pending_result,
+                                "install_result": {
+                                    "ok": True,
+                                    "code": "INSTALLED",
+                                    "message": "Google Play 后台下载并安装完成",
+                                },
+                            }
+                            self._safe_after(
+                                0, self._set_precheck_task_status, item_id, "启动检查"
+                            )
+                            result = self._launch_check_after_install(
+                                result,
+                                launch_observation,
+                            )
+                            status = self._precheck_task_status_for_result(result)
+                            try:
+                                add_precheck_comment_once(
+                                    client,
+                                    task.gid,
+                                    self._comment_result_for_precheck(result),
+                                )
+                            except Exception:
+                                status = "评论失败"
+                            self._safe_after(
+                                0, self._set_precheck_task_status, item_id, status
+                            )
+                            self._safe_after(0, self._render_precheck_result, result)
+                            installed_this_round.append(item_id)
+                        if installed_this_round:
+                            installed_ids = set(installed_this_round)
+                            pending_remaining = [
+                                entry
+                                for entry in pending_remaining
+                                if entry[0] not in installed_ids
+                            ]
+                        if pending_remaining and not self._precheck_cancel_requested:
+                            time.sleep(3)
+                    remaining_background_downloads = len(pending_remaining)
+
+                cancelled = self._precheck_cancel_requested
+                batch_completed = not cancelled and processed == len(queue)
+                self._safe_after(
+                    0,
+                    lambda downloaded_total=downloaded_total,
+                    remaining_background_downloads=remaining_background_downloads,
+                    backend_blacklist_failures=backend_blacklist_failures: self._precheck_status.config(
+                        text=(
+                            f"已停止，完成 {processed}/{len(queue)}"
+                            if cancelled
+                            else (
+                                f"批量预检完成，共处理 {processed} 个任务，"
+                                f"新增下载 {downloaded_total} 个"
+                                + (
+                                    f"，仍在后台下载 {remaining_background_downloads} 个"
+                                    if remaining_background_downloads
+                                    else ""
+                                )
+                                + (
+                                    f"，后台加黑失败 {backend_blacklist_failures} 个"
+                                    if backend_blacklist_failures
+                                    else ""
+                                )
+                            )
+                        ),
+                        foreground=(
+                            "#ef6c00"
+                            if cancelled
+                            else (
+                                "#ef5350"
+                                if backend_blacklist_failures
+                                else "#2e7d32"
+                            )
+                        ),
+                    ),
+                )
+            except Exception as exc:
+                self._safe_after(
+                    0,
+                    lambda exc=exc: self._precheck_status.config(
+                        text=f"批量预检失败: {exc}", foreground="#ef5350"
+                    ),
+                )
+            finally:
+                self._precheck_cancel_requested = False
+                self._precheck_running = False
+                self._safe_after(
+                    0, lambda: self._precheck_load_asana_btn.configure(state=tk.NORMAL)
+                )
+                self._safe_after(
+                    0, lambda: self._precheck_batch_btn.configure(state=tk.NORMAL)
+                )
+                if self._precheck_auto_adapt_btn is not None:
+                    self._safe_after(
+                        0,
+                        lambda: self._precheck_auto_adapt_btn.configure(
+                            state=(
+                                tk.DISABLED
+                                if self._automation_running
+                                else tk.NORMAL
+                            )
+                        ),
+                    )
+                self._safe_after(
+                    0, lambda: self._precheck_start_btn.configure(state=tk.NORMAL)
+                )
+                self._safe_after(
+                    0, lambda: self._precheck_stop_btn.configure(state=tk.DISABLED)
+                )
+                if start_automation_after and batch_completed:
+                    self._safe_after(0, self._start_automation_after_precheck)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_precheck_open_page(self):
+        value = self.precheck_input.get().strip()
+        if not value:
+            self._precheck_status.config(text="请输入 GP 链接或包名", foreground="#ef5350")
+            return
+        self._precheck_status.config(text="正在打开手机页面...", foreground="#ffa726")
+
+        def _run():
+            ok, message, _package_name = open_google_play_page(value)
+            self._safe_after(
+                0,
+                lambda: self._precheck_status.config(
+                    text=message,
+                    foreground="#2e7d32" if ok else "#ef5350",
+                ),
+            )
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _render_precheck_result(self, result: dict):
+        code = result.get("code", "UNKNOWN")
+        colors = {
+            "HAS_ADS": "#2e7d32",
+            "GOOGLE_NO_PACKAGE": "#c62828",
+            "ALL_NETWORK_NO_PACKAGE": "#c62828",
+            "APKCOMBO_AVAILABLE": "#1976d2",
+            "APKCOMBO_CHECK_FAILED": "#ef6c00",
+            "IAP_ONLY": "#ef6c00",
+            "JAPANESE_PACKAGE": "#ef6c00",
+            "NO_ADS_OR_IAP": "#ef6c00",
+            "DEVICE_UNSUPPORTED": "#c62828",
+            "COUNTRY_UNSUPPORTED": "#c62828",
+        }
+        self._precheck_result_title.config(
+            text=result.get("title", "预检完成"),
+            foreground=colors.get(code, "#616161"),
+        )
+        decision = result.get("continue_adaptation")
+        if code == "NO_ADS_OR_IAP":
+            recommendation = "继续下载，人工检查是否包含广告；不自动加黑"
+        elif decision is True:
+            recommendation = "继续下载安装和适配"
+        elif code in {"IAP_ONLY", "JAPANESE_PACKAGE"}:
+            recommendation = "加黑并跳过，不下载、不适配"
+        elif code == "ALL_NETWORK_NO_PACKAGE":
+            recommendation = "Google Play 无法下载且 APKCombo 无可用包，暂不适配"
+        elif code == "APKCOMBO_AVAILABLE":
+            recommendation = "通过 APKCombo 下载第三方包体，再继续检查和适配"
+        elif code == "APKCOMBO_CHECK_FAILED":
+            recommendation = "APKCombo 自动核验无明确结果，需要人工确认"
+        elif code == "GOOGLE_NO_PACKAGE":
+            recommendation = "Google Play 无包，等待 APKCombo 核验"
+        elif decision is False:
+            recommendation = "跳过当前任务"
+        else:
+            recommendation = "等待页面加载后重试，暂不自动加黑"
+
+        lines = [
+            f"包名：{result.get('package_name') or '未识别'}",
+            f"结论：{result.get('title', '')}",
+            f"建议：{recommendation}",
+            f"识别方式：{result.get('source') or '未取得页面信息'}",
+            "",
+            result.get("detail", ""),
+        ]
+        evidence = result.get("evidence", [])
+        if evidence:
+            lines.extend(["", "判断依据："])
+            lines.extend(f"- {item}" for item in evidence)
+        install_result = result.get("install_result") or {}
+        if install_result:
+            lines.extend([
+                "",
+                "自动下载：",
+                f"- 状态：{install_result.get('code', '')}",
+                f"- 结果：{install_result.get('message', '')}",
+            ])
+        launch_result = result.get("launch_result") or {}
+        if launch_result:
+            lines.extend([
+                "",
+                "启动预检：",
+                f"- 状态：{launch_result.get('code', '')}",
+                f"- 结果：{launch_result.get('message', '')}",
+            ])
+            if launch_result.get("summary"):
+                lines.extend(["- 崩溃摘要：", launch_result["summary"]])
+        backend_blacklist = result.get("backend_blacklist") or {}
+        if backend_blacklist:
+            lines.extend([
+                "",
+                "后台加黑：",
+                f"- 状态：{backend_blacklist.get('code', '')}",
+                f"- 结果：{backend_blacklist.get('message', '')}",
+            ])
+        visible_texts = result.get("visible_texts", [])
+        if visible_texts:
+            lines.extend(["", "页面识别文字："])
+            lines.extend(f"- {item}" for item in visible_texts)
+
+        self.precheck_output.configure(state=tk.NORMAL)
+        self.precheck_output.delete("1.0", tk.END)
+        self.precheck_output.insert("1.0", "\n".join(lines))
+        self.precheck_output.configure(state=tk.DISABLED)
+        if backend_blacklist and not backend_blacklist.get("ok"):
+            self._precheck_status.config(text="预检完成，但后台加黑失败", foreground="#ef5350")
+        elif backend_blacklist.get("ok"):
+            self._precheck_status.config(text="预检完成，后台加黑及缓存刷新成功", foreground="#2e7d32")
+        else:
+            self._precheck_status.config(text="预检完成", foreground=colors.get(code, "#616161"))
+
+    def _on_start_precheck(self):
+        if self._precheck_running:
+            return
+        value = self.precheck_input.get().strip()
+        if not value:
+            self._precheck_status.config(text="请输入 GP 链接或包名", foreground="#ef5350")
+            return
+        selected_item_id, selected_task = self._selected_precheck_task()
+        asana_pat = self.asana_pat_var.get().strip()
+        auto_install = self.precheck_auto_install_var.get()
+        launch_check = self.precheck_launch_check_var.get()
+        try:
+            launch_observation = int(
+                self.precheck_launch_observation_var.get().strip()
+            )
+        except ValueError:
+            self._precheck_status.config(
+                text="启动观察时间必须是整数", foreground="#ef5350"
+            )
+            return
+        if launch_observation < 5 or launch_observation > 120:
+            self._precheck_status.config(
+                text="启动观察时间需为 5-120 秒", foreground="#ef5350"
+            )
+            return
+        self._precheck_running = True
+        self._precheck_start_btn.configure(state=tk.DISABLED)
+        self._precheck_status.config(text="正在打开并识别手机页面...", foreground="#ffa726")
+
+        def _run():
+            try:
+                result = run_google_play_precheck(value, verify_apkcombo=True)
+                result = self._submit_precheck_blacklist(result)
+                if auto_install and (
+                    result.get("continue_adaptation") is True
+                    or result.get("code") in {"HAS_ADS", "NO_ADS_OR_IAP"}
+                ):
+                    if selected_item_id:
+                        self._safe_after(
+                            0, self._set_precheck_task_status, selected_item_id, "下载中"
+                        )
+                    result = self._install_after_precheck(result)
+                    if launch_check and (result.get("install_result") or {}).get("ok"):
+                        if selected_item_id:
+                            self._safe_after(
+                                0,
+                                self._set_precheck_task_status,
+                                selected_item_id,
+                                "启动检查",
+                            )
+                        result = self._launch_check_after_install(
+                            result,
+                            launch_observation,
+                        )
+                comment_error = ""
+                if (
+                    selected_task is not None
+                    and selected_task.gid
+                    and selected_task.package_name == result.get("package_name")
+                    and result.get("code") not in {"NO_DEVICE", "OPEN_FAILED"}
+                    and asana_pat
+                ):
+                    try:
+                        client = build_asana_client(asana_pat)
+                        add_precheck_comment_once(
+                            client,
+                            selected_task.gid,
+                            self._comment_result_for_precheck(result),
+                        )
+                        backend_blacklist = result.get("backend_blacklist") or {}
+                        if backend_blacklist and not backend_blacklist.get("ok"):
+                            add_automation_comment_once(
+                                client,
+                                selected_task.gid,
+                                backend_blacklist.get(
+                                    "code", "PRECHECK_BLACKLIST_SUBMIT_FAILED"
+                                ),
+                                backend_blacklist.get(
+                                    "message", "预检后台标记提交失败，需要人工处理"
+                                ),
+                            )
+                        self._safe_after(
+                            0,
+                            self._set_precheck_task_status,
+                            selected_item_id,
+                            self._precheck_task_status_for_result(result),
+                        )
+                    except Exception as exc:
+                        comment_error = str(exc)
+                        self._safe_after(
+                            0, self._set_precheck_task_status, selected_item_id, "评论失败"
+                        )
+                self._safe_after(0, self._render_precheck_result, result)
+                if comment_error:
+                    self._safe_after(
+                        0,
+                        lambda comment_error=comment_error: self._precheck_status.config(
+                            text=f"预检完成，但 Asana 评论失败: {comment_error}",
+                            foreground="#ef5350",
+                        ),
+                    )
+            except Exception as exc:
+                self._safe_after(
+                    0,
+                    lambda exc=exc: self._precheck_status.config(
+                        text=f"预检失败: {exc}", foreground="#ef5350"
+                    ),
+                )
+            finally:
+                self._safe_after(
+                    0, lambda: self._precheck_start_btn.configure(state=tk.NORMAL)
+                )
+                self._safe_after(0, lambda: setattr(self, "_precheck_running", False))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── 自动化脚本 Tab ────────────────────────────────────────────
 
@@ -578,6 +2064,7 @@ class APKToolApp:
             ("打开应用", self._on_open_app),
             ("清空 Play Store 缓存", self._on_clear_play_store),
             ("修复 zygotehole 权限", self._on_fix_zygotehole_permissions),
+            ("取消当前游戏注入", self._on_cancel_zygotehole_injection),
         ]:
             b = ttk.Button(btn_row2, text=text, command=cmd)
             b.pack(side=tk.LEFT, padx=2)
@@ -632,25 +2119,6 @@ class APKToolApp:
         ).pack(side=tk.LEFT, padx=2)
         ttk.Label(extract_row, text="← 从 ZGSDK.AutoDetector 日志提取 SDK Key、聚合ID、归因平台",
                   foreground="#81c784").pack(side=tk.LEFT, padx=8)
-
-        # 其他过滤按钮
-        btn_row2 = ttk.Frame(logcat_frame)
-        btn_row2.pack(fill=tk.X, pady=2)
-        patterns = [
-            ("Max 聚合", "ZGSDK.Max"),
-            ("IronSource", "ZGSDK.iron"),
-            ("AdMob", "ZGSDK.admob"),
-            ("Single", "ZGSDK.single"),
-            ("Send", "ZGSDK.send"),
-            ("插屏聚合ID", "MaxInterstitialAdMulti"),
-            ("激励聚合ID", "MaxUnifiedAd"),
-        ]
-        for label, pattern in patterns:
-            btn = ttk.Button(
-                btn_row2, text=label,
-                command=lambda p=pattern: self._on_start_logcat(p)
-            )
-            btn.pack(side=tk.LEFT, padx=2)
 
         # --- 输出控制台 ---
         output_frame = ttk.LabelFrame(parent, text="ADB 控制台", padding=5)
@@ -763,12 +2231,6 @@ class APKToolApp:
                 None,
                 "访问 Google Sheets API 的本机 HTTP 代理；不需要代理可留空。",
             ),
-            (
-                "父任务 GID",
-                self.parent_task_gid_var,
-                None,
-                "Asana 父任务 URL 里的任务数字 ID，新建任务会挂到它下面。",
-            ),
         ]
         for label, var, browse_cmd, help_text in rows:
             row_frame = ttk.Frame(cfg_frame)
@@ -796,6 +2258,50 @@ class APKToolApp:
                 wraplength=640,
                 justify=tk.LEFT,
             ).pack(fill=tk.X, pady=(2, 0))
+
+        parent_url_row = ttk.Frame(cfg_frame)
+        parent_url_row.pack(fill=tk.X, pady=4)
+        ttk.Label(
+            parent_url_row, text="父任务地址:", width=15, anchor=tk.E
+        ).pack(side=tk.LEFT, anchor=tk.N)
+        parent_url_field = ttk.Frame(parent_url_row)
+        parent_url_field.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        parent_url_entry_row = ttk.Frame(parent_url_field)
+        parent_url_entry_row.pack(fill=tk.X)
+        self.parent_task_url_entry = ttk.Entry(
+            parent_url_entry_row, textvariable=self.parent_task_url_var
+        )
+        self.parent_task_url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.parent_task_fill_btn = ttk.Button(
+            parent_url_entry_row,
+            text="解析填充",
+            command=self._on_fill_parent_task_gid_from_url,
+        )
+        self.parent_task_fill_btn.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(
+            parent_url_field,
+            text="粘贴 Asana 任务地址，自动识别任务 GID；不会误取末尾的 story 评论 GID。",
+            foreground="gray",
+            wraplength=640,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(2, 0))
+
+        parent_gid_row = ttk.Frame(cfg_frame)
+        parent_gid_row.pack(fill=tk.X, pady=4)
+        ttk.Label(
+            parent_gid_row, text="父任务 GID:", width=15, anchor=tk.E
+        ).pack(side=tk.LEFT, anchor=tk.N)
+        parent_gid_field = ttk.Frame(parent_gid_row)
+        parent_gid_field.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Entry(parent_gid_field, textvariable=self.parent_task_gid_var).pack(fill=tk.X)
+        self.parent_task_url_status_label = ttk.Label(
+            parent_gid_field,
+            text="Asana 父任务数字 ID，新建任务会挂到它下面。",
+            foreground="gray",
+            wraplength=640,
+            justify=tk.LEFT,
+        )
+        self.parent_task_url_status_label.pack(fill=tk.X, pady=(2, 0))
 
         # --- CP 后台数据源 ---
         source_frame = ttk.LabelFrame(content, text="前置数据源（CP 后台 → Google Sheet）", padding=10)
@@ -1147,6 +2653,10 @@ class APKToolApp:
         notebook.add(apk_tab, text="APK 工具")
         self._build_apk_tab(apk_tab)
 
+        precheck_tab = ttk.Frame(notebook)
+        notebook.add(precheck_tab, text="页面预检")
+        self._build_precheck_tab(precheck_tab)
+
         adb_tab = ttk.Frame(notebook)
         notebook.add(adb_tab, text="ADB 指令")
         self._build_adb_tab(adb_tab)
@@ -1154,6 +2664,16 @@ class APKToolApp:
         action_script_tab = ttk.Frame(notebook)
         notebook.add(action_script_tab, text="自动化脚本")
         self._build_action_script_tab(action_script_tab)
+
+        automation_tab = ttk.Frame(notebook)
+        notebook.add(automation_tab, text="自动化适配")
+        self._build_automation_tab(automation_tab)
+
+        summary_tab = ttk.Frame(notebook)
+        notebook.add(summary_tab, text="当日总结")
+        self._daily_summary_tab = summary_tab
+        self._daily_summary_built = False
+        notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed, add="+")
 
         sync_tab = ttk.Frame(notebook)
         notebook.add(sync_tab, text="数据同步")
@@ -1163,6 +2683,1695 @@ class APKToolApp:
             self.root, text="就绪", relief=tk.SUNKEN, anchor=tk.W, padding=(6, 2)
         )
         self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _on_notebook_tab_changed(self, event):
+        if self._daily_summary_built:
+            return
+        notebook = event.widget
+        if notebook.select() != str(self._daily_summary_tab):
+            return
+        self._daily_summary_built = True
+        self._build_daily_summary_tab(self._daily_summary_tab)
+
+    # ── 当日总结 Tab ──────────────────────────────────────────────
+
+    def _build_daily_summary_tab(self, parent: ttk.Frame):
+        container = ttk.Frame(parent, padding=18)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        info = ttk.LabelFrame(container, text="Asana 当日适配总结", padding=12)
+        info.pack(fill=tk.X)
+        ttk.Label(
+            info,
+            text=(
+                "读取所选日期执行分组中的当日评论，自动归类聚合通过、动作通过、"
+                "暂不适配和加黑；使用“数据同步”页中的项目 GID 与 Asana PAT。"
+            ),
+            foreground="#757575",
+            wraplength=780,
+        ).pack(anchor=tk.W)
+
+        toolbar = ttk.Frame(container)
+        toolbar.pack(fill=tk.X, pady=(12, 8))
+        ttk.Label(toolbar, text="日期：").pack(side=tk.LEFT)
+        ttk.Entry(
+            toolbar, textvariable=self.daily_summary_date_var, width=14
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self._daily_summary_generate_btn = ttk.Button(
+            toolbar, text="生成总结", command=self._on_generate_daily_summary
+        )
+        self._daily_summary_generate_btn.pack(side=tk.LEFT)
+        ttk.Button(
+            toolbar, text="一键复制", command=self._copy_daily_summary
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self._daily_summary_status = ttk.Label(
+            toolbar, text="就绪", foreground="#757575"
+        )
+        self._daily_summary_status.pack(side=tk.RIGHT)
+
+        result_frame = ttk.LabelFrame(container, text="总结预览", padding=8)
+        result_frame.pack(fill=tk.BOTH, expand=True)
+        self.daily_summary_text = tk.Text(
+            result_frame,
+            wrap=tk.WORD,
+            font=("SF Mono", 11),
+            padx=10,
+            pady=10,
+        )
+        scroll = ttk.Scrollbar(
+            result_frame, orient=tk.VERTICAL, command=self.daily_summary_text.yview
+        )
+        self.daily_summary_text.configure(yscrollcommand=scroll.set)
+        self.daily_summary_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _set_daily_summary_result(self, result: dict):
+        self.daily_summary_text.delete("1.0", tk.END)
+        self.daily_summary_text.insert("1.0", result.get("text", ""))
+        self._daily_summary_status.config(
+            text=(
+                f"{result.get('section_name', '')} · "
+                f"{result.get('task_count', 0)} 个任务 · "
+                f"{result.get('comment_count', 0)} 条当日评论"
+            ),
+            foreground="#2e7d32",
+        )
+
+    def _on_generate_daily_summary(self):
+        if self._daily_summary_running:
+            return
+        try:
+            target_date = datetime.strptime(
+                self.daily_summary_date_var.get().strip(), "%Y-%m-%d"
+            ).date()
+        except ValueError:
+            self._daily_summary_status.config(
+                text="日期格式应为 YYYY-MM-DD", foreground="#e53935"
+            )
+            return
+        project_gid = self.project_gid_var.get().strip()
+        asana_pat = self.asana_pat_var.get().strip()
+        if not project_gid or not asana_pat:
+            self._daily_summary_status.config(
+                text="请先在数据同步页填写项目 GID 和 Asana PAT",
+                foreground="#e53935",
+            )
+            return
+
+        self._daily_summary_running = True
+        self._daily_summary_generate_btn.configure(state=tk.DISABLED)
+        self._daily_summary_status.config(text="正在读取 Asana 评论...", foreground="#ef6c00")
+
+        def _run():
+            try:
+                result = generate_daily_asana_summary(
+                    build_asana_client(asana_pat), project_gid, target_date
+                )
+                self._safe_after(0, self._set_daily_summary_result, result)
+            except Exception as exc:
+                self._safe_after(
+                    0,
+                    self._daily_summary_status.config,
+                    {"text": f"生成失败：{exc}", "foreground": "#e53935"},
+                )
+            finally:
+                self._daily_summary_running = False
+                self._safe_after(
+                    0, self._daily_summary_generate_btn.configure, {"state": tk.NORMAL}
+                )
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _copy_daily_summary(self):
+        text = self.daily_summary_text.get("1.0", tk.END).strip()
+        if not text:
+            self._daily_summary_status.config(
+                text="请先生成总结", foreground="#e53935"
+            )
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._daily_summary_status.config(text="总结已复制", foreground="#2e7d32")
+
+    # ── 自动化适配 Tab（不改变现有手动按钮） ────────────────────
+
+    def _build_automation_tab(self, parent: ttk.Frame):
+        outer = ttk.Frame(parent, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        intro = ttk.LabelFrame(outer, text="自动化说明", padding=10)
+        intro.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(
+            intro,
+            text=(
+                "本页使用独立自动化函数，不改变 ADB 指令页原有按钮。"
+                "单包按钮保留手动校对；批量模式会按预检列表顺序自动完成 "
+                "ADB 配置、参数检测、Asana 回填、后台提交和广告回放验证。"
+            ),
+            foreground="gray",
+            wraplength=820,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+        task_frame = ttk.LabelFrame(outer, text="当前 Asana 任务", padding=10)
+        task_frame.pack(fill=tk.X, pady=(0, 8))
+        first = ttk.Frame(task_frame)
+        first.pack(fill=tk.X)
+        ttk.Label(first, text="Task GID:").pack(side=tk.LEFT)
+        ttk.Entry(first, textvariable=self.automation_task_gid_var, width=24).pack(
+            side=tk.LEFT, padx=(4, 10)
+        )
+        ttk.Label(first, text="包名:").pack(side=tk.LEFT)
+        ttk.Entry(first, textvariable=self.automation_package_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 10)
+        )
+        ttk.Button(
+            first,
+            text="从页面预检选中任务带入",
+            command=self._automation_use_selected_precheck_task,
+        ).pack(side=tk.RIGHT)
+        second = ttk.Frame(task_frame)
+        second.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(second, text="UP2 appid:").pack(side=tk.LEFT)
+        ttk.Entry(second, textvariable=self.automation_appid_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 12)
+        )
+        ttk.Label(second, text="回放监听:").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            second,
+            from_=10,
+            to=600,
+            width=5,
+            textvariable=self.automation_replay_timeout_var,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Label(second, text="秒（默认 500）", foreground="gray").pack(side=tk.LEFT)
+
+        fields_frame = ttk.LabelFrame(outer, text="聚合参数校对", padding=8)
+        fields_frame.pack(fill=tk.BOTH, expand=False, pady=(0, 8))
+        field_toolbar = ttk.Frame(fields_frame)
+        field_toolbar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(
+            field_toolbar,
+            text="提取当前聚合参数",
+            command=self._automation_extract_fields,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            field_toolbar,
+            text="自动回填 Asana",
+            command=self._automation_fill_asana,
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            field_toolbar,
+            text="接口提交后台",
+            command=self._automation_submit_backend,
+        ).pack(side=tk.LEFT)
+        self._automation_field_status = ttk.Label(
+            field_toolbar, text="尚未提取", foreground="gray"
+        )
+        self._automation_field_status.pack(side=tk.RIGHT)
+        self.automation_fields_text = tk.Text(
+            fields_frame,
+            height=10,
+            wrap=tk.WORD,
+            font=("Menlo", 10),
+            bg="#f5f5f5",
+            fg="#333333",
+            state=tk.DISABLED,
+        )
+        self.automation_fields_text.pack(fill=tk.BOTH, expand=True)
+
+        control = ttk.LabelFrame(outer, text="自动化执行", padding=10)
+        control.pack(fill=tk.X, pady=(0, 8))
+        self._automation_run_btn = ttk.Button(
+            control,
+            text="参数确认无误：回填 → 提交 → 回放",
+            command=self._automation_run_post_detection,
+        )
+        self._automation_run_btn.pack(side=tk.LEFT)
+        self._automation_batch_btn = ttk.Button(
+            control,
+            text="批量自动适配预检合格任务",
+            command=self._automation_run_eligible_batch,
+        )
+        self._automation_batch_btn.pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            control,
+            text="仅开始聚合回放检测",
+            command=self._automation_start_replay,
+        ).pack(side=tk.LEFT, padx=6)
+        self._automation_stop_btn = ttk.Button(
+            control,
+            text="停止",
+            command=self._automation_stop,
+            state=tk.DISABLED,
+        )
+        self._automation_stop_btn.pack(side=tk.LEFT)
+        self._automation_pause_btn = ttk.Button(
+            control,
+            text="暂停队列",
+            command=self._automation_toggle_pause,
+            state=tk.DISABLED,
+        )
+        self._automation_pause_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self._automation_status = ttk.Label(control, text="就绪", foreground="gray")
+        self._automation_status.pack(side=tk.RIGHT)
+
+        log_frame = ttk.LabelFrame(outer, text="自动化日志", padding=6)
+        log_frame.pack(fill=tk.BOTH, expand=True)
+        self.automation_log_text = tk.Text(
+            log_frame,
+            height=11,
+            wrap=tk.WORD,
+            font=("Menlo", 10),
+            bg="#1e1e1e",
+            fg="#d4d4d4",
+            state=tk.DISABLED,
+        )
+        log_scroll = ttk.Scrollbar(log_frame, command=self.automation_log_text.yview)
+        self.automation_log_text.configure(yscrollcommand=log_scroll.set)
+        self.automation_log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _automation_log(self, message: str):
+        if not hasattr(self, "automation_log_text"):
+            return
+        self.automation_log_text.configure(state=tk.NORMAL)
+        self.automation_log_text.insert(
+            tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
+        )
+        self.automation_log_text.see(tk.END)
+        self.automation_log_text.configure(state=tk.DISABLED)
+
+    def _automation_set_status(self, text: str, color: str = "#616161"):
+        self._automation_status.config(text=text, foreground=color)
+
+    def _automation_set_running(self, running: bool):
+        self._automation_running = running
+        self._automation_run_btn.configure(state=tk.DISABLED if running else tk.NORMAL)
+        if self._automation_batch_btn is not None:
+            self._automation_batch_btn.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
+        if self._precheck_auto_adapt_btn is not None:
+            self._precheck_auto_adapt_btn.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
+        self._automation_stop_btn.configure(state=tk.NORMAL if running else tk.DISABLED)
+        if self._automation_pause_btn is not None:
+            self._automation_pause_btn.configure(
+                state=(
+                    tk.NORMAL
+                    if running and self._automation_batch_active
+                    else tk.DISABLED
+                ),
+                text="暂停队列",
+            )
+        if running:
+            self._automation_stop_event.clear()
+            self._automation_pause_event.clear()
+        else:
+            self._automation_pause_event.clear()
+            self._automation_batch_active = False
+
+    def _automation_use_selected_precheck_task(self):
+        item_id, task = self._selected_precheck_task()
+        if task is None:
+            self._automation_set_status("请先在页面预检中选择任务", "#e53935")
+            return
+        self._automation_clear_detected_fields()
+        self._automation_precheck_item_id = item_id or ""
+        self.automation_task_gid_var.set(str(getattr(task, "gid", "") or ""))
+        self.automation_package_var.set(str(getattr(task, "package_name", "") or ""))
+        self.automation_appid_var.set(str(getattr(task, "up2_appid", "") or ""))
+        self._automation_task_notes = str(getattr(task, "notes", "") or "")
+        self._automation_log(f"已带入任务: {self.automation_package_var.get()}")
+        self._automation_set_status("任务已带入", "#2e7d32")
+
+    def _automation_clear_detected_fields(self, status_text: str = "尚未提取"):
+        """Drop every detected value before another package is processed."""
+        self._automation_context_version += 1
+        self._automation_fields = {}
+        self.automation_fields_text.configure(state=tk.NORMAL)
+        self.automation_fields_text.delete("1.0", tk.END)
+        self.automation_fields_text.configure(state=tk.DISABLED)
+        self._automation_field_status.config(
+            text=status_text,
+            foreground="gray",
+        )
+
+    def _automation_render_fields(
+        self,
+        data: dict,
+        context_version: int | None = None,
+    ):
+        if (
+            context_version is not None
+            and context_version != self._automation_context_version
+        ):
+            return
+        text = format_aggregation_fields(data)
+        assessment = build_aggregation_assessment(data)
+        self.automation_fields_text.configure(state=tk.NORMAL)
+        self.automation_fields_text.delete("1.0", tk.END)
+        self.automation_fields_text.insert("1.0", text)
+        self.automation_fields_text.configure(state=tk.DISABLED)
+        confidence = assessment["confidence"]
+        method = assessment["method"]
+        policy = assessment["policy"]
+        color = (
+            "#2e7d32"
+            if confidence == "高" and assessment["auto_submit"]
+            else "#ef6c00"
+            if assessment["auto_submit"]
+            else "#e53935"
+        )
+        self._automation_field_status.config(
+            text=f"{confidence}置信度 · {method} · {policy}",
+            foreground=color,
+        )
+
+    def _automation_extract_fields(self):
+        if self._automation_running:
+            return
+        self._automation_clear_detected_fields("正在提取当前应用参数...")
+        context_version = self._automation_context_version
+        self._automation_set_running(True)
+        self._automation_set_status("正在提取参数...", "#ef6c00")
+
+        def _run():
+            try:
+                self._safe_after(
+                    0,
+                    self._automation_log,
+                    "[ADB 前置] 配置、推送、构建、UID 和 UID 日志过滤",
+                )
+                initial_fields = self._automation_prepare_detection_sync()
+                runtime_monitor = PackageRuntimeMonitor(
+                    self.automation_package_var.get().strip()
+                )
+                result = detect_aggregation_with_one_retry(
+                    self.automation_package_var.get().strip(),
+                    lambda: self._automation_extract_logcat_fields(),
+                    first_fields=initial_fields,
+                    stop_event=self._automation_stop_event,
+                    on_progress=lambda text: self._safe_after(
+                        0, self._automation_log, text
+                    ),
+                    runtime_check=runtime_monitor.poll,
+                    runtime_reset=runtime_monitor.reset,
+                )
+                data = result.get("fields") or {}
+                if context_version != self._automation_context_version:
+                    self._safe_after(
+                        0,
+                        self._automation_log,
+                        "已丢弃上一应用延迟返回的聚合参数",
+                    )
+                    return
+                self._automation_fields = data
+                if data:
+                    self._safe_after(
+                        0,
+                        self._automation_render_fields,
+                        data,
+                        context_version,
+                    )
+                if result.get("ok"):
+                    self._safe_after(
+                        0, self._automation_log, result.get("message", "聚合参数提取完成")
+                    )
+                    assessment = build_aggregation_assessment(data)
+                    if (
+                        (
+                            assessment.get("confidence") == "高"
+                            or data.get("_aggregation_type_inferred")
+                        )
+                        and assessment.get("auto_submit")
+                    ):
+                        self._safe_after(
+                            0,
+                            self._automation_log,
+                            (
+                                "video/inter 已按规则推断为 IronSource，"
+                                "自动继续回填 → 提交 → 回放"
+                                if data.get("_aggregation_type_inferred")
+                                else "高置信度且参数校验通过，自动继续回填 → 提交 → 回放"
+                            ),
+                        )
+                        self._automation_execute_post_detection_sync()
+                    else:
+                        self._safe_after(
+                            0, self._automation_set_status, "参数待校对", "#ef6c00"
+                        )
+                    return
+                message = result.get("message", "聚合参数提取失败")
+                if result.get("code") == "UNSUPPORTED_ATTRIBUTION":
+                    # A non-whitelisted or unknown attribution is still a
+                    # valid aggregation detection result.  Persist all fields
+                    # before ending this task, just like the batch path.
+                    self._automation_complete_unsupported_attribution_sync(
+                        message
+                    )
+                    return
+                else:
+                    self._automation_mark_failed(message)
+                if result.get("code") in {
+                    "AGGREGATION_TYPE_EMPTY",
+                    "AGGREGATION_RESULT_INCOMPLETE",
+                    "AF_KEY_EMPTY",
+                    "AD_IDS_EMPTY",
+                    "UNSUPPORTED_ATTRIBUTION",
+                    "APP_CRASHED",
+                    "APP_EXITED_DURING_AUTOMATION",
+                }:
+                    package_name = self.automation_package_var.get().strip()
+                    runtime_summary = str(
+                        (result.get("runtime") or {}).get("summary")
+                        or (result.get("fields") or {}).get("_runtime_summary")
+                        or ""
+                    ).strip()
+                    self._automation_comment_failure(
+                        result.get("code"),
+                        f"{message}\n包名：{package_name}"
+                        + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else ""),
+                    )
+            except Exception as exc:
+                if self._automation_stop_event.is_set() or "用户已停止" in str(exc):
+                    self._safe_after(
+                        0, self._automation_log, "聚合参数提取已由用户停止"
+                    )
+                    self._safe_after(
+                        0, self._automation_set_status, "自动化已停止", "#ef6c00"
+                    )
+                else:
+                    self._automation_mark_failed(f"聚合参数提取失败: {exc}")
+            finally:
+                self._safe_after(0, self._automation_set_running, False)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _automation_asana_client(self):
+        pat = self.asana_pat_var.get().strip()
+        if not pat:
+            raise ValueError("请先在数据同步页填写 Asana PAT")
+        return build_asana_client(pat)
+
+    def _automation_fill_asana_sync(
+        self,
+        *,
+        allow_unsupported_attribution: bool = False,
+        terminal_note: str = "",
+    ) -> str:
+        if not self._automation_fields:
+            raise ValueError("请先提取并校对聚合参数")
+        if not has_aggregation_type(self._automation_fields):
+            raise ValueError("聚合类型识别为空，不能回填 Asana 描述")
+        task_gid = self.automation_task_gid_var.get().strip()
+        client = self._automation_asana_client()
+        merged = update_asana_aggregation_notes(
+            client,
+            task_gid,
+            self._automation_task_notes,
+            self._automation_fields,
+            allow_unsupported_attribution=allow_unsupported_attribution,
+            terminal_note=terminal_note,
+        )
+        self._automation_task_notes = merged
+        return merged
+
+    def _automation_fill_asana(self):
+        if self._automation_running:
+            return
+        self._automation_set_running(True)
+        self._automation_set_status("正在回填 Asana...", "#ef6c00")
+
+        def _run():
+            try:
+                self._automation_fill_asana_sync()
+                self._safe_after(0, self._automation_log, "聚合参数已回填至 Asana 描述")
+                self._safe_after(0, self._automation_set_status, "Asana 回填完成", "#2e7d32")
+            except Exception as exc:
+                self._safe_after(0, self._automation_log, f"Asana 回填失败: {exc}")
+                self._safe_after(0, self._automation_set_status, "Asana 回填失败", "#e53935")
+            finally:
+                self._safe_after(0, self._automation_set_running, False)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _automation_submit_backend_sync(
+        self, *, allow_unsupported_attribution: bool = False
+    ) -> dict:
+        if not self._automation_fields:
+            raise ValueError("请先提取并校对聚合参数")
+        return submit_backend_via_api(
+            self._automation_fields,
+            self.automation_package_var.get().strip(),
+            api_url=self.cp_adapt_api_url_var.get().strip(),
+            x_token=self.cp_adapt_x_token_var.get().strip(),
+            token=self.cp_adapt_token_var.get().strip(),
+            user_name=self.cp_adapt_assign_var.get().strip() or "rain",
+            stop_event=self._automation_stop_event,
+            allow_unsupported_attribution=allow_unsupported_attribution,
+        )
+
+    def _automation_clear_inferred_backend_sync(
+        self,
+        note: str = INFERRED_AGGREGATION_FAILURE_NOTE,
+    ) -> dict:
+        """Rollback the provisional video/inter submission after replay failure."""
+        return clear_backend_adaptation_via_api(
+            self.automation_package_var.get().strip(),
+            api_url=self.cp_adapt_api_url_var.get().strip(),
+            x_token=self.cp_adapt_x_token_var.get().strip(),
+            token=self.cp_adapt_token_var.get().strip(),
+            user_name=self.cp_adapt_assign_var.get().strip() or "rain",
+            note=note,
+        )
+
+    def _automation_handle_replay_type_change_sync(self, replay: dict) -> bool:
+        """Replace provisional IronSource data with authoritative MAX data."""
+        detected_fields = dict(replay.get("detected_fields") or {})
+        verdict = normalize_optional_parameter(detected_fields.get("最终判断"))
+        assessment = build_aggregation_assessment(detected_fields)
+        if (
+            "max" not in verdict.casefold()
+            or assessment.get("confidence") != "高"
+            or not assessment.get("auto_submit")
+        ):
+            return self._automation_handle_inferred_replay_failure_sync(replay)
+
+        self._safe_after(
+            0,
+            self._automation_log,
+            "回放期间明确识别为 MAX；正在先清空临时 IronSource 参数",
+        )
+        cleared = self._automation_clear_inferred_backend_sync(
+            note="回放检测到 MAX，清理临时 IronSource 参数"
+        )
+        self._safe_after(0, self._automation_log, cleared.get("message", ""))
+        if not cleared.get("ok"):
+            message = (
+                "检测到聚合类型变为 MAX，但清空旧 IronSource 参数失败；"
+                "为避免混合配置，已停止自动化"
+            )
+            self._automation_mark_failed(message)
+            self._automation_comment_failure(
+                cleared.get("code", "AGGREGATION_TYPE_CHANGE_CLEAR_FAILED"),
+                message + "\n" + cleared.get("message", ""),
+            )
+            return False
+
+        detected_fields["_aggregation_type_changed_during_replay"] = True
+        detected_fields.pop("_aggregation_type_inferred", None)
+        self._automation_fields = detected_fields
+        self._safe_after(
+            0,
+            self._automation_render_fields,
+            detected_fields,
+            self._automation_context_version,
+        )
+        self._safe_after(
+            0,
+            self._automation_log,
+            "旧 IronSource 参数已置空；改用回放期间检测到的 MAX 参数",
+        )
+        # Reuse the standard tail: replace Asana data, submit MAX through the
+        # API, clear/read back cache, then start a fresh MAX replay.
+        return self._automation_execute_post_detection_sync()
+
+    def _automation_handle_inferred_replay_failure_sync(
+        self, replay: dict
+    ) -> bool:
+        """Clear provisional backend data and record the terminal conclusion."""
+        package_name = self.automation_package_var.get().strip()
+        replay_message = replay.get("message", "聚合广告回放失败")
+        self._safe_after(
+            0,
+            self._automation_log,
+            "推断 IronSource 回放未成功，正在清空刚提交的后台适配参数",
+        )
+        cleared = self._automation_clear_inferred_backend_sync()
+        self._safe_after(0, self._automation_log, cleared.get("message", ""))
+
+        description_error = ""
+        try:
+            self._automation_fill_asana_sync(
+                terminal_note=INFERRED_AGGREGATION_FAILURE_NOTE
+            )
+            self._safe_after(
+                0,
+                self._automation_log,
+                "暂不适配结论已回填至 Asana 描述",
+            )
+        except Exception as exc:
+            description_error = str(exc)
+            self._safe_after(
+                0,
+                self._automation_log,
+                f"Asana 暂不适配描述回填失败: {exc}",
+            )
+
+        comment_lines = [
+            INFERRED_AGGREGATION_FAILURE_NOTE,
+            f"包名：{package_name}",
+            f"回放结果：{replay_message}",
+            f"后台清空：{cleared.get('message', '未返回结果')}",
+        ]
+        if description_error:
+            comment_lines.append(f"Asana 描述回填失败：{description_error}")
+        comment_code = (
+            "INFERRED_AGGREGATION_REPLAY_FAILED"
+            if cleared.get("ok")
+            else "INFERRED_AGGREGATION_CLEAR_FAILED"
+        )
+        self._automation_comment_failure(comment_code, "\n".join(comment_lines))
+
+        if cleared.get("ok"):
+            self._safe_after(
+                0,
+                self._automation_set_status,
+                "未识别出聚合类型，暂不适配",
+                "#ef6c00",
+            )
+            if self._automation_precheck_item_id:
+                self._safe_after(
+                    0,
+                    self._set_precheck_task_status,
+                    self._automation_precheck_item_id,
+                    "未识别聚合类型",
+                )
+        else:
+            self._automation_mark_failed(
+                "回放失败且后台参数清空失败，需要人工立即处理"
+            )
+        return False
+
+    def _automation_comment_failure(self, code: str, message: str):
+        task_gid = self.automation_task_gid_var.get().strip()
+        if not task_gid:
+            return
+        try:
+            add_automation_comment_once(
+                self._automation_asana_client(), task_gid, code, message
+            )
+            self._safe_after(0, self._automation_log, "失败原因已写入 Asana 评论")
+        except Exception as exc:
+            self._safe_after(0, self._automation_log, f"Asana 评论失败: {exc}")
+
+    def _automation_comment_success(self, result: dict):
+        task_gid = self.automation_task_gid_var.get().strip()
+        package_name = self.automation_package_var.get().strip()
+        if not task_gid:
+            return
+        interstitial = result.get("interstitial") or {}
+        rewarded = result.get("rewarded") or {}
+        lines = ["聚合适配完成", f"包名：{package_name}"]
+        lines.append(
+            "插屏广告："
+            + ("回放成功" if interstitial.get("displayed") else "未配置")
+        )
+        lines.append(
+            "激励视频："
+            + ("回放成功" if rewarded.get("displayed") else "未配置")
+        )
+        try:
+            created = add_automation_comment_once(
+                self._automation_asana_client(),
+                task_gid,
+                "AGGREGATION_REPLAY_SUCCESS",
+                "\n".join(lines),
+            )
+            self._safe_after(
+                0,
+                self._automation_log,
+                "聚合适配成功已写入 Asana 评论"
+                if created
+                else "Asana 已存在聚合适配成功评论",
+            )
+        except Exception as exc:
+            self._safe_after(0, self._automation_log, f"Asana 成功评论写入失败: {exc}")
+
+    def _automation_mark_failed(self, message: str):
+        self._safe_after(0, self._automation_set_status, "自动化失败", "#e53935")
+        self._safe_after(0, self._automation_log, message)
+        if self._automation_precheck_item_id:
+            self._safe_after(
+                0,
+                self._set_precheck_task_status,
+                self._automation_precheck_item_id,
+                "自动化失败",
+            )
+
+    def _automation_mark_not_adapted(self, message: str):
+        self._safe_after(0, self._automation_set_status, "归因暂不适配", "#ef6c00")
+        self._safe_after(0, self._automation_log, message)
+        if self._automation_precheck_item_id:
+            self._safe_after(
+                0,
+                self._set_precheck_task_status,
+                self._automation_precheck_item_id,
+                "归因暂不适配",
+            )
+
+    def _automation_complete_unsupported_attribution_sync(
+        self, message: str
+    ) -> bool:
+        """Persist unsupported-attribution parameters, then skip replay."""
+        package_name = self.automation_package_var.get().strip()
+        self._safe_after(
+            0,
+            self._automation_log,
+            "[归因暂不适配 1/2] 回填 Asana 聚合参数描述",
+        )
+        self._automation_fill_asana_sync(allow_unsupported_attribution=True)
+        self._safe_after(
+            0,
+            self._automation_log,
+            "非白名单归因的聚合检测结果已回填至 Asana 描述",
+        )
+        self._automation_comment_failure(
+            "UNSUPPORTED_ATTRIBUTION",
+            f"{message}\n包名：{package_name}",
+        )
+        if self._automation_stop_event.is_set():
+            return False
+        self._safe_after(
+            0,
+            self._automation_log,
+            "[归因暂不适配 2/2] 提交适配后台、清除缓存并回读校验",
+        )
+        submit = self._automation_submit_backend_sync(
+            allow_unsupported_attribution=True
+        )
+        self._safe_after(0, self._automation_log, submit.get("message", ""))
+        if self._automation_stop_event.is_set():
+            self._safe_after(
+                0,
+                self._automation_log,
+                "已停止：后台步骤结束，不进入聚合回放",
+            )
+            return False
+        if not submit.get("ok"):
+            submit_message = submit.get("message", "后台自动提交失败")
+            self._automation_mark_failed(submit_message)
+            self._automation_comment_failure(
+                submit.get("code", "BACKEND_SUBMIT_FAILED"), submit_message
+            )
+            return False
+        self._automation_mark_not_adapted(message)
+        self._safe_after(
+            0,
+            self._automation_log,
+            "非白名单归因参数已提交并清除缓存；按规则跳过聚合回放",
+        )
+        return False
+
+    def _automation_submit_backend(self):
+        if self._automation_running:
+            return
+        self._automation_set_running(True)
+        self._automation_set_status("正在通过接口提交后台...", "#ef6c00")
+
+        def _run():
+            try:
+                result = self._automation_submit_backend_sync()
+                self._safe_after(0, self._automation_log, result.get("message", ""))
+                if result.get("ok"):
+                    self._safe_after(0, self._automation_set_status, "后台提交成功", "#2e7d32")
+                else:
+                    message = result.get("message", "后台自动提交失败")
+                    self._automation_mark_failed(message)
+                    self._automation_comment_failure(result.get("code", "BACKEND_SUBMIT_FAILED"), message)
+            except Exception as exc:
+                self._automation_mark_failed(f"后台自动提交失败: {exc}")
+                self._automation_comment_failure("BACKEND_SUBMIT_FAILED", str(exc))
+            finally:
+                self._safe_after(0, self._automation_set_running, False)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _automation_replay_sync(self) -> dict:
+        if not self._automation_fields:
+            raise ValueError("请先提取并校对聚合参数")
+        package_name = self.automation_package_var.get().strip()
+        timeout = validate_replay_timeout(self.automation_replay_timeout_var.get())
+        expectation = ReplayExpectation.from_values(
+            self._automation_fields.get("插屏聚合id", ""),
+            self._automation_fields.get("激励视频聚合id", ""),
+            self._automation_fields.get("最终判断", ""),
+        )
+        ok, uid = get_app_uid(package_name)
+        if not ok:
+            raise RuntimeError(uid)
+        self._safe_after(0, self._set_uid, uid)
+
+        def _higher_priority_max_detected(fields: dict) -> bool:
+            verdict = normalize_optional_parameter(fields.get("最终判断"))
+            if "max" not in verdict.casefold():
+                return False
+            assessment = build_aggregation_assessment(fields)
+            return bool(
+                assessment.get("confidence") == "高"
+                and assessment.get("auto_submit")
+            )
+
+        current_verdict = normalize_optional_parameter(
+            self._automation_fields.get("最终判断")
+        ).casefold()
+        # MAX is authoritative over both an explicit IronSource result and the
+        # provisional video/inter business-rule inference.  Keep watching the
+        # same UID during the first replay so a later complete AutoDetector MAX
+        # result can replace the already-submitted IronSource configuration.
+        watch_type_change = bool(
+            is_inferred_aggregation_result(self._automation_fields)
+            or "ironsource" in current_verdict
+            or "iron_source" in current_verdict
+        )
+        return run_ad_replay_check(
+            package_name,
+            uid,
+            expectation,
+            timeout_seconds=timeout,
+            stop_event=self._automation_stop_event,
+            on_line=lambda line: self._safe_after(0, self._automation_log, line),
+            on_progress=lambda text: self._safe_after(
+                0, self._automation_set_status, text, "#ef6c00"
+            ),
+            dismiss_interrupting_dialog=dismiss_notification_permission_dialog,
+            aggregation_change_detector=(
+                _higher_priority_max_detected if watch_type_change else None
+            ),
+            aggregation_change_grace_seconds=90,
+        )
+
+    def _automation_handle_replay_result(self, result: dict):
+        if result.get("ok"):
+            self._automation_log(result.get("message", "聚合广告回放成功"))
+            self._automation_set_status("聚合适配成功", "#2e7d32")
+            if self._automation_precheck_item_id:
+                self._set_precheck_task_status(
+                    self._automation_precheck_item_id, "聚合适配成功"
+                )
+            return
+        message = result.get("message", "聚合广告回放失败")
+        self._automation_mark_failed(message)
+        if result.get("code") == "REPLAY_TIMEOUT":
+            comment = build_replay_failure_comment(
+                self.automation_package_var.get().strip(), result
+            )
+            comment = "\n".join(comment.splitlines()[1:])
+            comment_code = "AD_REPLAY_FAILED"
+        else:
+            comment = (
+                "聚合广告回放失败，自动化适配终止，需要测试人员确认\n"
+                f"包名：{self.automation_package_var.get().strip()}\n"
+                f"失败原因：{message}"
+            )
+            comment_code = result.get("code", "AD_REPLAY_FAILED")
+        self._automation_comment_failure(comment_code, comment)
+
+    def _automation_start_replay(self):
+        if self._automation_running:
+            return
+        self._automation_set_running(True)
+
+        def _run():
+            try:
+                result = self._automation_replay_sync()
+                if result.get("code") == "AGGREGATION_TYPE_CHANGED_DURING_REPLAY":
+                    self._automation_handle_replay_type_change_sync(result)
+                elif result.get("ok"):
+                    self._automation_comment_success(result)
+                    self._safe_after(0, self._automation_handle_replay_result, result)
+                elif self._automation_fields.get("_aggregation_type_inferred"):
+                    self._automation_handle_inferred_replay_failure_sync(result)
+                else:
+                    self._safe_after(0, self._automation_handle_replay_result, result)
+            except Exception as exc:
+                if self._automation_fields.get("_aggregation_type_inferred"):
+                    self._automation_handle_inferred_replay_failure_sync(
+                        {
+                            "ok": False,
+                            "code": "REPLAY_EXCEPTION",
+                            "message": f"聚合回放检测异常：{exc}",
+                        }
+                    )
+                else:
+                    self._automation_mark_failed(f"聚合回放检测失败: {exc}")
+                    self._automation_comment_failure("AD_REPLAY_FAILED", str(exc))
+            finally:
+                self._safe_after(0, self._automation_set_running, False)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _automation_execute_post_detection_sync(self) -> bool:
+        """Run the common fill/submit/replay tail for validated fields."""
+        if self._automation_stop_event.is_set():
+            self._safe_after(
+                0, self._automation_log, "已停止：不再回填 Asana 或提交后台"
+            )
+            self._safe_after(
+                0, self._automation_set_status, "自动化已停止", "#ef6c00"
+            )
+            return False
+        self._safe_after(0, self._automation_log, "[1/3] 回填 Asana 描述")
+        self._automation_fill_asana_sync()
+        if self._automation_stop_event.is_set():
+            return False
+        self._safe_after(0, self._automation_log, "[2/3] 接口提交适配后台")
+        submit = self._automation_submit_backend_sync()
+        self._safe_after(0, self._automation_log, submit.get("message", ""))
+        if self._automation_stop_event.is_set():
+            self._safe_after(
+                0,
+                self._automation_log,
+                "已停止：后台步骤结束后不再进入聚合回放",
+            )
+            self._safe_after(
+                0, self._automation_set_status, "自动化已停止", "#ef6c00"
+            )
+            return False
+        if not submit.get("ok"):
+            message = submit.get("message", "后台自动提交失败")
+            self._automation_mark_failed(message)
+            self._automation_comment_failure(
+                submit.get("code", "BACKEND_SUBMIT_FAILED"), message
+            )
+            return False
+        self._safe_after(0, self._automation_log, "[3/3] 重启应用并检测聚合回放")
+        try:
+            replay = self._automation_replay_sync()
+        except Exception as exc:
+            if self._automation_fields.get("_aggregation_type_inferred"):
+                return self._automation_handle_inferred_replay_failure_sync(
+                    {
+                        "ok": False,
+                        "code": "REPLAY_EXCEPTION",
+                        "message": f"聚合回放检测异常：{exc}",
+                    }
+                )
+            raise
+        if replay.get("code") == "AGGREGATION_TYPE_CHANGED_DURING_REPLAY":
+            return self._automation_handle_replay_type_change_sync(replay)
+        if replay.get("ok"):
+            self._automation_comment_success(replay)
+        elif self._automation_fields.get("_aggregation_type_inferred"):
+            return self._automation_handle_inferred_replay_failure_sync(replay)
+        self._safe_after(0, self._automation_handle_replay_result, replay)
+        return bool(replay.get("ok"))
+
+    def _automation_run_post_detection(self):
+        if self._automation_running:
+            return
+        context_version = self._automation_context_version
+        self._automation_set_running(True)
+        self._automation_set_status("开始自动化后半程...", "#ef6c00")
+
+        def _run():
+            try:
+                field_issue = detection_field_issue(self._automation_fields)
+                if field_issue:
+                    if self._automation_fields.get("_detection_retry_exhausted") or self._automation_fields.get("_aggregation_retry_exhausted"):
+                        detection = {
+                            "ok": False,
+                            "code": field_issue[0],
+                            "message": field_issue[1],
+                            "fields": self._automation_fields,
+                        }
+                    else:
+                        first_fields = self._automation_fields or self._automation_prepare_detection_sync()
+                        runtime_monitor = PackageRuntimeMonitor(
+                            self.automation_package_var.get().strip()
+                        )
+                        detection = detect_aggregation_with_one_retry(
+                            self.automation_package_var.get().strip(),
+                            lambda: self._automation_extract_logcat_fields(),
+                            first_fields=first_fields,
+                            stop_event=self._automation_stop_event,
+                            on_progress=lambda text: self._safe_after(
+                                0, self._automation_log, text
+                            ),
+                            runtime_check=runtime_monitor.poll,
+                            runtime_reset=runtime_monitor.reset,
+                        )
+                    if context_version != self._automation_context_version:
+                        self._safe_after(
+                            0,
+                            self._automation_log,
+                            "已丢弃上一应用延迟返回的聚合参数",
+                        )
+                        return
+                    self._automation_fields = detection.get("fields") or {}
+                    if self._automation_fields:
+                        self._safe_after(
+                            0,
+                            self._automation_render_fields,
+                            self._automation_fields,
+                            context_version,
+                        )
+                    if not detection.get("ok"):
+                        message = detection.get("message", "聚合参数提取失败")
+                        if detection.get("code") == "UNSUPPORTED_ATTRIBUTION":
+                            self._automation_complete_unsupported_attribution_sync(
+                                message
+                            )
+                            return
+                        else:
+                            self._automation_mark_failed(message)
+                        if detection.get("code") in {
+                            "AGGREGATION_TYPE_EMPTY",
+                            "AGGREGATION_RESULT_INCOMPLETE",
+                            "AF_KEY_EMPTY",
+                            "AD_IDS_EMPTY",
+                            "UNSUPPORTED_ATTRIBUTION",
+                            "APP_CRASHED",
+                            "APP_EXITED_DURING_AUTOMATION",
+                        }:
+                            runtime_summary = str(
+                                (detection.get("runtime") or {}).get("summary")
+                                or (detection.get("fields") or {}).get("_runtime_summary")
+                                or ""
+                            ).strip()
+                            self._automation_comment_failure(
+                                detection.get("code"),
+                                f"{message}\n"
+                                f"包名：{self.automation_package_var.get().strip()}"
+                                + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else ""),
+                            )
+                        return
+                self._automation_execute_post_detection_sync()
+            except Exception as exc:
+                self._automation_mark_failed(f"自动化执行失败: {exc}")
+                self._automation_comment_failure("AUTOMATION_FAILED", str(exc))
+            finally:
+                self._safe_after(0, self._automation_set_running, False)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _automation_eligible_precheck_tasks(self):
+        """Return installed, non-terminal precheck tasks in visible list order."""
+        eligible_statuses = {"启动正常", "安装完成", "已安装"}
+        queue = []
+        for item_id in self.precheck_task_tree.get_children():
+            task = self._precheck_tasks.get(item_id)
+            if task is None or getattr(task, "completed", False):
+                continue
+            values = self.precheck_task_tree.item(item_id, "values")
+            status = str(values[3] if len(values) >= 4 else "").strip()
+            if status in eligible_statuses:
+                queue.append((item_id, task))
+        return queue
+
+    def _automation_apply_task_context(self, item_id: str, task):
+        self._automation_clear_detected_fields()
+        self._automation_precheck_item_id = item_id
+        self.automation_task_gid_var.set(str(getattr(task, "gid", "") or ""))
+        self.automation_package_var.set(
+            str(getattr(task, "package_name", "") or "")
+        )
+        self.automation_appid_var.set(str(getattr(task, "up2_appid", "") or ""))
+        self._automation_task_notes = str(getattr(task, "notes", "") or "")
+        self._select_precheck_item(item_id)
+
+    def _automation_switch_task_sync(self, item_id: str, task):
+        # A page-level UID listener belongs to the previous package.  Stop it
+        # before changing the task context so no A-process output can race with
+        # the setup and UID switch for package B.
+        self._automation_stop_active_logcat("切换到下一个包体")
+        self._cached_uid = None
+        self._safe_after(0, self.uid_var.set, "")
+        if threading.current_thread() is threading.main_thread():
+            self._automation_apply_task_context(item_id, task)
+            return
+        applied = threading.Event()
+
+        def _apply():
+            try:
+                self._automation_apply_task_context(item_id, task)
+            finally:
+                applied.set()
+
+        self._safe_after(0, _apply)
+        if not applied.wait(timeout=10):
+            raise RuntimeError("切换自动化任务超时")
+
+    def _automation_run_command_sync(
+        self,
+        cmd: list[str],
+        *,
+        cwd: str | None = None,
+        timeout: int = 180,
+        respect_control: bool = True,
+    ) -> str:
+        if respect_control and not self._automation_wait_if_paused():
+            raise RuntimeError("用户已停止自动化")
+        display = self._cmd_display(cmd)
+        self._safe_after(0, self._automation_log, f"$ {display}")
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as exc:
+            raise RuntimeError(f"无法执行命令：{display}：{exc}") from exc
+
+        output_lines = []
+        started = time.monotonic()
+        selector = selectors.DefaultSelector()
+        if proc.stdout is not None:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+        try:
+            while proc.poll() is None:
+                if respect_control and self._automation_stop_event.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise RuntimeError("用户已停止自动化")
+                if timeout and time.monotonic() - started >= timeout:
+                    proc.kill()
+                    proc.wait()
+                    raise RuntimeError(f"命令超时：{display}")
+                for key, _mask in selector.select(timeout=0.5):
+                    line = key.fileobj.readline()
+                    if not line:
+                        continue
+                    clean = line.rstrip()
+                    output_lines.append(clean)
+                    self._safe_after(0, self._automation_log, f"ADB | {clean}")
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    clean = line.rstrip()
+                    output_lines.append(clean)
+                    self._safe_after(0, self._automation_log, f"ADB | {clean}")
+        finally:
+            selector.close()
+
+        output = "\n".join(output_lines).strip()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"命令失败 (exit={proc.returncode})：{output or display}"
+            )
+        return output
+
+    def _automation_extract_logcat_fields(
+        self,
+        seen_lines: set[str] | None = None,
+        uid: str | None = None,
+    ):
+        seen_lines = seen_lines if seen_lines is not None else set()
+
+        def _line(line: str):
+            clean = line.strip()
+            if not clean or clean in seen_lines:
+                return
+            seen_lines.add(clean)
+            self._safe_after(0, self._automation_log, f"ADB | {clean}")
+
+        uid = uid or self._cached_uid or self.uid_var.get().strip()
+        return extract_logcat_fields(uid=uid or None, on_line=_line)
+
+    def _automation_stop_active_logcat(self, reason: str = ""):
+        """Stop any page-level logcat process before switching package/UID."""
+        proc = self._logcat_proc
+        if proc is None:
+            return
+        stop_logcat_stream(proc)
+        self._logcat_proc = None
+        self._logcat_thread = None
+        previous_pattern = self._active_pattern
+        self._active_pattern = None
+        # ``_safe_after`` forwards positional arguments only.  Use a closure
+        # here so this cleanup is also safe when called from the batch worker.
+        self._safe_after(
+            0,
+            lambda: self.monitor_label.config(text="当前未监听", foreground="gray"),
+        )
+        self._safe_after(
+            0,
+            self._automation_log,
+            f"已停止旧 UID 监听{f'（{reason}）' if reason else ''}: {previous_pattern or 'logcat'}",
+        )
+
+    def _automation_prepare_detection_sync(self) -> dict:
+        """Run the independent ADB preparation pipeline for the current task."""
+        self._automation_stop_active_logcat("切换包体前")
+        # Do not let a previous task's UID be used as a fallback while B is
+        # being prepared.  The UID is populated again only after B is installed
+        # and queried with get_app_uid().
+        self._cached_uid = None
+        self._safe_after(0, self.uid_var.set, "")
+        package_name = self.automation_package_var.get().strip()
+        appid = self.automation_appid_var.get().strip()
+        config_path = self.config_path_var.get().strip()
+        work_dir = self.work_dir_var.get().strip()
+        if not package_name or not appid:
+            raise ValueError("当前任务缺少包名或 UP2 appid")
+        if not check_device():
+            raise RuntimeError("没有已连接的 ADB 设备")
+        if not os.path.isfile(config_path):
+            raise ValueError(f"配置文件不存在: {config_path}")
+        script_path = os.path.join(work_dir, "zygote_build.sh")
+        if not os.path.isfile(script_path):
+            raise ValueError(f"构建脚本不存在: {script_path}")
+
+        self._safe_after(0, self._automation_log, "[ADB 1/6] 写入当前包体配置")
+        with open(config_path, "r", encoding="utf-8") as file:
+            config = json.load(file)
+        if not config.get("data"):
+            config["data"] = [{}]
+        config["data"][0].update(
+            {
+                "packageName": package_name,
+                "appId": appid,
+                "taskUUID": AUTOMATION_AGGREGATION_TASK_UUID,
+            }
+        )
+        with open(config_path, "w", encoding="utf-8") as file:
+            json.dump(config, file, indent=2, ensure_ascii=False)
+        # The automation tab and the manual ADB tab intentionally keep
+        # separate widgets, but they operate on the same config.json.  Refresh
+        # the ADB tab after automation writes the current task so opening that
+        # tab never shows package A while package B is being detected.
+        self._safe_after(
+            0,
+            self._sync_adb_tab_from_automation,
+            package_name,
+            appid,
+            AUTOMATION_AGGREGATION_TASK_UUID,
+        )
+        self._safe_after(
+            0,
+            self._automation_log,
+            (
+                f"ADB | packageName={package_name} appId={appid} "
+                f"taskUUID={AUTOMATION_AGGREGATION_TASK_UUID}"
+            ),
+        )
+
+        self._safe_after(0, self._automation_log, "[ADB 2/6] 推送 config.json")
+        self._automation_run_command_sync(build_push_config_cmd(config_path), timeout=45)
+        if self._automation_stop_event.is_set():
+            raise RuntimeError("用户已停止自动化")
+
+        self._safe_after(0, self._automation_log, "[ADB 3/6] 执行 zygote_build")
+        self._automation_run_command_sync(
+            build_zygote_build_cmd(work_dir), cwd=work_dir, timeout=180
+        )
+        if self._automation_stop_event.is_set():
+            raise RuntimeError("用户已停止自动化")
+
+        self._safe_after(0, self._automation_log, "[ADB 4/6] 获取应用 UID")
+        ok, uid = get_app_uid(package_name)
+        if not ok:
+            raise RuntimeError(uid)
+        self._cached_uid = uid
+        self._safe_after(0, self._set_uid, uid)
+        self._safe_after(0, self._automation_log, f"ADB | UID={uid}")
+
+        self._safe_after(0, self._automation_log, "[ADB 5/6] 清理旧日志并启动应用")
+        clear_logcat_buffer()
+        self._automation_run_command_sync(build_open_app_cmd(package_name), timeout=20)
+        runtime_monitor = PackageRuntimeMonitor(package_name)
+
+        self._safe_after(
+            0,
+            self._automation_log,
+            "[ADB 6/6] 监听 ZGSDK.AutoDetector 并提取聚合参数",
+        )
+        seen_lines: set[str] = set()
+        latest_fields: dict = {}
+        last_good_fields: dict = {}
+        last_logcat_error = ""
+        initial_started = time.monotonic()
+        initial_hard_deadline = initial_started + 90
+        minimum_wait_seconds = 60
+        quiet_window_seconds = 25
+        last_log_signature = ""
+        last_log_change = initial_started
+        next_status_second = 90
+        last_dialog_check = -3.0
+        notification_dialog_dismissed = False
+        while time.monotonic() < initial_hard_deadline:
+            if self._automation_stop_event.is_set():
+                raise RuntimeError("用户已停止自动化")
+            if not self._automation_wait_if_paused():
+                raise RuntimeError("用户已停止自动化")
+            elapsed = time.monotonic() - initial_started
+            if (
+                not notification_dialog_dismissed
+                and elapsed - last_dialog_check >= 3.0
+            ):
+                last_dialog_check = elapsed
+                dialog_result = dismiss_notification_permission_dialog()
+                if dialog_result.get("dismissed"):
+                    notification_dialog_dismissed = True
+                    self._safe_after(
+                        0,
+                        self._automation_log,
+                        f"ADB | {dialog_result.get('message')}",
+                    )
+            snapshot = self._automation_extract_logcat_fields(seen_lines, uid=uid)
+            runtime = runtime_monitor.poll()
+            if not runtime.get("ok", True):
+                summary = str(runtime.get("summary") or "").strip()
+                message = runtime.get("message", "应用在检测过程中异常退出")
+                if summary:
+                    self._safe_after(0, self._automation_log, f"ADB | 崩溃证据: {summary}")
+                return {
+                    "ok": False,
+                    "error": message,
+                    "_runtime_code": runtime.get(
+                        "code", "APP_EXITED_DURING_AUTOMATION"
+                    ),
+                    "_runtime_summary": summary,
+                }
+            if not snapshot.get("ok", True):
+                if snapshot.get("_transient"):
+                    error = str(snapshot.get("error") or "Logcat 暂时无法读取")
+                    if error != last_logcat_error:
+                        last_logcat_error = error
+                        self._safe_after(
+                            0,
+                            self._automation_log,
+                            f"ADB | {error}，设备状态={snapshot.get('_adb_state', 'unknown')}，继续等待",
+                        )
+                    time.sleep(
+                        min(2, max(0.1, initial_hard_deadline - time.monotonic()))
+                    )
+                    latest_fields = snapshot
+                    continue
+                return snapshot
+            latest_fields = snapshot
+            last_good_fields = snapshot
+            issue = detection_field_issue(latest_fields)
+            if issue is None or (
+                issue is not None
+                and issue[0] == "UNSUPPORTED_ATTRIBUTION"
+                and has_explicit_attribution(latest_fields)
+            ):
+                return latest_fields
+            now = time.monotonic()
+            signature = str(latest_fields.get("完整日志") or "")
+            if signature and signature != last_log_signature:
+                last_log_signature = signature
+                last_log_change = now
+            elapsed = now - initial_started
+            # Do not stop at the old 45-second boundary.  A normal detector can
+            # emit its final verdict just after 45 seconds.  Allow at least 60
+            # seconds, then stop only after a 25-second quiet period, with a
+            # hard cap of 90 seconds.
+            if (
+                elapsed >= minimum_wait_seconds
+                and now - last_log_change >= quiet_window_seconds
+            ):
+                break
+            remaining = max(0, int(initial_hard_deadline - now))
+            if remaining <= next_status_second:
+                self._safe_after(
+                    0,
+                    self._automation_log,
+                    f"ADB | 等待检测日志，剩余约 {remaining} 秒",
+                )
+                next_status_second -= 10
+            time.sleep(min(5, max(0.1, initial_hard_deadline - time.monotonic())))
+        return last_good_fields or latest_fields or self._automation_extract_logcat_fields(
+            seen_lines, uid=uid
+        )
+
+    def _sync_adb_tab_from_automation(
+        self, package_name: str, appid: str, task_uuid: str
+    ) -> None:
+        """Show the latest automation config in the existing manual ADB tab."""
+        self.pkg_entry.delete(0, tk.END)
+        self.pkg_entry.insert(0, package_name)
+        self.appid_entry.delete(0, tk.END)
+        self.appid_entry.insert(0, appid)
+        if task_uuid in self.task_uuid_combo["values"]:
+            self.task_uuid_var.set(task_uuid)
+        else:
+            self.task_uuid_var.set(AUTOMATION_AGGREGATION_TASK_UUID)
+        self.status_label.config(text="ADB 指令页已同步当前聚合检测配置")
+
+    def _automation_process_current_task_sync(self) -> bool:
+        context_version = self._automation_context_version
+        package_name = self.automation_package_var.get().strip()
+        initial_fields = self._automation_prepare_detection_sync()
+        runtime_monitor = PackageRuntimeMonitor(package_name)
+        detection = detect_aggregation_with_one_retry(
+            package_name,
+            lambda: self._automation_extract_logcat_fields(),
+            first_fields=initial_fields,
+            stop_event=self._automation_stop_event,
+            on_progress=lambda text: self._safe_after(0, self._automation_log, text),
+            runtime_check=runtime_monitor.poll,
+            runtime_reset=runtime_monitor.reset,
+        )
+        if context_version != self._automation_context_version:
+            self._safe_after(
+                0,
+                self._automation_log,
+                "已丢弃上一应用延迟返回的聚合参数",
+            )
+            return False
+        self._automation_fields = detection.get("fields") or {}
+        if self._automation_fields:
+            self._safe_after(
+                0,
+                self._automation_render_fields,
+                self._automation_fields,
+                context_version,
+            )
+        if not detection.get("ok"):
+            message = detection.get("message", "聚合参数提取失败")
+            failure_code = detection.get(
+                "code", "AGGREGATION_DETECTION_FAILED"
+            )
+            if failure_code in AUTOMATION_INFRASTRUCTURE_FAILURE_CODES:
+                self._safe_after(
+                    0,
+                    self._automation_log,
+                    f"ADB | {message}；批量队列安全停止，不写入 Asana 业务结论",
+                )
+                self._safe_after(
+                    0,
+                    self._automation_set_status,
+                    "ADB/Logcat 异常，队列已停止",
+                    "#e53935",
+                )
+                self._automation_stop_event.set()
+                return False
+            if detection.get("code") == "UNSUPPORTED_ATTRIBUTION":
+                return self._automation_complete_unsupported_attribution_sync(
+                    message
+                )
+            else:
+                self._automation_mark_failed(message)
+            runtime_summary = str(
+                (detection.get("runtime") or {}).get("summary")
+                or (detection.get("fields") or {}).get("_runtime_summary")
+                or ""
+            ).strip()
+            self._automation_comment_failure(
+                failure_code,
+                f"{message}\n包名：{package_name}"
+                + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else ""),
+            )
+            return False
+
+        if not self._automation_wait_if_paused():
+            return False
+        self._safe_after(0, self._automation_log, "[1/3] 回填 Asana 描述")
+        self._automation_fill_asana_sync()
+        if self._automation_stop_event.is_set():
+            return False
+        if not self._automation_wait_if_paused():
+            return False
+        self._safe_after(0, self._automation_log, "[2/3] 接口提交适配后台")
+        submit = self._automation_submit_backend_sync()
+        self._safe_after(0, self._automation_log, submit.get("message", ""))
+        if self._automation_stop_event.is_set():
+            self._safe_after(
+                0,
+                self._automation_log,
+                "已停止：后台步骤结束后不再进入聚合回放",
+            )
+            self._safe_after(0, self._automation_set_status, "自动化已停止", "#ef6c00")
+            return False
+        if not submit.get("ok"):
+            message = submit.get("message", "后台自动提交失败")
+            self._automation_mark_failed(message)
+            self._automation_comment_failure(
+                submit.get("code", "BACKEND_SUBMIT_FAILED"), message
+            )
+            return False
+        if self._automation_stop_event.is_set():
+            return False
+        if not self._automation_wait_if_paused():
+            return False
+        self._safe_after(0, self._automation_log, "[3/3] 重启应用并检测聚合回放")
+        try:
+            replay = self._automation_replay_sync()
+        except Exception as exc:
+            if self._automation_fields.get("_aggregation_type_inferred"):
+                return self._automation_handle_inferred_replay_failure_sync(
+                    {
+                        "ok": False,
+                        "code": "REPLAY_EXCEPTION",
+                        "message": f"聚合回放检测异常：{exc}",
+                    }
+                )
+            raise
+        if replay.get("code") == "AGGREGATION_TYPE_CHANGED_DURING_REPLAY":
+            return self._automation_handle_replay_type_change_sync(replay)
+        if replay.get("ok"):
+            self._automation_comment_success(replay)
+            self._safe_after(
+                0, self._automation_log, replay.get("message", "聚合广告回放成功")
+            )
+            self._safe_after(0, self._automation_set_status, "聚合适配成功", "#2e7d32")
+            if self._automation_precheck_item_id:
+                self._safe_after(
+                    0,
+                    self._set_precheck_task_status,
+                    self._automation_precheck_item_id,
+                    "聚合适配成功",
+                )
+            return True
+
+        if self._automation_fields.get("_aggregation_type_inferred"):
+            return self._automation_handle_inferred_replay_failure_sync(replay)
+
+        message = replay.get("message", "聚合广告回放失败")
+        self._automation_mark_failed(message)
+        if replay.get("code") == "REPLAY_TIMEOUT":
+            comment = build_replay_failure_comment(package_name, replay)
+            comment = "\n".join(comment.splitlines()[1:])
+            code = "AD_REPLAY_FAILED"
+        else:
+            comment = (
+                "聚合广告回放失败，自动化适配终止，需要测试人员确认\n"
+                f"包名：{package_name}\n失败原因：{message}"
+            )
+            code = replay.get("code", "AD_REPLAY_FAILED")
+        self._automation_comment_failure(code, comment)
+        return False
+
+    def _automation_run_eligible_batch(self):
+        if self._automation_running:
+            return
+        queue = self._automation_eligible_precheck_tasks()
+        if not queue:
+            self._automation_set_status("预检列表中没有可自动适配的已安装任务", "#e53935")
+            self._automation_log(
+                "批量队列为空：仅处理状态为启动正常、安装完成或已安装的任务"
+            )
+            return
+        self._automation_batch_active = True
+        self._automation_set_running(True)
+        self._automation_set_status(f"批量自动适配 0/{len(queue)}", "#ef6c00")
+
+        def _run():
+            succeeded = 0
+            failed = 0
+            try:
+                for position, (item_id, task) in enumerate(queue, start=1):
+                    if self._automation_stop_event.is_set():
+                        break
+                    if not self._automation_wait_if_paused():
+                        break
+                    self._automation_switch_task_sync(item_id, task)
+                    package_name = str(getattr(task, "package_name", "") or "")
+                    self._safe_after(
+                        0,
+                        self._automation_set_status,
+                        f"批量自动适配 {position}/{len(queue)}",
+                        "#ef6c00",
+                    )
+                    self._safe_after(
+                        0,
+                        self._automation_log,
+                        f"========== [{position}/{len(queue)}] {package_name} ==========",
+                    )
+                    try:
+                        if self._automation_process_current_task_sync():
+                            succeeded += 1
+                        else:
+                            failed += 1
+                    except Exception as exc:
+                        failed += 1
+                        message = f"自动化执行失败: {exc}"
+                        self._automation_mark_failed(message)
+                        self._automation_comment_failure("AUTOMATION_FAILED", message)
+                    finally:
+                        self._automation_stop_active_logcat("当前包体已完成")
+                        try:
+                            self._automation_run_command_sync(
+                                build_force_stop_cmd(package_name),
+                                timeout=15,
+                                respect_control=False,
+                            )
+                        except Exception as exc:
+                            self._safe_after(
+                                0,
+                                self._automation_log,
+                                f"停止当前应用失败: {exc}",
+                            )
+                stopped = self._automation_stop_event.is_set()
+                summary = (
+                    f"批量自动适配已停止：成功 {succeeded}，失败 {failed}"
+                    if stopped
+                    else f"批量自动适配完成：成功 {succeeded}，失败 {failed}"
+                )
+                self._safe_after(0, self._automation_log, summary)
+                self._safe_after(
+                    0,
+                    self._automation_set_status,
+                    summary,
+                    "#ef6c00" if stopped or failed else "#2e7d32",
+                )
+            finally:
+                self._safe_after(0, self._automation_set_running, False)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _automation_wait_if_paused(self) -> bool:
+        """Pause the batch at a safe boundary; return False when stopped."""
+        logged = False
+        while self._automation_pause_event.is_set():
+            if self._automation_stop_event.is_set():
+                return False
+            if not logged:
+                self._safe_after(0, self._automation_log, "批量队列已暂停，等待继续")
+                logged = True
+            time.sleep(0.2)
+        return not self._automation_stop_event.is_set()
+
+    def _automation_toggle_pause(self):
+        if not self._automation_running or not self._automation_batch_active:
+            return
+        if self._automation_pause_event.is_set():
+            self._automation_pause_event.clear()
+            self._automation_pause_btn.configure(text="暂停队列")
+            self._automation_set_status("批量队列继续执行", "#ef6c00")
+            self._automation_log("已继续批量自动适配")
+        else:
+            self._automation_pause_event.set()
+            self._automation_pause_btn.configure(text="继续队列")
+            self._automation_set_status("将在当前安全步骤后暂停", "#ef6c00")
+            self._automation_log("已请求暂停，不会切换到下一包")
+
+    def _automation_stop(self):
+        self._automation_stop_event.set()
+        self._automation_pause_event.clear()
+        self._automation_set_status("正在停止...", "#ef6c00")
+        self._automation_log("已请求停止，将在当前步骤安全结束后停止")
 
     # ── 自动化脚本事件 ────────────────────────────────────────────
 
@@ -1547,13 +4756,12 @@ class APKToolApp:
 
         # 如果是直链(.apk/.xapk) → 直接下载安装
         if url.startswith("http://") or url.startswith("https://"):
-            pkg_match = re.search(r"[?&]id=([^&]+)", url)
-            if pkg_match and not is_apk_download_url(url):
-                pkg = pkg_match.group(1)
+            apkcombo_url = build_apkcombo_search_url(url)
+            if apkcombo_url and not is_apk_download_url(url):
                 import webbrowser
-                webbrowser.open(f"https://apkcombo.com/{pkg}/download/apk")
+                webbrowser.open(apkcombo_url)
                 self.status_label.config(
-                    text="已在电脑浏览器打开 apkcombo，下载后选择 xapk 文件并点「推送安装」"
+                    text="已打开 APKCombo 搜索结果页"
                 )
                 return
             self._start_download_install(url)
@@ -1609,6 +4817,23 @@ class APKToolApp:
             save_gui_settings(self._settings)
         except OSError as e:
             self.status_label.config(text=f"路径记忆保存失败: {e}")
+
+    def _on_fill_parent_task_gid_from_url(self):
+        try:
+            task_gid = extract_asana_task_gid(self.parent_task_url_var.get())
+        except ValueError as exc:
+            self.parent_task_url_status_label.config(
+                text=str(exc), foreground="#ef5350"
+            )
+            return
+
+        self.parent_task_gid_var.set(task_gid)
+        # Persist immediately so the next sync uses the new parent even if the
+        # user clicks the sync action before the normal debounced save fires.
+        self._save_sync_settings()
+        self.parent_task_url_status_label.config(
+            text=f"已填充并保存父任务 GID：{task_gid}", foreground="#2e7d32"
+        )
 
     def _remember_cleanup_keep_packages(self):
         self._settings["cleanup_keep_packages"] = self._cleanup_keep_packages_text()
@@ -1803,7 +5028,14 @@ class APKToolApp:
                     self.status_label.config(text=msg)
                 self._set_buttons_state(True, token)
 
-            self._safe_after(0, _finish)
+            # Normal execution runs in a worker and must marshal back to Tk.
+            # Synchronous thread adapters (used by embedders/tests) already run
+            # on Tk's main thread, where deferring would leave the 50s safety
+            # timer pending unnecessarily.
+            if threading.current_thread() is threading.main_thread():
+                _finish()
+            else:
+                self._safe_after(0, _finish)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1866,6 +5098,41 @@ class APKToolApp:
         cmd = build_force_stop_cmd(pkg)
         self._run_command(cmd, timeout=8, disable_buttons=False)
 
+    def _on_cancel_zygotehole_injection(self):
+        if not check_device():
+            self.status_label.config(text="没有已连接的设备")
+            return
+        pkg = self.pkg_entry.get().strip()
+        if not pkg:
+            self.status_label.config(text="请输入包名")
+            return
+        if not messagebox.askyesno(
+            "确认取消注入",
+            f"将从设备注入配置中删除 {pkg}，保留其他游戏配置，并强制停止该游戏。是否继续？",
+        ):
+            self.status_label.config(text="已取消操作")
+            return
+
+        token = self._set_buttons_state(False, auto_restore_ms=35000)
+        self._console_cmd(f"取消当前游戏注入: {pkg}")
+        self.status_label.config(text="正在取消注入...")
+        self.root.update_idletasks()
+
+        def _run():
+            ok, msg = cancel_zygotehole_injection(pkg)
+
+            def _finish():
+                self._console_line(
+                    f"[取消注入] {msg}",
+                    "done" if ok else "error",
+                )
+                self.status_label.config(text=msg)
+                self._set_buttons_state(True, token)
+
+            self._safe_after(0, _finish)
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _on_open_app(self):
         if not check_device():
             self.status_label.config(text="没有已连接的设备")
@@ -1894,6 +5161,10 @@ class APKToolApp:
         current_pkg = self.pkg_entry.get().strip()
         if current_pkg:
             packages.append(current_pkg)
+        # The MAX Mediation Debugger share receiver is part of the automation
+        # toolchain and must survive third-party package cleanup even when an
+        # older saved keep-list predates the helper app.
+        packages.append("com.apktool.sharereceiver")
         return sorted(set(packages))
 
     def _cleanup_keep_packages_text(self) -> str:

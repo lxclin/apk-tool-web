@@ -20,6 +20,11 @@ dist/
 
 # Runtime logs
 *.log
+crash-export-*/
+crash-export-*.tar.gz
+
+# Locally generated Android signing material
+android/share-receiver/debug.keystore
 
 # Local app state
 gui_settings.json

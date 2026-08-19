@@ -11,6 +11,7 @@ from datetime import date
 from auto_asana.main import (
     PackageRow,
     AsanaTaskInfo,
+    AsanaPrecheckTask,
     SheetCellUpdate,
     SheetRowUpdate,
     build_task_name,
@@ -44,9 +45,15 @@ from auto_asana.main import (
     find_or_create_section,
     get_existing_task_names,
     get_existing_tasks_by_name,
+    get_asana_tasks_for_date,
+    parse_asana_precheck_task,
+    build_precheck_asana_comment,
+    add_precheck_comment_once,
+    classify_precheck_workflow_status,
     create_tasks_for_packages,
     update_task_notes_for_packages,
     _SectionsFacade,
+    _StoriesFacade,
     _TasksFacade,
     _build_gs_service,
     sync_packages,
@@ -92,6 +99,337 @@ class TestGenerateTargetDates:
         parts = sheet_date.split(".")
         assert len(parts) == 3
         assert len(parts[0]) == 2  # yy
+
+
+class TestAsanaPrecheckTasks:
+    def test_latest_comment_restores_business_status(self):
+        stories = [
+            {
+                "text": "应用内购，无广告，加黑",
+                "resource_subtype": "comment_added",
+                "created_at": "2026-08-12T01:00:00Z",
+            },
+            {
+                "text": "聚合适配完成",
+                "resource_subtype": "comment_added",
+                "created_at": "2026-08-12T02:00:00Z",
+            },
+        ]
+
+        assert classify_precheck_workflow_status(stories) == (
+            "聚合适配成功",
+            True,
+        )
+
+    @pytest.mark.parametrize(
+        ("comment", "expected"),
+        [
+            ("【APK Tool 页面预检：APP_CRASHED】\n包体闪退，暂不适配", "包体闪退"),
+            ("Singular归因，暂不适配", "归因暂不适配"),
+            ("【APK Tool 自动化适配：AF_KEY_EMPTY】\naf_key为空", "参数待确认"),
+            ("【APK Tool 自动化适配：AD_REPLAY_FAILED】\n未确认广告展示", "回放失败"),
+            (
+                "【APK Tool 自动化适配：PRECHECK_BLACKLIST_CACHE_FAILED】\n刷新缓存失败",
+                "加黑缓存刷新失败",
+            ),
+        ],
+    )
+    def test_comment_status_categories(self, comment, expected):
+        assert classify_precheck_workflow_status([{"text": comment}]) == (
+            expected,
+            True,
+        )
+
+    def test_parses_fields_from_task_notes(self):
+        task = parse_asana_precheck_task({
+            "gid": "task-1",
+            "name": "聚合/动作适配com.example.game",
+            "notes": (
+                "包名：com.example.game\n"
+                "UP2 appid：up2-123\n"
+                "GP链接：https://play.google.com/store/apps/details?id=com.example.game"
+            ),
+            "completed": False,
+        })
+
+        assert isinstance(task, AsanaPrecheckTask)
+        assert task.package_name == "com.example.game"
+        assert task.up2_appid == "up2-123"
+        assert task.gp_link.endswith("id=com.example.game")
+
+    def test_parses_markdown_google_play_link(self):
+        task = parse_asana_precheck_task({
+            "gid": "task-1",
+            "name": "聚合/动作适配com.example.game",
+            "notes": (
+                "GP链接： [https://play.google.com/store/apps/details?id=com.example.game]"
+                "(https://play.google.com/store/apps/details?id=com.example.game)"
+            ),
+        })
+
+        assert task.gp_link == (
+            "https://play.google.com/store/apps/details?id=com.example.game"
+        )
+
+    def test_reads_only_section_matching_today_and_preserves_order(self):
+        client = MagicMock()
+        client.sections.get_sections_for_project.return_value = [
+            {"gid": "old", "name": "7.29执行"},
+            {"gid": "today", "name": "7.30执行"},
+            {"gid": "future", "name": "7.31执行"},
+        ]
+        client.tasks.get_tasks_for_section.return_value = [
+            {
+                "gid": "2",
+                "name": "聚合/动作适配com.second.game",
+                "notes": "包名：com.second.game",
+            },
+            {
+                "gid": "1",
+                "name": "聚合/动作适配com.first.game",
+                "notes": "包名：com.first.game",
+            },
+        ]
+
+        result = get_asana_tasks_for_date(
+            client,
+            "project-1",
+            today=date(2026, 7, 30),
+        )
+
+        assert result["section_name"] == "7.30执行"
+        assert result["section_gid"] == "today"
+        assert [task.package_name for task in result["tasks"]] == [
+            "com.second.game",
+            "com.first.game",
+        ]
+        client.tasks.get_tasks_for_section.assert_called_once()
+        assert client.tasks.get_tasks_for_section.call_args.args[0] == "today"
+        assert "created_at" in (
+            client.tasks.get_tasks_for_section.call_args.kwargs["opt_fields"]
+        )
+
+    def test_sorts_tasks_by_created_at_descending_like_asana_view(self):
+        client = MagicMock()
+        client.sections.get_sections_for_project.return_value = [
+            {"gid": "today", "name": "8.13执行"},
+        ]
+        client.tasks.get_tasks_for_section.return_value = [
+            {
+                "gid": "older",
+                "name": "聚合/动作适配com.older.game",
+                "notes": "包名：com.older.game",
+                "created_at": "2026-08-13T01:00:00.000Z",
+            },
+            {
+                "gid": "no-time",
+                "name": "聚合/动作适配com.legacy.game",
+                "notes": "包名：com.legacy.game",
+            },
+            {
+                "gid": "newest",
+                "name": "聚合/动作适配com.newest.game",
+                "notes": "包名：com.newest.game",
+                "created_at": "2026-08-13T03:00:00.000Z",
+            },
+            {
+                "gid": "middle",
+                "name": "聚合/动作适配com.middle.game",
+                "notes": "包名：com.middle.game",
+                "created_at": "2026-08-13T02:00:00.000Z",
+            },
+        ]
+
+        result = get_asana_tasks_for_date(
+            client, "project-1", today=date(2026, 8, 13)
+        )
+
+        assert [task.package_name for task in result["tasks"]] == [
+            "com.newest.game",
+            "com.middle.game",
+            "com.older.game",
+            "com.legacy.game",
+        ]
+
+    def test_reads_task_comments_into_workflow_status(self):
+        client = MagicMock()
+        client.sections.get_sections_for_project.return_value = [
+            {"gid": "today", "name": "8.12执行"},
+        ]
+        client.tasks.get_tasks_for_section.return_value = [
+            {
+                "gid": "task-1",
+                "name": "聚合/动作适配com.issue.game",
+                "notes": "包名：com.issue.game",
+                "completed": False,
+            }
+        ]
+        client.stories.get_stories_for_task.return_value = [
+            {
+                "text": "【APK Tool 页面预检：IAP_ONLY】\n应用内购，无广告，加黑",
+                "resource_subtype": "comment_added",
+                "created_at": "2026-08-12T01:00:00Z",
+            }
+        ]
+
+        result = get_asana_tasks_for_date(
+            client, "project-1", today=date(2026, 8, 12)
+        )
+
+        assert result["tasks"][0].workflow_status == "已加黑"
+        assert result["tasks"][0].workflow_terminal is True
+        assert result["comment_status_errors"] == []
+
+    def test_missing_today_section_does_not_create_or_read_tasks(self):
+        client = MagicMock()
+        client.sections.get_sections_for_project.return_value = [
+            {"gid": "old", "name": "7.29执行"},
+        ]
+
+        result = get_asana_tasks_for_date(
+            client,
+            "project-1",
+            today=date(2026, 7, 30),
+        )
+
+        assert result == {
+            "section_name": "7.30执行",
+            "section_gid": "",
+            "tasks": [],
+        }
+        client.tasks.get_tasks_for_section.assert_not_called()
+
+    def test_builds_expected_blacklist_comment_for_iap_only(self):
+        comment = build_precheck_asana_comment({
+            "code": "IAP_ONLY",
+            "package_name": "com.example.game",
+            "detail": "页面仅标注应用内购。",
+        })
+
+        assert "【APK Tool 页面预检：IAP_ONLY】" in comment
+        assert "应用内购，无广告，加黑" in comment
+        assert "com.example.game" in comment
+
+    def test_builds_google_no_package_comment(self):
+        comment = build_precheck_asana_comment({
+            "code": "GOOGLE_NO_PACKAGE",
+            "package_name": "com.example.removed",
+            "detail": "Google Play 提示 Item not found",
+        })
+
+        assert "【APK Tool 页面预检：GOOGLE_NO_PACKAGE】" in comment
+        assert "google无包" in comment
+        assert "com.example.removed" in comment
+
+    def test_builds_all_network_no_package_comment(self):
+        comment = build_precheck_asana_comment({
+            "code": "ALL_NETWORK_NO_PACKAGE",
+            "package_name": "com.example.missing",
+            "detail": "Google Play 无法下载，APKCombo 也无可用包。",
+        })
+
+        assert "【APK Tool 页面预检：ALL_NETWORK_NO_PACKAGE】" in comment
+        assert "全网无包，暂不适配" in comment
+        assert "com.example.missing" in comment
+
+    def test_builds_japanese_package_blacklist_comment(self):
+        comment = build_precheck_asana_comment({
+            "code": "JAPANESE_PACKAGE",
+            "package_name": "jp.co.barows.kenshowalkprotect",
+            "detail": "包名包含 jp 段且页面包含明显日文内容。",
+        })
+
+        assert "【APK Tool 页面预检：JAPANESE_PACKAGE】" in comment
+        assert "日本包体，加黑" in comment
+        assert "jp.co.barows.kenshowalkprotect" in comment
+
+    def test_has_ads_does_not_create_comment(self):
+        assert build_precheck_asana_comment({"code": "HAS_ADS"}) == ""
+
+    def test_install_failure_creates_manual_review_comment(self):
+        comment = build_precheck_asana_comment({
+            "code": "INSTALL_FAILED",
+            "package_name": "com.example.game",
+            "detail": "Google Play 要求身份验证",
+        })
+
+        assert "自动下载安装失败" in comment
+        assert "Google Play 要求身份验证" in comment
+
+    def test_app_crash_comment_uses_required_wording(self):
+        comment = build_precheck_asana_comment({
+            "code": "APP_CRASHED",
+            "package_name": "com.playcus.crosstitchcoloringart",
+            "detail": "JAVA_CRASH",
+        })
+
+        assert "包体闪退，暂不适配" in comment
+        assert "com.playcus.crosstitchcoloringart" in comment
+
+    def test_adds_comment_only_once_for_same_result(self):
+        client = MagicMock()
+        client.stories.get_stories_for_task.return_value = []
+        result = {
+            "code": "NO_ADS_OR_IAP",
+            "package_name": "com.example.game",
+        }
+
+        assert add_precheck_comment_once(client, "task-1", result) is True
+        client.stories.create_comment.assert_called_once()
+        assert "未发现广告或应用内购标识，继续下载并人工确认（不加黑）" in (
+            client.stories.create_comment.call_args.args[1]
+        )
+
+        client.stories.get_stories_for_task.return_value = [{
+            "text": "【APK Tool 页面预检：NO_ADS_OR_IAP】\n已经评论",
+        }]
+        assert add_precheck_comment_once(client, "task-1", result) is False
+        client.stories.create_comment.assert_called_once()
+
+    def test_corrects_legacy_no_ads_blacklist_comment(self):
+        client = MagicMock()
+        client.stories.get_stories_for_task.return_value = [{
+            "text": (
+                "【APK Tool 页面预检：NO_ADS_OR_IAP】\n"
+                "未标注广告或应用内购，加黑"
+            ),
+        }]
+
+        created = add_precheck_comment_once(client, "task-1", {
+            "code": "NO_ADS_OR_IAP",
+            "package_name": "com.example.game",
+        })
+
+        assert created is True
+        new_comment = client.stories.create_comment.call_args.args[1]
+        assert "继续下载并人工确认（不加黑）" in new_comment
+        assert "此前的自动预检结论已被本次结果替代" in new_comment
+
+    def test_new_decision_marks_previous_precheck_comment_as_replaced(self):
+        client = MagicMock()
+        client.stories.get_stories_for_task.return_value = [{
+            "text": "【APK Tool 页面预检：DEVICE_UNSUPPORTED】\n旧结论",
+        }]
+
+        created = add_precheck_comment_once(client, "task-1", {
+            "code": "IAP_ONLY",
+            "package_name": "com.example.game",
+        })
+
+        assert created is True
+        new_comment = client.stories.create_comment.call_args.args[1]
+        assert "应用内购，无广告，加黑" in new_comment
+        assert "此前的自动预检结论已被本次结果替代" in new_comment
+
+    def test_stories_facade_uses_asana_sdk_body_shape(self):
+        api = MagicMock()
+        facade = _StoriesFacade(api)
+
+        facade.create_comment("task-1", "测试评论")
+
+        api.create_story_for_task.assert_called_once_with(
+            {"data": {"text": "测试评论"}}, "task-1", {}
+        )
 
 
 # ═══════════════════════════════════════════════════════════════

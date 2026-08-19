@@ -27,6 +27,7 @@ from adb_pusher import (
     start_logcat_stream, stop_logcat_stream,
     run_stream, cmd_to_str, get_adb_path, extract_uid_from_dumpsys,
 )
+from web_precheck import load_today_precheck_tasks, run_web_precheck
 
 CONFIG_DEFAULT = os.path.expanduser(
     "~/Documents/test/适配动作与聚合参数获取_260518/config.json"
@@ -479,6 +480,71 @@ async def ws_endpoint(ws: WebSocket):
                     "connected": check_device(),
                     "adb_path": get_adb_path() or "未找到",
                 })
+
+            elif msg_type == "asana_today_tasks":
+                request_id = str(msg.get("request_id") or "")
+                try:
+                    result = await asyncio.to_thread(
+                        load_today_precheck_tasks,
+                        str(msg.get("project_gid") or ""),
+                        str(msg.get("asana_pat") or ""),
+                    )
+                    await ws.send_json({
+                        "type": "asana_today_tasks_result",
+                        "request_id": request_id,
+                        "ok": True,
+                        **result,
+                    })
+                except Exception as exc:
+                    await ws.send_json({
+                        "type": "asana_today_tasks_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": str(exc),
+                    })
+
+            elif msg_type == "play_precheck":
+                request_id = str(msg.get("request_id") or "")
+                loop = asyncio.get_running_loop()
+
+                def _progress(text: str):
+                    asyncio.run_coroutine_threadsafe(
+                        ws.send_json({
+                            "type": "play_precheck_progress",
+                            "request_id": request_id,
+                            "text": text,
+                        }),
+                        loop,
+                    )
+
+                try:
+                    result = await asyncio.to_thread(
+                        run_web_precheck,
+                        str(msg.get("value") or ""),
+                        auto_install=bool(msg.get("auto_install", False)),
+                        launch_check=bool(msg.get("launch_check", True)),
+                        observation_seconds=int(msg.get("observation_seconds", 20)),
+                        task_gid=str(msg.get("task_gid") or ""),
+                        asana_pat=str(msg.get("asana_pat") or ""),
+                        backend_api_url=str(msg.get("backend_api_url") or ""),
+                        backend_x_token=str(msg.get("backend_x_token") or ""),
+                        backend_token=str(msg.get("backend_token") or ""),
+                        backend_user_name=str(msg.get("backend_user_name") or "rain"),
+                        on_progress=_progress,
+                    )
+                    await ws.send_json({
+                        "type": "play_precheck_result",
+                        "request_id": request_id,
+                        "ok": True,
+                        "result": result,
+                    })
+                except Exception as exc:
+                    await ws.send_json({
+                        "type": "play_precheck_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": str(exc),
+                    })
 
             else:
                 await ws.send_json({"type": "error", "text": f"未知消息类型: {msg_type}"})

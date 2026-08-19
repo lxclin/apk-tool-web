@@ -18,7 +18,9 @@ import os
 import sys
 import json
 import time
-from dataclasses import dataclass
+import re
+import urllib.parse
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any, Optional
 
@@ -84,6 +86,149 @@ class SheetRowUpdate:
     range_name: str
     values: list[str]
     is_new: bool = False
+
+
+@dataclass(frozen=True)
+class AsanaPrecheckTask:
+    """A task from today's Asana section prepared for Play Store precheck."""
+
+    gid: str
+    name: str
+    package_name: str
+    up2_appid: str
+    gp_link: str
+    notes: str = ""
+    completed: bool = False
+    permalink_url: str = ""
+    workflow_status: str = ""
+    workflow_terminal: bool = False
+
+
+_PRECHECK_COMMENT_CODE_RE = re.compile(
+    r"【APK Tool 页面预检：([A-Z0-9_]+)】", re.I
+)
+_AUTOMATION_COMMENT_CODE_RE = re.compile(
+    r"【APK Tool 自动化适配：([A-Z0-9_]+)】", re.I
+)
+
+_PRECHECK_CODE_STATUSES = {
+    "GOOGLE_NO_PACKAGE": "google无包",
+    "ALL_NETWORK_NO_PACKAGE": "全网无包",
+    "APKCOMBO_AVAILABLE": "APKCombo有包",
+    "APKCOMBO_CHECK_FAILED": "APKCombo待确认",
+    "IAP_ONLY": "已加黑",
+    "JAPANESE_PACKAGE": "已加黑",
+    "NO_ADS_OR_IAP": "待人工检查",
+    "DEVICE_UNSUPPORTED": "设备不支持",
+    "COUNTRY_UNSUPPORTED": "地区不支持",
+    "INSTALL_FAILED": "安装失败",
+    "APP_CRASHED": "包体闪退",
+    "APP_EXITED": "启动异常",
+    "LAUNCH_FAILED": "启动失败",
+    "UNKNOWN": "待人工检查",
+}
+
+_AUTOMATION_CODE_STATUSES = {
+    "AGGREGATION_REPLAY_SUCCESS": "聚合适配成功",
+    "UNSUPPORTED_ATTRIBUTION": "归因暂不适配",
+    "AGGREGATION_TYPE_EMPTY": "参数待确认",
+    "AGGREGATION_RESULT_INCOMPLETE": "参数待确认",
+    "AF_KEY_EMPTY": "参数待确认",
+    "AD_IDS_EMPTY": "参数待确认",
+    "BACKEND_VALIDATION_FAILED": "参数待确认",
+    "BACKEND_SUBMIT_FAILED": "后台提交失败",
+    "BACKEND_SUBMIT_TIMEOUT": "后台提交失败",
+    "BACKEND_CACHE_CLEAR_TIMEOUT": "缓存清除失败",
+    "BACKEND_CACHE_CLEAR_FAILED": "缓存清除失败",
+    "BACKEND_CACHE_CLEAR_REJECTED": "缓存清除失败",
+    "PRECHECK_BLACKLIST_VALIDATION_FAILED": "加黑提交失败",
+    "PRECHECK_BLACKLIST_LOOKUP_TIMEOUT": "加黑提交失败",
+    "PRECHECK_BLACKLIST_LOOKUP_FAILED": "加黑提交失败",
+    "PRECHECK_BLACKLIST_RECORD_NOT_FOUND": "加黑提交失败",
+    "PRECHECK_BLACKLIST_SUBMIT_TIMEOUT": "加黑提交失败",
+    "PRECHECK_BLACKLIST_SUBMIT_FAILED": "加黑提交失败",
+    "PRECHECK_BLACKLIST_SUBMIT_REJECTED": "加黑提交失败",
+    "PRECHECK_BLACKLIST_CACHE_TIMEOUT": "加黑缓存刷新失败",
+    "PRECHECK_BLACKLIST_CACHE_FAILED": "加黑缓存刷新失败",
+    "PRECHECK_BLACKLIST_CACHE_REJECTED": "加黑缓存刷新失败",
+    "PRECHECK_BLACKLIST_READBACK_FAILED": "加黑回读失败",
+    "AD_REPLAY_FAILED": "回放失败",
+    "REPLAY_TIMEOUT": "回放失败",
+    "APP_CRASHED": "包体闪退",
+    "APP_EXITED_DURING_AUTOMATION": "包体闪退",
+    "APP_LAUNCH_NOT_CONFIRMED": "启动失败",
+    "AUTOMATION_FAILED": "自动化失败",
+}
+
+
+def classify_precheck_workflow_status(stories: list[dict[str, Any]]) -> tuple[str, bool]:
+    """Return the latest business status recorded in Asana comments.
+
+    All recognized decisions are terminal for automatic precheck: an operator
+    can still select and run one task manually, but repeated list refreshes and
+    batch runs must not turn a known issue back into an unprocessed task.
+    """
+    ordered = sorted(
+        enumerate(stories or []),
+        key=lambda item: (str(item[1].get("created_at") or ""), item[0]),
+    )
+    latest_status = ""
+    for _index, story in ordered:
+        subtype = str(story.get("resource_subtype") or "")
+        story_type = str(story.get("type") or "")
+        if subtype and subtype != "comment_added":
+            continue
+        if story_type and story_type not in {"comment", "system"}:
+            continue
+        text = str(story.get("text") or "").strip()
+        if not text:
+            continue
+
+        precheck_match = _PRECHECK_COMMENT_CODE_RE.search(text)
+        if precheck_match:
+            code = precheck_match.group(1).upper()
+            status = _PRECHECK_CODE_STATUSES.get(code)
+            if status:
+                latest_status = status
+                continue
+
+        automation_match = _AUTOMATION_COMMENT_CODE_RE.search(text)
+        if automation_match:
+            code = automation_match.group(1).upper()
+            status = _AUTOMATION_CODE_STATUSES.get(code)
+            if status:
+                latest_status = status
+                continue
+
+        # Manual comments used before the structured APK Tool markers existed.
+        normalized = re.sub(r"\s+", "", text)
+        if re.search(r"聚合(?:适配|测试)?(?:验证)?(?:已)?(?:成功|通过|完成)", normalized):
+            latest_status = "聚合适配成功"
+        elif ("加黑" in normalized or "黑名单" in normalized) and not re.search(
+            r"(?:不|未|无需|不能|不要|避免).{0,6}加黑", normalized
+        ):
+            latest_status = "已加黑"
+        elif "google无包" in normalized.lower() or "谷歌无包" in normalized:
+            latest_status = "google无包"
+        elif "包体闪退" in normalized or ("闪退" in normalized and "暂不适配" in normalized):
+            latest_status = "包体闪退"
+        elif "归因" in normalized and ("暂不适配" in normalized or "不适配" in normalized):
+            latest_status = "归因暂不适配"
+        elif "暂不适配" in normalized or "跳过适配" in normalized:
+            latest_status = "暂不适配"
+        elif "回放" in normalized and ("失败" in normalized or "未确认" in normalized):
+            latest_status = "回放失败"
+        elif "后台" in normalized and "提交" in normalized and "失败" in normalized:
+            latest_status = "后台提交失败"
+        elif "聚合类型" in normalized and ("为空" in normalized or "未识别" in normalized):
+            latest_status = "参数待确认"
+        elif "af_key" in text.lower() and ("为空" in normalized or "未找到" in normalized):
+            latest_status = "参数待确认"
+        elif "设备" in normalized and ("不支持" in normalized or "不兼容" in normalized):
+            latest_status = "设备不支持"
+        elif ("国家" in normalized or "地区" in normalized) and "不支持" in normalized:
+            latest_status = "地区不支持"
+    return latest_status, bool(latest_status)
 
 
 def build_task_name(package_name: str) -> str:
@@ -991,12 +1136,14 @@ class AsanaClient:
     def __init__(self, access_token: str):
         from asana import ApiClient, Configuration
         from asana.api.sections_api import SectionsApi
+        from asana.api.stories_api import StoriesApi
         from asana.api.tasks_api import TasksApi
 
         config = Configuration()
         config.access_token = access_token
         self._api_client = ApiClient(config)
         self._sections_api = SectionsApi(self._api_client)
+        self._stories_api = StoriesApi(self._api_client)
         self._tasks_api = TasksApi(self._api_client)
 
     @property
@@ -1006,6 +1153,10 @@ class AsanaClient:
     @property
     def tasks(self):
         return _TasksFacade(self._tasks_api)
+
+    @property
+    def stories(self):
+        return _StoriesFacade(self._stories_api)
 
 
 class _SectionsFacade:
@@ -1045,6 +1196,26 @@ class _TasksFacade:
         return result
 
 
+class _StoriesFacade:
+    """Adapt Asana's Stories API to the small surface used by the GUI."""
+
+    def __init__(self, api):
+        self._api = api
+
+    def get_stories_for_task(self, task_gid, opt_fields=None):
+        opts = {}
+        if opt_fields:
+            opts["opt_fields"] = (
+                ",".join(opt_fields) if isinstance(opt_fields, list) else opt_fields
+            )
+        return list(self._api.get_stories_for_task(task_gid, opts))
+
+    def create_comment(self, task_gid: str, text: str):
+        return self._api.create_story_for_task(
+            {"data": {"text": text}}, task_gid, {}
+        )
+
+
 def _build_asana_client(access_token=None):
     """构建 Asana 适配客户端。
 
@@ -1057,6 +1228,14 @@ def _build_asana_client(access_token=None):
         return AsanaClient(access_token)
     except ImportError:
         sys.exit("缺少依赖，请运行：pip install asana")
+
+
+def build_asana_client(asana_pat: str = None):
+    """Build only the Asana client for lightweight task-list operations."""
+    try:
+        return AsanaClient(asana_pat or ASANA_PAT)
+    except ImportError as exc:
+        raise RuntimeError("缺少 Asana 依赖，请安装 auto_asana/requirements.txt") from exc
 
 
 def build_sync_clients(
@@ -1081,6 +1260,204 @@ def build_sync_clients(
 
 
 # ── Asana 业务函数（接口不变，与测试一致） ──────────────────
+
+
+def parse_asana_precheck_task(task: dict[str, Any]) -> AsanaPrecheckTask:
+    """Extract package, UP2 AppId and GP link from one Asana task."""
+    notes = str(task.get("notes") or "")
+
+    def note_value(label_pattern: str) -> str:
+        match = re.search(
+            rf"(?im)^\s*(?:{label_pattern})\s*[:：]\s*(.*?)\s*$",
+            notes,
+        )
+        return match.group(1).strip() if match else ""
+
+    package_name = note_value(r"包名|package(?:[_ ]?name)?")
+    up2_appid = note_value(r"UP2\s*appid|appid")
+    gp_link = note_value(r"GP\s*链接|Google\s*Play(?:\s*链接)?|gp_link")
+
+    if gp_link:
+        markdown_match = re.search(r"\[[^\]]*\]\((https?://[^)\s]+)\)", gp_link)
+        url_match = re.search(r"https?://[^\s\])]+", gp_link)
+        if markdown_match:
+            gp_link = markdown_match.group(1)
+        elif url_match:
+            gp_link = url_match.group(0).rstrip(".,，。")
+
+    if not package_name and gp_link:
+        parsed = urllib.parse.urlparse(gp_link)
+        package_name = (urllib.parse.parse_qs(parsed.query).get("id") or [""])[0].strip()
+    if not package_name:
+        name = str(task.get("name") or "").strip()
+        package_name = re.sub(r"^聚合/动作适配", "", name).strip()
+
+    return AsanaPrecheckTask(
+        gid=str(task.get("gid") or ""),
+        name=str(task.get("name") or ""),
+        package_name=package_name,
+        up2_appid=up2_appid,
+        gp_link=gp_link,
+        notes=notes,
+        completed=bool(task.get("completed", False)),
+        permalink_url=str(task.get("permalink_url") or ""),
+    )
+
+
+def get_asana_tasks_for_date(
+    client,
+    project_gid: str,
+    today: Optional[date] = None,
+) -> dict:
+    """Read tasks only from the Asana section matching ``today``.
+
+    Tasks are sorted by ``created_at`` descending to match the Asana list view's
+    “建立日期 → 递减” setting.  Asana view sorting is client-side metadata and
+    is not reflected in the section API's response order.  Tasks without a
+    creation timestamp are placed last while preserving their API order.
+    """
+    _, section_name = generate_target_dates(today)
+    sections = client.sections.get_sections_for_project(project_gid)
+    section = next(
+        (
+            item for item in sections
+            if str(item.get("name") or "").strip() == section_name
+        ),
+        None,
+    )
+    if section is None:
+        return {
+            "section_name": section_name,
+            "section_gid": "",
+            "tasks": [],
+        }
+
+    section_gid = str(section.get("gid") or "")
+    raw_tasks = client.tasks.get_tasks_for_section(
+        section_gid,
+        opt_fields=[
+            "gid",
+            "name",
+            "notes",
+            "completed",
+            "permalink_url",
+            "created_at",
+        ],
+    )
+    indexed_tasks = list(enumerate(raw_tasks))
+    tasks_with_created_at = [
+        item for item in indexed_tasks
+        if str(item[1].get("created_at") or "").strip()
+    ]
+    tasks_without_created_at = [
+        item for item in indexed_tasks
+        if not str(item[1].get("created_at") or "").strip()
+    ]
+    tasks_with_created_at.sort(
+        key=lambda item: str(item[1].get("created_at") or ""),
+        reverse=True,
+    )
+    raw_tasks = [
+        task for _index, task in tasks_with_created_at + tasks_without_created_at
+    ]
+    tasks = []
+    comment_status_errors = []
+    for raw_task in raw_tasks:
+        task = parse_asana_precheck_task(raw_task)
+        if not task.completed and task.gid:
+            try:
+                stories = client.stories.get_stories_for_task(
+                    task.gid,
+                    opt_fields=["text", "resource_subtype", "type", "created_at"],
+                )
+                workflow_status, workflow_terminal = classify_precheck_workflow_status(
+                    list(stories or [])
+                )
+                task = replace(
+                    task,
+                    workflow_status=workflow_status,
+                    workflow_terminal=workflow_terminal,
+                )
+            except Exception as exc:
+                comment_status_errors.append(
+                    {"task_gid": task.gid, "package_name": task.package_name, "error": str(exc)}
+                )
+        tasks.append(task)
+
+    return {
+        "section_name": section_name,
+        "section_gid": section_gid,
+        "tasks": tasks,
+        "comment_status_errors": comment_status_errors,
+    }
+
+
+def build_precheck_asana_comment(result: dict) -> str:
+    """Build an Asana comment for a terminal or reviewable precheck result."""
+    code = str(result.get("code") or "UNKNOWN")
+    package_name = str(result.get("package_name") or "").strip()
+    messages = {
+        "GOOGLE_NO_PACKAGE": "google无包",
+        "ALL_NETWORK_NO_PACKAGE": "全网无包，暂不适配",
+        "APKCOMBO_AVAILABLE": "Google Play 无法下载，但 APKCombo 存在包体，等待第三方下载",
+        "APKCOMBO_CHECK_FAILED": "APKCombo 自动核验失败，需要人工确认",
+        "IAP_ONLY": "应用内购，无广告，加黑",
+        "JAPANESE_PACKAGE": "日本包体，加黑",
+        "NO_ADS_OR_IAP": "未发现广告或应用内购标识，继续下载并人工确认（不加黑）",
+        "DEVICE_UNSUPPORTED": "当前设备暂不支持此应用，跳过适配",
+        "COUNTRY_UNSUPPORTED": "当前账号所在国家或地区不支持下载此应用，跳过适配",
+        "UNKNOWN": "Google Play 页面预检暂时无法判断，需要人工确认",
+        "INSTALL_FAILED": "检测到包含广告，但 Google Play 自动下载安装失败，需要人工确认",
+        "APP_CRASHED": "包体闪退，暂不适配",
+        "APP_EXITED": "应用启动后进程退出，但没有取得明确崩溃堆栈，需要人工确认",
+        "LAUNCH_FAILED": "应用无法正常启动，需要人工确认",
+    }
+    message = messages.get(code)
+    if not message:
+        return ""
+
+    marker = f"【APK Tool 页面预检：{code}】"
+    lines = [marker, message]
+    if package_name:
+        lines.append(f"包名：{package_name}")
+    detail = str(result.get("detail") or "").strip()
+    if detail:
+        lines.append(f"识别说明：{detail}")
+    return "\n".join(lines)
+
+
+def add_precheck_comment_once(client, task_gid: str, result: dict) -> bool:
+    """Add one idempotent precheck comment; return whether it was created."""
+    comment = build_precheck_asana_comment(result)
+    if not comment:
+        return False
+    marker = comment.splitlines()[0]
+    stories = client.stories.get_stories_for_task(
+        task_gid,
+        opt_fields=["text", "resource_subtype", "type"],
+    )
+    has_previous_precheck = False
+    for story in stories:
+        text = str(story.get("text") or "")
+        if marker in text:
+            # The meaning of NO_ADS_OR_IAP changed: old comments incorrectly
+            # blacklisted these tasks.  Write one correcting comment instead
+            # of treating the legacy marker as already handled.
+            if (
+                result.get("code") == "NO_ADS_OR_IAP"
+                and "加黑" in text
+                and "不加黑" not in text
+            ):
+                has_previous_precheck = True
+                continue
+            return False
+        if "【APK Tool 页面预检：" in text:
+            has_previous_precheck = True
+    if has_previous_precheck:
+        comment += "\n更正说明：此前的自动预检结论已被本次结果替代，请以本条为准。"
+    client.stories.create_comment(task_gid, comment)
+    return True
+
 
 def find_or_create_section(client, project_gid: str, section_name: str) -> str:
     """
