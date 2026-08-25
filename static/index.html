@@ -758,6 +758,26 @@ select.form-input {
       </div>
     </div>
 
+    <div class="card" id="privateCpCandidateCard" style="display:none">
+      <div class="card-header"><div class="dot" style="background:var(--brand)"></div><h2>高概率 CP 分配</h2></div>
+      <div class="precheck-help">
+        使用下方“当前 Asana 任务”区域的后台接口凭证，读取尚未分配的待适配 CP，按照历史包名成功率预估并默认勾选推荐项。评分只用于队列排序，提交前可以手动增删；确认后才会分配给 rain。
+      </div>
+      <div class="form-inline gap-sm mt-sm">
+        <button class="btn btn-primary" id="btnCpCandidatePreview" onclick="previewCpCandidates()">读取并筛选</button>
+        <button class="btn btn-secondary" onclick="selectRecommendedCpCandidates()">恢复推荐勾选</button>
+        <button class="btn btn-secondary" onclick="clearCpCandidateSelection()">清空选择</button>
+        <button class="btn btn-success" id="btnCpCandidateAssign" onclick="assignSelectedCpCandidates()">将勾选项分配为 rain</button>
+        <span id="cpCandidateStatus" class="precheck-status">尚未读取</span>
+      </div>
+      <div class="precheck-table-wrap mt-sm">
+        <table class="precheck-table">
+          <thead><tr><th>选择</th><th>预计成功率</th><th>包名</th><th>类型</th><th>判断依据</th></tr></thead>
+          <tbody id="cpCandidateBody"><tr><td colspan="5">点击“读取并筛选”加载后台数据</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-header"><div class="dot" style="background:var(--brand)"></div><h2>当前 Asana 任务</h2></div>
       <div class="precheck-grid">
@@ -1146,7 +1166,10 @@ function connect() {
         break;
       case 'logline': cOut(m.text); break;
       case 'logcat_stopped': monitorTag.textContent='空闲'; monitorTag.className='monitor-indicator'; break;
-      case 'device_status': updateDeviceStatus(m.connected, m.adb_path); break;
+      case 'device_status':
+        updateDeviceStatus(m.connected, m.adb_path);
+        updatePrivateFeatures(m.private_features || {});
+        break;
       case 'config_data': handleConfigData(m); break;
       case 'config_saved': cOk('配置已写入'); setBtns(true); break;
       case 'extracted_fields': showFieldModal(m); break;
@@ -1154,6 +1177,7 @@ function connect() {
       case 'asana_today_tasks_result': resolvePrecheckRequest(m); break;
       case 'play_precheck_result': resolvePrecheckRequest(m); break;
       case 'daily_summary_result': resolvePrecheckRequest(m); break;
+      case 'cp_candidate_result': resolveAutomationRequest(m); break;
       case 'play_precheck_progress':
         setPrecheckStatus(m.text || '处理中...', 'busy');
         break;
@@ -1182,6 +1206,11 @@ function connect() {
 function send(data) {
   if (!ws || ws.readyState !== WebSocket.OPEN) { cErr('WebSocket 未连接'); return false; }
   ws.send(JSON.stringify(data)); return true;
+}
+
+function updatePrivateFeatures(features) {
+  const card = $('privateCpCandidateCard');
+  if (card) card.style.display = features.cp_candidate_assignment ? '' : 'none';
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1524,8 +1553,9 @@ async function loadTodayTasks() {
     const currentGids = new Set(precheckTasks.filter(task => task.gid).map(task => String(task.gid)));
     const pendingGids = loadPendingPrecheckGids(projectGid);
     precheckTasks.forEach(task => {
-      const eligible = !!task.gid && !task.completed && !task.workflow_terminal && !task.workflow_status;
-      task._incrementalNew = eligible && (!seenGids.has(String(task.gid)) || pendingGids.has(String(task.gid)));
+      const actionableRestored = task.workflow_status === 'APKCombo有包';
+      const eligible = !!task.gid && !task.completed && !task.workflow_terminal && (!task.workflow_status || actionableRestored);
+      task._incrementalNew = eligible && (actionableRestored || !seenGids.has(String(task.gid)) || pendingGids.has(String(task.gid)));
       if (!task.completed && !task.workflow_status && previousStatusByGid.has(task.gid)) {
         task._status = previousStatusByGid.get(task.gid);
       } else if (!task.completed && !task.workflow_status && task._incrementalNew) {
@@ -1555,6 +1585,9 @@ function precheckTaskStatus(result) {
   const install = result.install_result || {};
   const launch = result.launch_result || {};
   const backendBlacklist = result.backend_blacklist || null;
+  if (code === 'ALL_NETWORK_NO_PACKAGE' && backendBlacklist) {
+    return backendBlacklist.ok ? '全网无包(后台)' : '全网无包提交失败';
+  }
   if ((code === 'IAP_ONLY' || code === 'JAPANESE_PACKAGE') && backendBlacklist) {
     return backendBlacklist.ok ? '已加黑(后台)' : '加黑提交失败';
   }
@@ -1568,7 +1601,7 @@ function precheckTaskStatus(result) {
   }
   if (launch.ok === true) return '启动正常';
   if (launch.code) return '需人工确认';
-  if (install.code === 'INSTALLED') return '已下载';
+  if (install.code === 'INSTALLED' || install.code === 'APKCOMBO_INSTALLED') return '已下载';
   if (install.code === 'ALREADY_INSTALLED') return '已安装';
   if (install.code && !install.ok) return '下载失败';
   return ({
@@ -1599,7 +1632,7 @@ function formatPrecheckResult(result) {
     lines.push('', 'Asana：' + (result.asana_comment.message || '已处理'));
   }
   if (result.backend_blacklist) {
-    lines.push('', '后台加黑：', `- 状态：${result.backend_blacklist.code || ''}`, `- 结果：${result.backend_blacklist.message || ''}`);
+    lines.push('', '后台提交：', `- 状态：${result.backend_blacklist.code || ''}`, `- 结果：${result.backend_blacklist.message || ''}`);
   }
   if (result.visible_texts && result.visible_texts.length) {
     lines.push('', '页面识别文字：', ...result.visible_texts.map(item => '- ' + item));
@@ -1619,6 +1652,7 @@ async function runOneWebPrecheck(value, task, autoInstall, options) {
     backend_x_token: $('automationXToken').value.trim(),
     backend_token: $('automationFixedToken').value.trim(),
     backend_user_name: $('automationUserName').value.trim() || 'rain',
+    force_apkcombo: !!task && task.workflow_status === 'APKCombo有包',
   });
   $('precheckResult').textContent = formatPrecheckResult(response.result);
   return response.result;
@@ -1641,11 +1675,11 @@ async function startSinglePrecheck() {
     const comment = result.asana_comment || {};
     const backendBlacklist = result.backend_blacklist || null;
     if (backendBlacklist && !backendBlacklist.ok) {
-      setPrecheckStatus('预检完成，但后台加黑失败：' + (backendBlacklist.message || backendBlacklist.code || ''), 'error');
+      setPrecheckStatus('预检完成，但后台提交失败：' + (backendBlacklist.message || backendBlacklist.code || ''), 'error');
     } else if (comment.message && comment.message.startsWith('Asana 评论失败')) {
       setPrecheckStatus(comment.message, 'error');
     } else {
-      setPrecheckStatus(backendBlacklist?.ok ? '预检完成，后台加黑及缓存刷新成功' : '预检完成', 'ok');
+      setPrecheckStatus(backendBlacklist?.ok ? '预检完成，后台提交及缓存刷新成功' : '预检完成', 'ok');
     }
   } catch (error) {
     setPrecheckStatus('预检失败: ' + error.message, 'error');
@@ -1669,7 +1703,9 @@ async function startBatchPrecheck() {
   const queue = precheckTasks.map((task, index) => ({task, index})).filter(item => {
     if (item.task.completed || item.task.workflow_terminal) return false;
     if (manualOldStart) return item.index >= selectedPrecheckIndex;
-    return item.task._incrementalNew && item.task._status === '新增待预检';
+    return item.task._incrementalNew && (
+      item.task._status === '新增待预检' || item.task.workflow_status === 'APKCombo有包'
+    );
   });
   if (!queue.length) { setPrecheckStatus('本次读取没有新增待预检任务', 'error'); return; }
   let options;
@@ -1793,7 +1829,7 @@ async function startBatchPrecheck() {
 
     const finalText = precheckStopRequested
       ? `已停止，完成 ${processed}/${queue.length}`
-      : `批量预检完成，共处理 ${processed} 个任务，新增下载 ${downloadedTotal} 个${downloadsPaused ? '，后续下载已暂停' : ''}${backendBlacklistFailures ? `，${backendBlacklistFailures} 个后台加黑失败` : ''}${commentFailures ? `，${commentFailures} 条 Asana 评论失败` : ''}`;
+      : `批量预检完成，共处理 ${processed} 个任务，新增下载 ${downloadedTotal} 个${downloadsPaused ? '，后续下载已暂停' : ''}${backendBlacklistFailures ? `，${backendBlacklistFailures} 个后台提交失败` : ''}${commentFailures ? `，${commentFailures} 条 Asana 评论失败` : ''}`;
     setPrecheckStatus(finalText, precheckStopRequested ? 'busy' : ((commentFailures || backendBlacklistFailures) ? 'error' : 'ok'));
   } finally {
     precheckBatchRunning = false;
@@ -1846,7 +1882,7 @@ function automationRequest(type, payload={}) {
       if (!pending) return;
       automationRequests.delete(requestId);
       pending.reject(new Error('自动化步骤等待响应超时'));
-    }, type === 'automation_replay' ? 650000 : 150000);
+    }, (type === 'automation_replay' || type === 'cp_candidate_assign') ? 650000 : 150000);
   });
 }
 
@@ -1855,6 +1891,118 @@ function resolveAutomationRequest(message) {
   if (!pending) return;
   automationRequests.delete(message.request_id);
   pending.resolve(message);
+}
+
+let cpCandidates = [];
+
+function setCpCandidateStatus(text, state='') {
+  const el = $('cpCandidateStatus');
+  el.textContent = text;
+  el.className = 'precheck-status' + (state ? ' ' + state : '');
+}
+
+function renderCpCandidates() {
+  const body = $('cpCandidateBody');
+  if (!cpCandidates.length) {
+    body.innerHTML = '<tr><td colspan="5">没有可供选择的未分配 CP</td></tr>';
+    return;
+  }
+  body.innerHTML = cpCandidates.map((item, index) => `
+    <tr>
+      <td><input type="checkbox" data-cp-index="${index}" ${item.selected ? 'checked' : ''}></td>
+      <td>${Number(item.score || 0)}%</td>
+      <td class="mono">${esc(item.package_name || '')}</td>
+      <td>${esc(item.category || '')}</td>
+      <td>${esc(item.reason || '')}</td>
+    </tr>
+  `).join('');
+  body.querySelectorAll('input[data-cp-index]').forEach(input => {
+    input.addEventListener('change', event => {
+      cpCandidates[Number(event.target.dataset.cpIndex)].selected = event.target.checked;
+    });
+  });
+}
+
+function cpCandidateCredentials() {
+  return {
+    api_url: $('automationApiUrl').value.trim(),
+    x_token: $('automationXToken').value.trim(),
+    token: $('automationFixedToken').value.trim(),
+  };
+}
+
+async function previewCpCandidates() {
+  const button = $('btnCpCandidatePreview');
+  const credentials = cpCandidateCredentials();
+  if (!credentials.api_url || !credentials.x_token || !credentials.token) {
+    setCpCandidateStatus('请先填写本页后台接口、X-Token 和固定 token', 'error');
+    return;
+  }
+  button.disabled = true;
+  setCpCandidateStatus('正在读取后台候选数据...', 'busy');
+  try {
+    const result = await automationRequest('cp_candidate_preview', credentials);
+    if (!result.ok) throw new Error(result.error || '候选读取失败');
+    cpCandidates = (result.candidates || []).map(item => ({
+      ...item,
+      selected: Boolean(item.recommended),
+    }));
+    renderCpCandidates();
+    setCpCandidateStatus(
+      `未分配 ${result.unassigned_count || 0} 条，默认推荐 ${result.recommended_count || 0} 条`,
+      'ok'
+    );
+  } catch (error) {
+    setCpCandidateStatus('读取失败：' + error.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function selectRecommendedCpCandidates() {
+  cpCandidates.forEach(item => { item.selected = Boolean(item.recommended); });
+  renderCpCandidates();
+}
+
+function clearCpCandidateSelection() {
+  cpCandidates.forEach(item => { item.selected = false; });
+  renderCpCandidates();
+}
+
+async function assignSelectedCpCandidates() {
+  const packages = cpCandidates.filter(item => item.selected).map(item => item.package_name);
+  if (!packages.length) {
+    setCpCandidateStatus('请至少勾选一个包体', 'error');
+    return;
+  }
+  if (!window.confirm(`确定把 ${packages.length} 个包体分配给 rain 吗？`)) return;
+  const button = $('btnCpCandidateAssign');
+  button.disabled = true;
+  setCpCandidateStatus('正在分配并回读确认...', 'busy');
+  try {
+    const result = await automationRequest('cp_candidate_assign', {
+      ...cpCandidateCredentials(),
+      package_names: packages,
+    });
+    if (!result.results) throw new Error(result.error || '批量分配失败');
+    const failed = (result.results || []).filter(item => !item.ok);
+    const succeeded = new Set(
+      (result.results || []).filter(item => item.ok).map(item => item.package_name)
+    );
+    cpCandidates = cpCandidates.filter(item => !succeeded.has(item.package_name));
+    renderCpCandidates();
+    setCpCandidateStatus(
+      `分配完成：成功 ${result.success_count || 0}，失败 ${result.failure_count || 0}`,
+      failed.length ? 'error' : 'ok'
+    );
+    failed.forEach(item => appendAutomationResult(
+      `${item.package_name} 分配失败：${item.error || '未知错误'}`
+    ));
+  } catch (error) {
+    setCpCandidateStatus('分配失败：' + error.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function automationUseSelectedTask() {

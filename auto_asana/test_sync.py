@@ -102,6 +102,28 @@ class TestGenerateTargetDates:
 
 
 class TestAsanaPrecheckTasks:
+    def test_apkcombo_available_comment_is_actionable_not_terminal(self):
+        comment = (
+            "【APK Tool 页面预检：APKCOMBO_AVAILABLE】\n"
+            "Google Play 无法下载，但 APKCombo 存在包体，等待第三方下载"
+        )
+
+        assert classify_precheck_workflow_status([{"text": comment}]) == (
+            "APKCombo有包",
+            False,
+        )
+
+    def test_historical_install_failure_migrates_to_apkcombo_retry(self):
+        comment = (
+            "【APK Tool 页面预检：INSTALL_FAILED】\n"
+            "自动下载安装失败，需要人工确认"
+        )
+
+        assert classify_precheck_workflow_status([{"text": comment}]) == (
+            "APKCombo有包",
+            False,
+        )
+
     def test_latest_comment_restores_business_status(self):
         stories = [
             {

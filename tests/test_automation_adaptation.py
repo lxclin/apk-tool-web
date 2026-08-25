@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from automation_adaptation import (
     add_automation_comment_once,
@@ -24,6 +25,7 @@ from automation_adaptation import (
     submit_precheck_blacklist_via_api,
     update_asana_aggregation_notes,
     validate_backend_fields,
+    _get_with_system_ca_retry,
 )
 
 
@@ -37,6 +39,29 @@ FIELDS = {
     "af_key": "af-key",
     "SDK列表": [{"名称": "AppLovin", "key": "sdk-key"}],
 }
+
+
+def test_cache_get_retries_ssl_with_trusted_system_ca_without_disabling_verify():
+    session = MagicMock()
+    response = MagicMock()
+    session.get.side_effect = [requests.exceptions.SSLError("missing issuer"), response]
+
+    with patch(
+        "automation_adaptation._system_ca_bundle_candidates",
+        return_value=["/etc/ssl/cert.pem"],
+    ):
+        actual = _get_with_system_ca_retry(
+            session,
+            "https://a2-2.hilong.vip/a2/delete_a2_package_cache",
+            params={"package_name": "com.demo"},
+            timeout=10,
+        )
+
+    assert actual is response
+    assert session.get.call_count == 2
+    assert "verify" not in session.get.call_args_list[0].kwargs
+    assert session.get.call_args_list[1].kwargs["verify"] == "/etc/ssl/cert.pem"
+    assert session.get.call_args_list[1].kwargs["verify"] is not False
 
 
 def test_formats_fields_like_manual_copy():
@@ -353,7 +378,7 @@ def test_appsflyer_attribution_retries_when_af_key_is_empty():
         "最终判断": "MAX聚合",
         "归因平台": "AppsFlyer, AppMetrica",
         "插屏聚合id": "inter-123",
-        "af_key": "未找到",
+        "af_key": "暂未找到",
     }
     second = {**first, "af_key": "real-af-key"}
 
@@ -368,6 +393,64 @@ def test_appsflyer_attribution_retries_when_af_key_is_empty():
     assert result["ok"] is True
     assert result["attempts"] == 2
     assert result["message"] == "重启游戏后已提取 af_key"
+
+
+def test_temporary_missing_af_key_blocks_backend_submission_until_retry():
+    fields = {
+        "ok": True,
+        "最终判断": "IronSource聚合（根据 video/inter 自动推断）",
+        "_aggregation_type_inferred": True,
+        "初始Activity": "com.dootalk.vibe.MainActivity",
+        "应用类型": "ReactNative",
+        "归因平台": "AppsFlyer",
+        "af_key": "暂未找到",
+        "激励视频聚合id": "video",
+        "插屏聚合id": "inter",
+    }
+
+    assert detection_field_issue(fields) == (
+        "AF_KEY_EMPTY",
+        "af_key为空，再次确认",
+    )
+    assert "缺少 af_key（归因平台包含 AppsFlyer）" in validate_backend_fields(
+        fields, "com.dootalk.vibe"
+    )
+
+    result = detect_aggregation_with_one_retry(
+        "com.dootalk.vibe",
+        MagicMock(return_value=fields),
+        first_fields=fields,
+        restart_app=MagicMock(return_value=(True, "ok")),
+        wait_seconds=0,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "AF_KEY_EMPTY"
+    assert result["message"] == "af_key为空，再次确认"
+
+
+def test_inferred_ironsource_does_not_override_unsupported_attribution_on_retry():
+    fields = {
+        "ok": True,
+        "最终判断": "IronSource聚合（根据 video/inter 自动推断）",
+        "_aggregation_type_inferred": True,
+        "初始Activity": "com.demo.MainActivity",
+        "归因平台": "SolarEngine",
+        "激励视频聚合id": "video",
+        "插屏聚合id": "inter",
+    }
+
+    result = detect_aggregation_with_one_retry(
+        "com.demo",
+        MagicMock(return_value=fields),
+        first_fields={**fields, "归因平台": "AppsFlyer", "af_key": "暂未找到"},
+        restart_app=MagicMock(return_value=(True, "ok")),
+        wait_seconds=0,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "UNSUPPORTED_ATTRIBUTION"
+    assert result["message"] == "SolarEngine归因，暂不适配"
 
 
 def test_appsflyer_af_key_still_empty_after_retry_is_terminal():
@@ -493,6 +576,61 @@ def test_empty_verdict_with_exact_video_inter_pair_is_inferred_as_ironsource():
     assert assessment["method"] == "业务规则推断"
     assert assessment["auto_submit"] is True
     assert "AutoDetector 原始最终判断为空" in assessment["evidence"]
+
+
+def test_reconcile_stale_incomplete_result_uses_final_video_inter_fields():
+    from automation_adaptation import reconcile_detection_result
+
+    fields = {
+        "ok": True,
+        "最终判断": "",
+        "初始Activity": "com.DefaultCompany.Makeup.MainActivity",
+        "归因平台": "Adjust",
+        "激励视频聚合id": "video",
+        "插屏聚合id": "inter",
+    }
+
+    result = reconcile_detection_result(
+        {
+            "ok": False,
+            "code": "AGGREGATION_RESULT_INCOMPLETE",
+            "message": "旧的不完整结论",
+            "fields": fields,
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["code"] == "AGGREGATION_FIELDS_RECONCILED"
+    assert result["fields"]["最终判断"].startswith("IronSource聚合")
+    assert result["fields"]["_aggregation_type_inferred"] is True
+
+
+def test_reconcile_inferred_ironsource_reports_missing_af_key_not_incomplete():
+    from automation_adaptation import reconcile_detection_result
+
+    fields = {
+        "ok": True,
+        "最终判断": "",
+        "初始Activity": "com.DefaultCompany.Makeup.MainActivity",
+        "归因平台": "AppsFlyer, AppMetrica",
+        "af_key": "暂未找到",
+        "激励视频聚合id": "video",
+        "插屏聚合id": "inter",
+    }
+
+    result = reconcile_detection_result(
+        {
+            "ok": False,
+            "code": "AGGREGATION_RESULT_INCOMPLETE",
+            "message": "旧的不完整结论",
+            "fields": fields,
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "AF_KEY_EMPTY"
+    assert result["message"] == "af_key为空，再次确认"
+    assert result["fields"]["最终判断"].startswith("IronSource聚合")
 
 
 def test_explicit_max_retry_overrides_provisional_ironsource_inference():
@@ -923,10 +1061,23 @@ def test_inferred_replay_failure_clears_all_backend_fields_and_keeps_note():
     session.get.assert_called_once()
 
 
-def test_precheck_blacklist_preserves_record_submits_reason_and_clears_cache():
+@pytest.mark.parametrize(
+    ("result_code", "package_name", "reason"),
+    [
+        ("IAP_ONLY", "com.iap.game", "应用内购，无广告，加黑"),
+        (
+            "ALL_NETWORK_NO_PACKAGE",
+            "com.no.package.game",
+            "全网无包，暂不适配",
+        ),
+    ],
+)
+def test_precheck_blacklist_preserves_record_submits_reason_and_clears_cache(
+    result_code, package_name, reason
+):
     session = MagicMock()
     existing = {
-        "package_name": "com.iap.game",
+        "package_name": package_name,
         "aggr_platform": None,
         "attribution_platform": None,
         "aggr_chaping_id": None,
@@ -945,7 +1096,7 @@ def test_precheck_blacklist_preserves_record_submits_reason_and_clears_cache():
     }
     submitted = {
         **existing,
-        "block_ps": "应用内购，无广告，加黑",
+        "block_ps": reason,
         "user_name": "rain",
     }
     submit = MagicMock()
@@ -961,7 +1112,7 @@ def test_precheck_blacklist_preserves_record_submits_reason_and_clears_cache():
     session.get.return_value = cache
 
     result = submit_precheck_blacklist_via_api(
-        {"code": "IAP_ONLY", "package_name": "com.iap.game"},
+        {"code": result_code, "package_name": package_name},
         api_url="http://example.test/cp_adapt/list",
         x_token="session-token",
         token="fixed-token",
@@ -973,9 +1124,9 @@ def test_precheck_blacklist_preserves_record_submits_reason_and_clears_cache():
     assert result["code"] == "PRECHECK_BLACKLIST_SUBMITTED"
     submit_request = session.post.call_args_list[1]
     assert submit_request.args[0].endswith("/s10_package_info")
-    assert submit_request.kwargs["json"]["block_ps"] == "应用内购，无广告，加黑"
+    assert submit_request.kwargs["json"]["block_ps"] == reason
     assert submit_request.kwargs["json"]["ps"] == "旧备注"
-    assert session.get.call_args.kwargs["params"] == {"package_name": "com.iap.game"}
+    assert session.get.call_args.kwargs["params"] == {"package_name": package_name}
 
 
 def test_precheck_blacklist_rejects_non_blacklist_result():

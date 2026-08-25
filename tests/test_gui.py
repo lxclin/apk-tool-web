@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import call, patch, MagicMock
 import tkinter as tk
 import json
 import time
@@ -67,6 +67,30 @@ class TestAppInit:
             with patch.object(root, "mainloop"):
                 app = APKToolApp(root)
                 assert "APK" in root.title()
+        finally:
+            root.destroy()
+
+    def test_private_cp_candidate_button_is_hidden_by_default(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch("gui.private_feature_enabled", return_value=False), \
+                 patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                assert app._cp_candidate_btn is None
+        finally:
+            root.destroy()
+
+    def test_private_cp_candidate_button_is_available_when_enabled(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch("gui.private_feature_enabled", return_value=True), \
+                 patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                assert app._cp_candidate_btn is not None
         finally:
             root.destroy()
 
@@ -398,6 +422,47 @@ class TestGooglePlayPrecheckActions:
 
 
 class TestAutomationBatchActions:
+    def test_selected_precheck_task_is_written_to_shared_adb_config(self, tmp_path):
+        root = tk.Tk()
+        try:
+            from auto_asana.main import AsanaPrecheckTask
+            from gui import APKToolApp
+
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps({"data": [{"preserved": "value"}]}),
+                encoding="utf-8",
+            )
+            task = AsanaPrecheckTask(
+                gid="task-selected",
+                name="selected",
+                package_name="com.selected.game",
+                up2_appid="selected-appid",
+                gp_link="",
+            )
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.config_path_var.set(str(config_path))
+                with patch.object(
+                    app,
+                    "_selected_precheck_task",
+                    return_value=("item-selected", task),
+                ):
+                    app._automation_use_selected_precheck_task()
+
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            assert saved["data"][0]["packageName"] == "com.selected.game"
+            assert saved["data"][0]["appId"] == "selected-appid"
+            assert saved["data"][0]["taskUUID"] == "mediation_test_snow"
+            assert saved["data"][0]["preserved"] == "value"
+            assert app.pkg_entry.get() == "com.selected.game"
+            assert app.appid_entry.get() == "selected-appid"
+            assert app.task_uuid_var.get() == "mediation_test_snow"
+            assert "写入 config" in app._automation_status.cget("text")
+        finally:
+            root.destroy()
+
     def test_switching_task_stops_old_listener_before_uid_reset(self):
         root = tk.Tk()
         try:
@@ -773,6 +838,123 @@ class TestAutomationBatchActions:
         finally:
             root.destroy()
 
+    def test_multi_id_replay_locks_success_and_only_advances_failed_type(self):
+        root = tk.Tk()
+        try:
+            from gui import (
+                APKToolApp,
+                INTERSTITIAL,
+                MULTI_ID_REPLAY_TIMEOUT_SECONDS,
+                REWARDED,
+            )
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app._automation_fields = {
+                    "最终判断": "MAX聚合（强关系证据确认）",
+                    "归因平台": "AppsFlyer",
+                    "插屏聚合id": "inter-1, inter-2",
+                    "激励视频聚合id": "reward-1, reward-2, reward-3",
+                }
+                app._automation_prepare_replay_id_candidates()
+                replay_results = [
+                    {
+                        "ok": False,
+                        "code": "REPLAY_TIMEOUT",
+                        "interstitial": {"required": True, "displayed": False},
+                        "rewarded": {"required": True, "displayed": False},
+                    },
+                    {
+                        "ok": False,
+                        "code": "REPLAY_TIMEOUT",
+                        "interstitial": {
+                            "required": True,
+                            "displayed": True,
+                            "evidence": ["inter-2 displayed"],
+                        },
+                        "rewarded": {"required": True, "displayed": False},
+                    },
+                    {
+                        "ok": True,
+                        "code": "AGGREGATION_REPLAY_SUCCESS",
+                        "interstitial": {"required": False, "displayed": False},
+                        "rewarded": {
+                            "required": True,
+                            "displayed": True,
+                            "evidence": ["reward-3 displayed"],
+                        },
+                    },
+                ]
+
+                with patch.object(
+                    app,
+                    "_automation_replay_sync",
+                    side_effect=replay_results,
+                ) as replay, patch.object(
+                    app, "_automation_fill_asana_sync"
+                ) as fill_asana, patch.object(
+                    app,
+                    "_automation_submit_backend_sync",
+                    return_value={"ok": True, "message": "后台已生效"},
+                ) as submit:
+                    result = app._automation_replay_with_id_rotation_sync()
+
+                assert result["ok"] is True
+                assert result["interstitial"]["displayed"] is True
+                assert result["rewarded"]["displayed"] is True
+                assert app._automation_fields["插屏聚合id"] == "inter-2"
+                assert app._automation_fields["激励视频聚合id"] == "reward-3"
+                assert replay.call_args_list == [
+                    call(timeout_seconds=MULTI_ID_REPLAY_TIMEOUT_SECONDS),
+                    call(
+                        required_types={INTERSTITIAL, REWARDED},
+                        timeout_seconds=MULTI_ID_REPLAY_TIMEOUT_SECONDS,
+                    ),
+                    call(
+                        required_types={REWARDED},
+                        timeout_seconds=MULTI_ID_REPLAY_TIMEOUT_SECONDS,
+                    ),
+                ]
+                assert fill_asana.call_count == 2
+                assert submit.call_count == 2
+        finally:
+            root.destroy()
+
+    def test_single_id_replay_keeps_original_one_shot_flow(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app._automation_fields = {
+                    "最终判断": "MAX聚合",
+                    "归因平台": "Adjust",
+                    "插屏聚合id": "inter-only",
+                    "激励视频聚合id": "reward-only",
+                }
+                replay_result = {
+                    "ok": False,
+                    "code": "REPLAY_TIMEOUT",
+                    "interstitial": {"required": True, "displayed": False},
+                    "rewarded": {"required": True, "displayed": False},
+                }
+                with patch.object(
+                    app, "_automation_replay_sync", return_value=replay_result
+                ) as replay, patch.object(
+                    app, "_automation_fill_asana_sync"
+                ) as fill_asana, patch.object(
+                    app, "_automation_submit_backend_sync"
+                ) as submit:
+                    result = app._automation_replay_with_id_rotation_sync()
+
+                assert result is replay_result
+                replay.assert_called_once_with()
+                fill_asana.assert_not_called()
+                submit.assert_not_called()
+        finally:
+            root.destroy()
+
     def test_inferred_ironsource_replay_failure_clears_backend_and_updates_asana(self):
         root = tk.Tk()
         try:
@@ -1131,6 +1313,34 @@ class TestAutomationBatchActions:
         finally:
             root.destroy()
 
+    def test_apkcombo_available_result_uses_automatic_third_party_install(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            result = {
+                "code": "APKCOMBO_AVAILABLE",
+                "continue_adaptation": False,
+                "package_name": "com.example.game",
+            }
+            installed = {
+                "ok": True,
+                "code": "APKCOMBO_INSTALLED",
+                "message": "安装完成",
+            }
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                with patch(
+                    "gui.download_and_install_apkcombo", return_value=installed
+                ) as install:
+                    output = app._install_after_precheck(result)
+
+            install.assert_called_once()
+            assert output["install_result"] == installed
+            assert APKToolApp._precheck_task_status_for_result(output) == "安装完成"
+        finally:
+            root.destroy()
+
     def test_launch_crash_result_maps_to_asana_comment_and_status(self):
         from gui import APKToolApp
 
@@ -1278,6 +1488,37 @@ class TestAutomationBatchActions:
                 assert statuses == ["包体闪退", "新增待预检"]
                 assert [task.gid for _item_id, task in queue] == ["pending"]
                 assert "评论恢复 1 个状态" in app._precheck_asana_status.cget("text")
+        finally:
+            root.destroy()
+
+    def test_refresh_keeps_restored_apkcombo_result_in_batch_queue(self):
+        root = tk.Tk()
+        try:
+            from auto_asana.main import AsanaPrecheckTask
+            from gui import APKToolApp
+
+            task = AsanaPrecheckTask(
+                gid="apkcombo-task",
+                name="apkcombo",
+                package_name="com.example.restricted",
+                up2_appid="app-id",
+                gp_link=(
+                    "https://play.google.com/store/apps/details?"
+                    "id=com.example.restricted"
+                ),
+                workflow_status="APKCombo有包",
+                workflow_terminal=False,
+            )
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app._render_today_asana_tasks(
+                    {"section_name": "8.21执行", "tasks": [task]}
+                )
+                item_id = app.precheck_task_tree.get_children()[0]
+                queue, _start = app._precheck_batch_queue_from_selection()
+
+                assert app.precheck_task_tree.item(item_id, "values")[3] == "APKCombo有包"
+                assert [queued.gid for _item, queued in queue] == ["apkcombo-task"]
         finally:
             root.destroy()
 
@@ -2119,12 +2360,11 @@ class TestActionDelayTool:
         finally:
             root.destroy()
 
-    def test_cleanup_third_party_packages_confirms_and_runs_bulk_command(self):
+    def test_cleanup_third_party_packages_updates_uninstall_progress(self):
         root = tk.Tk()
         try:
             from gui import APKToolApp
 
-            expected_cmd = ["adb", "shell", "sh", "-c", "pm uninstall com.remove"]
             with patch.object(root, "mainloop"):
                 app = APKToolApp(root)
                 app.cleanup_keep_packages_var.set("com.keep")
@@ -2132,15 +2372,16 @@ class TestActionDelayTool:
                 with patch("gui.check_device", return_value=True), \
                      patch("gui.list_third_party_packages", return_value=["com.keep", "com.remove"]), \
                      patch("gui.messagebox.askyesno", return_value=True) as mock_confirm, \
-                     patch("gui.build_bulk_uninstall_cmd", return_value=expected_cmd) as mock_build, \
+                     patch("gui.uninstall_third_party_package", return_value=(True, "卸载成功")) as mock_uninstall, \
                      patch("gui.save_gui_settings"), \
-                     patch.object(app, "_run_command") as mock_run, \
                     patch("gui.threading.Thread", ImmediateThread):
                     app._on_cleanup_third_party_packages()
 
                 mock_confirm.assert_called_once()
-                mock_build.assert_called_once_with(["com.remove"])
-                mock_run.assert_called_once_with(expected_cmd, timeout=60)
+                mock_uninstall.assert_called_once_with("com.remove")
+                assert app.cleanup_progress_var.get() == 1
+                assert "卸载完成：1/1" in app.cleanup_progress_text_var.get()
+                assert "成功 1 个，失败 0 个" in app.cleanup_preview_var.get()
         finally:
             root.destroy()
 

@@ -49,6 +49,11 @@ from automation_adaptation import (
 from daily_summary import generate_daily_asana_summary
 from auto_asana.main import build_asana_client
 from web_precheck import load_today_precheck_tasks, run_web_precheck
+from cp_candidate_assignment import (
+    assign_cp_candidates,
+    load_cp_assignment_candidates,
+)
+from private_features import private_feature_enabled
 
 
 # ── ADB 路径 ─────────────────────────────────────────────────────
@@ -350,6 +355,7 @@ _logcat_proc: subprocess.Popen | None = None
 # ── HTTP 回填服务 ──────────────────────────────────────────────────
 _connected_ws: set = set()  # 所有已连接的 WebSocket 客户端
 _latest_fill_data: dict = {}  # 最近一次回填数据
+_CP_CANDIDATE_ENABLED = private_feature_enabled("cp_candidate_assignment")
 
 
 def _broadcast_fill(data: dict):
@@ -502,6 +508,9 @@ async def handle_connection(ws):
             "type": "device_status",
             "connected": _check_device(),
             "adb_path": _find_adb(),
+            "private_features": {
+                "cp_candidate_assignment": _CP_CANDIDATE_ENABLED,
+            },
         }))
         if _latest_fill_data:
             await ws.send(json.dumps({
@@ -954,6 +963,70 @@ async def handle_connection(ws):
                         "error": str(exc),
                     }, ensure_ascii=False))
 
+            elif msg_type == "cp_candidate_preview":
+                request_id = str(msg.get("request_id") or "")
+                if not _CP_CANDIDATE_ENABLED:
+                    await ws.send(json.dumps({
+                        "type": "cp_candidate_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": "当前设备未启用此功能",
+                    }, ensure_ascii=False))
+                    continue
+                try:
+                    result = await asyncio.to_thread(
+                        load_cp_assignment_candidates,
+                        api_url=str(msg.get("api_url") or ""),
+                        x_token=str(msg.get("x_token") or ""),
+                        token=str(msg.get("token") or ""),
+                    )
+                    await ws.send(json.dumps({
+                        "type": "cp_candidate_result",
+                        "request_id": request_id,
+                        "ok": True,
+                        **result,
+                    }, ensure_ascii=False))
+                except Exception as exc:
+                    await ws.send(json.dumps({
+                        "type": "cp_candidate_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": str(exc),
+                    }, ensure_ascii=False))
+
+            elif msg_type == "cp_candidate_assign":
+                request_id = str(msg.get("request_id") or "")
+                if not _CP_CANDIDATE_ENABLED:
+                    await ws.send(json.dumps({
+                        "type": "cp_candidate_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": "当前设备未启用此功能",
+                    }, ensure_ascii=False))
+                    continue
+                try:
+                    result = await asyncio.to_thread(
+                        assign_cp_candidates,
+                        list(msg.get("package_names") or []),
+                        api_url=str(msg.get("api_url") or ""),
+                        x_token=str(msg.get("x_token") or ""),
+                        token=str(msg.get("token") or ""),
+                        assignee="rain",
+                        user_name="rain",
+                    )
+                    await ws.send(json.dumps({
+                        "type": "cp_candidate_result",
+                        "request_id": request_id,
+                        **result,
+                    }, ensure_ascii=False))
+                except Exception as exc:
+                    await ws.send(json.dumps({
+                        "type": "cp_candidate_result",
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": str(exc),
+                    }, ensure_ascii=False))
+
             elif msg_type == "play_precheck":
                 request_id = str(msg.get("request_id") or "")
                 loop = asyncio.get_running_loop()
@@ -981,6 +1054,7 @@ async def handle_connection(ws):
                         backend_x_token=str(msg.get("backend_x_token") or ""),
                         backend_token=str(msg.get("backend_token") or ""),
                         backend_user_name=str(msg.get("backend_user_name") or "rain"),
+                        force_apkcombo=bool(msg.get("force_apkcombo", False)),
                         on_progress=_progress,
                     )
                     await ws.send(json.dumps({

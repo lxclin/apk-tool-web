@@ -4,6 +4,16 @@ import subprocess
 import json
 
 
+@pytest.mark.parametrize(
+    "placeholder",
+    ["未找到", "未提取到", "暂未找到", "暂未提取到", "暂未检测到"],
+)
+def test_normalize_optional_parameter_omits_detector_placeholders(placeholder):
+    from adb_pusher import normalize_optional_parameter
+
+    assert normalize_optional_parameter(placeholder) == ""
+
+
 class TestCheckDevice:
     def test_returns_true_when_device_connected(self):
         with patch("subprocess.run") as mock_run:
@@ -176,6 +186,21 @@ class TestPushApk:
         assert "拆分 APK 安装超时" in msg
         assert str(tmp_path) not in msg
 
+    def test_delayed_package_manager_confirmation_recovers_timeout(self):
+        from adb_pusher import wait_for_package_install_confirmation
+
+        with patch(
+            "adb_pusher.is_package_installed", side_effect=[False, True]
+        ), patch("adb_pusher.time.sleep") as mock_sleep:
+            installed = wait_for_package_install_confirmation(
+                "com.example.delayed",
+                timeout_seconds=5,
+                poll_interval_seconds=0,
+            )
+
+        assert installed is True
+        mock_sleep.assert_called_once_with(0)
+
 
 class TestApkDownloadUrl:
     def test_builds_apkcombo_search_url_from_google_play_url(self):
@@ -252,6 +277,114 @@ class TestGooglePlayPrecheck:
 
         assert result["code"] == "APKCOMBO_AVAILABLE"
         assert result["available"] is True
+        assert result["artifact_url"] == "https://apkcombo.com/r2?u=file"
+
+    def test_apkcombo_extracts_current_signed_download_link(self):
+        from adb_pusher import inspect_apkcombo_package
+
+        signed_link = (
+            "https://apkcombo.com/d?u=signed-value&amp;fp=abc&amp;"
+            "package_name=com.example.game"
+        )
+        with patch(
+            "adb_pusher._apkcombo_fetch_text",
+            side_effect=[
+                (
+                    '<a href="/game/com.example.game/download/xapk">Download XAPK</a>',
+                    "https://apkcombo.com/game/com.example.game/",
+                ),
+                (
+                    f'<a class="variant" href="{signed_link}">Download</a>',
+                    "https://apkcombo.com/game/com.example.game/download/xapk",
+                ),
+            ],
+        ):
+            result = inspect_apkcombo_package(
+                "com.example.game", attempts=1, retry_interval_seconds=0
+            )
+
+        assert result["code"] == "APKCOMBO_AVAILABLE"
+        assert result["artifact_url"].startswith("https://apkcombo.com/d?u=")
+        assert "&amp;" not in result["artifact_url"]
+
+    def test_apkcombo_auto_install_verifies_target_package(self):
+        from adb_pusher import download_and_install_apkcombo
+
+        inspected = {
+            "available": True,
+            "code": "APKCOMBO_AVAILABLE",
+            "artifact_url": "https://apkcombo.com/d?u=signed",
+            "download_url": "https://apkcombo.com/game/com.example.game/download/xapk",
+        }
+        with patch("adb_pusher.is_package_installed", side_effect=[False, True]), \
+             patch("adb_pusher.inspect_apkcombo_package", return_value=inspected), \
+             patch("adb_pusher.download_and_install", return_value=(True, "安装成功")) as install:
+            result = download_and_install_apkcombo("com.example.game")
+
+        assert result["ok"] is True
+        assert result["code"] == "APKCOMBO_INSTALLED"
+        install.assert_called_once_with(
+            inspected["artifact_url"],
+            on_progress=install.call_args.kwargs["on_progress"],
+            referer=inspected["download_url"],
+        )
+
+    def test_apkcombo_auto_install_falls_back_to_browser_on_403(self):
+        from adb_pusher import download_and_install_apkcombo
+
+        inspected = {
+            "available": True,
+            "code": "APKCOMBO_AVAILABLE",
+            "artifact_url": "https://apkcombo.com/d?u=signed",
+            "download_url": "https://apkcombo.com/game/com.example.game/download/xapk",
+        }
+        with patch("adb_pusher.is_package_installed", side_effect=[False, True]), \
+             patch("adb_pusher.inspect_apkcombo_package", return_value=inspected), \
+             patch(
+                 "adb_pusher.download_and_install",
+                 return_value=(False, "下载失败（网络错误）: HTTP Error 403: Forbidden"),
+             ), \
+             patch(
+                 "adb_pusher._download_apkcombo_via_browser",
+                 return_value=(True, "Chrome 下载并安装完成"),
+             ) as browser_download:
+            result = download_and_install_apkcombo("com.example.game")
+
+        assert result["ok"] is True
+        assert result["code"] == "APKCOMBO_INSTALLED"
+        browser_download.assert_called_once_with(
+            inspected["artifact_url"],
+            "com.example.game",
+            on_progress=None,
+        )
+
+    def test_apkcombo_install_timeout_is_reconciled_with_package_manager(self):
+        from adb_pusher import download_and_install_apkcombo
+
+        inspected = {
+            "available": True,
+            "code": "APKCOMBO_AVAILABLE",
+            "artifact_url": "https://apkcombo.com/d?u=signed",
+            "download_url": "https://apkcombo.com/game/com.example.game/download/xapk",
+        }
+        progress = []
+        with patch(
+            "adb_pusher.is_package_installed", side_effect=[False, True]
+        ), patch(
+            "adb_pusher.inspect_apkcombo_package", return_value=inspected
+        ), patch(
+            "adb_pusher.download_and_install",
+            return_value=(False, "拆分 APK 安装超时：共 3 个 APK"),
+        ):
+            result = download_and_install_apkcombo(
+                "com.example.game",
+                on_progress=progress.append,
+            )
+
+        assert result["ok"] is True
+        assert result["code"] == "APKCOMBO_INSTALLED"
+        assert "手机已确认安装完成" in result["message"]
+        assert any("最终安装状态" in message for message in progress)
 
     def test_apkcombo_dynamic_download_not_found_is_unavailable(self):
         from adb_pusher import inspect_apkcombo_package
@@ -433,15 +566,39 @@ class TestGooglePlayPrecheck:
         assert result["device_supported"] is False
         assert result["continue_adaptation"] is False
 
-    def test_no_monetization_has_priority_over_country_unavailable(self):
+    def test_country_unavailable_without_monetization_stops_download(self):
         from adb_pusher import classify_google_play_page_texts
 
         result = classify_google_play_page_texts([
             "This item isn't available in your country",
         ])
 
-        assert result["code"] == "NO_ADS_OR_IAP"
+        assert result["code"] == "COUNTRY_UNSUPPORTED"
         assert result["country_supported"] is False
+        assert result["continue_adaptation"] is False
+
+    def test_iap_only_has_priority_over_country_unavailable(self):
+        from adb_pusher import classify_google_play_page_texts
+
+        result = classify_google_play_page_texts([
+            "In-app purchases",
+            "This item isn't available in your country",
+        ])
+
+        assert result["code"] == "IAP_ONLY"
+        assert result["country_supported"] is False
+        assert result["continue_adaptation"] is False
+
+    def test_device_unavailable_without_monetization_stops_download(self):
+        from adb_pusher import classify_google_play_page_texts
+
+        result = classify_google_play_page_texts([
+            "Your device isn't compatible with this version.",
+        ])
+
+        assert result["code"] == "DEVICE_UNSUPPORTED"
+        assert result["device_supported"] is False
+        assert result["continue_adaptation"] is False
 
     def test_country_unavailable_is_recognized(self):
         from adb_pusher import classify_google_play_page_texts
@@ -557,6 +714,30 @@ class TestGooglePlayPrecheck:
         assert result["ok"] is True
         assert result["code"] == "INSTALLED"
         mock_tap.assert_called_once_with(install_node)
+
+    def test_auto_install_stops_on_country_restriction_without_ads_label(self):
+        from adb_pusher import install_google_play_app
+
+        country_node = {
+            "text": "This item isn't available in your country.",
+            "content_desc": "",
+            "enabled": True,
+            "bounds": "[20,300][900,420]",
+        }
+        with patch(
+            "adb_pusher.is_package_installed", return_value=False
+        ), patch(
+            "adb_pusher.collect_device_ui_nodes", return_value=[country_node]
+        ), patch("adb_pusher._tap_ui_node") as mock_tap:
+            result = install_google_play_app(
+                "com.gpshopper.moneygram",
+                timeout_seconds=1,
+                poll_interval_seconds=0,
+            )
+
+        assert result["ok"] is False
+        assert result["code"] == "COUNTRY_UNSUPPORTED"
+        mock_tap.assert_not_called()
 
     def test_auto_install_stops_when_google_requests_verification(self):
         from adb_pusher import install_google_play_app
@@ -863,6 +1044,30 @@ class TestAdbCommandBuilders:
             ["com.keep", "com.remove", "com.other"],
             ["com.keep", "com.other"],
         ) == ["com.remove"]
+
+    def test_uninstall_third_party_package_reports_success(self):
+        from adb_pusher import uninstall_third_party_package
+
+        result = MagicMock(returncode=0, stdout="Success\n", stderr="")
+        with patch("adb_pusher._run_adb", return_value=result) as mock_run:
+            ok, message = uninstall_third_party_package("com.example.app")
+
+        assert ok is True
+        assert message == "卸载成功"
+        mock_run.assert_called_once_with(
+            ["shell", "pm", "uninstall", "com.example.app"],
+            timeout=30,
+        )
+
+    def test_uninstall_third_party_package_rejects_invalid_name(self):
+        from adb_pusher import uninstall_third_party_package
+
+        with patch("adb_pusher._run_adb") as mock_run:
+            ok, message = uninstall_third_party_package("bad package")
+
+        assert ok is False
+        assert message == "无效的应用包名"
+        mock_run.assert_not_called()
 
     def test_build_bulk_uninstall_cmd_filters_invalid_package_names(self):
         from adb_pusher import build_bulk_uninstall_cmd

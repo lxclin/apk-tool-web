@@ -5,7 +5,9 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from adb_pusher import (
+    download_and_install_apkcombo,
     install_google_play_app,
+    resolve_google_play_package,
     run_app_launch_precheck,
     run_google_play_precheck,
 )
@@ -79,6 +81,7 @@ def run_web_precheck(
     backend_x_token: str = "",
     backend_token: str = "",
     backend_user_name: str = "rain",
+    force_apkcombo: bool = False,
     on_progress: ProgressCallback = None,
 ) -> dict:
     """Run one complete Web precheck and optionally add its Asana comment."""
@@ -87,13 +90,29 @@ def run_web_precheck(
         raise ValueError("请输入 Google Play 链接或包名")
     observation_seconds = max(5, min(120, int(observation_seconds)))
 
-    if on_progress:
-        on_progress("正在打开并识别 Google Play 页面...")
-    result = run_google_play_precheck(value, verify_apkcombo=True)
-
-    if result.get("code") in {"IAP_ONLY", "JAPANESE_PACKAGE"}:
+    if force_apkcombo:
+        package_name = resolve_google_play_package(value)
+        result = {
+            "code": "APKCOMBO_AVAILABLE",
+            "title": "APKCombo 有包，重新尝试自动下载",
+            "detail": "历史安装失败任务已转入 APKCombo 新下载链路重试。",
+            "continue_adaptation": False,
+            "package_name": package_name,
+            "source": "历史预检状态迁移",
+            "evidence": ["此前安装失败，按新规则使用 APKCombo 重试"],
+        }
+    else:
         if on_progress:
-            on_progress("检测到加黑结论，正在提交后台并刷新缓存...")
+            on_progress("正在打开并识别 Google Play 页面...")
+        result = run_google_play_precheck(value, verify_apkcombo=True)
+
+    if result.get("code") in {
+        "IAP_ONLY",
+        "JAPANESE_PACKAGE",
+        "ALL_NETWORK_NO_PACKAGE",
+    }:
+        if on_progress:
+            on_progress("检测到终止预检结论，正在提交后台并刷新缓存...")
         backend_blacklist = submit_precheck_blacklist_via_api(
             result,
             api_url=backend_api_url,
@@ -105,14 +124,24 @@ def run_web_precheck(
 
     if auto_install and (
         result.get("continue_adaptation") is True
-        or result.get("code") in {"HAS_ADS", "NO_ADS_OR_IAP"}
+        or result.get("code") in {
+            "HAS_ADS",
+            "NO_ADS_OR_IAP",
+            "APKCOMBO_AVAILABLE",
+        }
     ):
         if on_progress:
             on_progress("页面结果需继续人工确认，准备自动下载安装...")
-        install_result = install_google_play_app(
-            result.get("package_name", ""),
-            on_progress=on_progress,
-        )
+        if result.get("code") == "APKCOMBO_AVAILABLE":
+            install_result = download_and_install_apkcombo(
+                result.get("package_name", ""),
+                on_progress=on_progress,
+            )
+        else:
+            install_result = install_google_play_app(
+                result.get("package_name", ""),
+                on_progress=on_progress,
+            )
         result = {**result, "install_result": install_result}
         if launch_check and install_result.get("ok"):
             if on_progress:

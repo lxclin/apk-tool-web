@@ -121,7 +121,9 @@ _PRECHECK_CODE_STATUSES = {
     "NO_ADS_OR_IAP": "待人工检查",
     "DEVICE_UNSUPPORTED": "设备不支持",
     "COUNTRY_UNSUPPORTED": "地区不支持",
-    "INSTALL_FAILED": "安装失败",
+    # Historical automatic install failures should be retried through the new
+    # APKCombo browser-download path instead of becoming permanent terminal rows.
+    "INSTALL_FAILED": "APKCombo有包",
     "APP_CRASHED": "包体闪退",
     "APP_EXITED": "启动异常",
     "LAUNCH_FAILED": "启动失败",
@@ -228,7 +230,11 @@ def classify_precheck_workflow_status(stories: list[dict[str, Any]]) -> tuple[st
             latest_status = "设备不支持"
         elif ("国家" in normalized or "地区" in normalized) and "不支持" in normalized:
             latest_status = "地区不支持"
-    return latest_status, bool(latest_status)
+    # APKCombo availability used to be a terminal manual-handoff result.  It
+    # is now an actionable intermediate state because the tool can download
+    # and install that package automatically.
+    terminal = bool(latest_status) and latest_status != "APKCombo有包"
+    return latest_status, terminal
 
 
 def build_task_name(package_name: str) -> str:

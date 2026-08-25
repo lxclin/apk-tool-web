@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import shutil
 import shlex
 import subprocess
@@ -9,6 +10,7 @@ import urllib.parse
 import urllib.error
 import json
 import copy
+import html
 import tempfile
 import time
 import xml.etree.ElementTree as ET
@@ -37,6 +39,8 @@ FIRST_ACTION_MIN_DELAY_MS = 15000
 DEFAULT_FOLLOWING_ACTION_MIN_DELAY_MS = 5000
 APK_INSTALL_TIMEOUT_SECONDS = 90
 SPLIT_APK_INSTALL_TIMEOUT_SECONDS_PER_APK = 30
+INSTALL_RESULT_RECHECK_SECONDS = 30
+INSTALL_RESULT_RECHECK_INTERVAL_SECONDS = 2
 LOGCAT_READ_TIMEOUT_SECONDS = 15
 LOGCAT_READ_ATTEMPTS = 2
 LOGCAT_READ_MAX_LINES = 20000
@@ -107,6 +111,9 @@ MISSING_PARAMETER_VALUES = frozenset(
     {
         "未找到",
         "未提取到",
+        "暂未找到",
+        "暂未提取到",
+        "暂未检测到",
         "未知",
         "无",
         "-",
@@ -298,6 +305,40 @@ def _apkcombo_final_url_matches_package(final_url: str, package_name: str) -> bo
     )
 
 
+def _apkcombo_artifact_urls(
+    html_text: str,
+    page_url: str,
+    package_name: str,
+) -> list[str]:
+    """Extract APKCombo's short-lived signed artifact links from a page."""
+    candidates = []
+    for anchor in re.findall(r"<a\b[^>]*>", str(html_text or ""), re.I):
+        href_match = re.search(r'href=["\']([^"\']+)["\']', anchor, re.I)
+        if not href_match:
+            continue
+        href = html.unescape(href_match.group(1)).strip()
+        parsed_href = urllib.parse.urlparse(href)
+        if not (
+            parsed_href.path.casefold() in {"/d", "/r2"}
+            and "u=" in parsed_href.query.casefold()
+        ):
+            continue
+        artifact_url = urllib.parse.urljoin(page_url, href)
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlparse(artifact_url).query,
+            keep_blank_values=True,
+        )
+        linked_packages = query.get("package_name") or query.get("package") or []
+        if linked_packages and all(
+            str(value).casefold() != package_name.casefold()
+            for value in linked_packages
+        ):
+            continue
+        if artifact_url not in candidates:
+            candidates.append(artifact_url)
+    return candidates
+
+
 def inspect_apkcombo_package(
     package_name: str,
     *,
@@ -388,10 +429,14 @@ def inspect_apkcombo_package(
                     continue
                 return not_found_result
 
-            # Current APKCombo pages expose a signed /r2 link for real files.
-            if re.search(r'class=["\'][^"\']*\bvariant\b', download_html, re.I) or re.search(
-                r'href=["\']/r2\?u=', download_html,
-                re.I,
+            # Current APKCombo pages expose short-lived signed /d or /r2 links.
+            artifact_urls = _apkcombo_artifact_urls(
+                download_html,
+                final_download_url,
+                package_name,
+            )
+            if artifact_urls or re.search(
+                r'class=["\'][^"\']*\bvariant\b', download_html, re.I
             ):
                 return {
                     "code": "APKCOMBO_AVAILABLE",
@@ -401,6 +446,8 @@ def inspect_apkcombo_package(
                     "search_url": search_url,
                     "detail_url": detail_url,
                     "download_url": final_download_url,
+                    "artifact_url": artifact_urls[0] if artifact_urls else "",
+                    "artifact_urls": artifact_urls,
                 }
 
             # Some old app pages load the real download result through a POST.
@@ -451,9 +498,13 @@ def inspect_apkcombo_package(
                             time.sleep(retry_interval_seconds)
                         continue
                     return not_found_result
-                if re.search(r'class=["\'][^"\']*\bvariant\b', dynamic_html, re.I) or re.search(
-                    r'href=["\']/r2\?u=', dynamic_html,
-                    re.I,
+                artifact_urls = _apkcombo_artifact_urls(
+                    dynamic_html,
+                    dynamic_url,
+                    package_name,
+                )
+                if artifact_urls or re.search(
+                    r'class=["\'][^"\']*\bvariant\b', dynamic_html, re.I
                 ):
                     return {
                         "code": "APKCOMBO_AVAILABLE",
@@ -463,6 +514,8 @@ def inspect_apkcombo_package(
                         "search_url": search_url,
                         "detail_url": detail_url,
                         "download_url": final_download_url,
+                        "artifact_url": artifact_urls[0] if artifact_urls else "",
+                        "artifact_urls": artifact_urls,
                     }
 
             last_error = "APKCombo 页面已打开，但未取得明确的下载结果"
@@ -621,7 +674,8 @@ def classify_google_play_page_texts(
         )
         continue_adaptation = False
     # Monetization is the primary business decision for a real Play page.
-    # Compatibility matters only for apps that actually contain ads.
+    # When ads are visible, preserve both the monetization and restriction in
+    # the result. IAP-only remains a blacklist result even on a restricted page.
     elif has_ads:
         if country_unsupported:
             code = "COUNTRY_UNSUPPORTED"
@@ -642,6 +696,21 @@ def classify_google_play_page_texts(
         code = "IAP_ONLY"
         title = "仅检测到应用内购"
         detail = "页面标注应用内购，但未标注包含广告；按当前规则应加黑并跳过。"
+        continue_adaptation = False
+    # A restriction page often omits the normal monetization labels entirely.
+    # Once the restriction copy itself is visible, treating the page as
+    # NO_ADS_OR_IAP would incorrectly start an installation that cannot run.
+    # Keep IAP_ONLY above these branches so the business rule "IAP only wins"
+    # remains unchanged.
+    elif country_unsupported:
+        code = "COUNTRY_UNSUPPORTED"
+        title = "所在国家或地区不支持"
+        detail = "当前账号所在国家或地区无法下载此应用。"
+        continue_adaptation = False
+    elif device_unsupported:
+        code = "DEVICE_UNSUPPORTED"
+        title = "当前设备不支持"
+        detail = "当前设备与此应用不兼容，无法下载此应用。"
         continue_adaptation = False
     elif page_ready:
         code = "NO_ADS_OR_IAP"
@@ -781,6 +850,37 @@ def is_package_installed(package_name: str) -> bool:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
     return result.returncode == 0 and "package:" in (result.stdout or "")
+
+
+def wait_for_package_install_confirmation(
+    package_name: str,
+    *,
+    timeout_seconds: float = INSTALL_RESULT_RECHECK_SECONDS,
+    poll_interval_seconds: float = INSTALL_RESULT_RECHECK_INTERVAL_SECONDS,
+    on_progress=None,
+) -> bool:
+    """Reconcile an ambiguous adb result with Android PackageManager.
+
+    ``adb install`` and ``install-multiple`` can time out on the host after
+    Android has already committed the PackageInstaller session. Split APKs and
+    asset packs are especially prone to finishing a few seconds after adb
+    exits, so PackageManager must be the final source of truth.
+    """
+    package_name = resolve_google_play_package(package_name)
+    if not package_name:
+        return False
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    if on_progress:
+        on_progress("安装命令返回异常，正在等待手机确认最终安装状态...")
+    while True:
+        if is_package_installed(package_name):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        interval = max(0.0, float(poll_interval_seconds))
+        time.sleep(min(interval, remaining) if interval else 0)
 
 
 def _node_label(node: dict) -> str:
@@ -1907,6 +2007,37 @@ def packages_to_uninstall(
     return sorted(pkg for pkg in set(installed_packages) if pkg not in keep)
 
 
+def uninstall_third_party_package(package_name: str) -> tuple[bool, str]:
+    """卸载单个第三方包，返回可用于逐包进度展示的结果。"""
+    package_name = package_name.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.]*", package_name):
+        return False, "无效的应用包名"
+
+    try:
+        result = _run_adb(
+            ["shell", "pm", "uninstall", package_name],
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "卸载超时"
+    except (FileNotFoundError, OSError) as exc:
+        return False, f"执行失败: {exc}"
+
+    output = "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part.strip()
+    )
+    if result.returncode == 0 and any(
+        line.strip() == "Success" for line in output.splitlines()
+    ):
+        return True, "卸载成功"
+
+    detail = next(
+        (line.strip() for line in reversed(output.splitlines()) if line.strip()),
+        f"卸载失败 (exit={result.returncode})",
+    )
+    return False, detail
+
+
 def push_apk(apk_path: str) -> tuple[bool, str]:
     """安装 APK。支持单文件、目录（多 APK）、.xapk 文件"""
     try:
@@ -2066,7 +2197,12 @@ def _install_xapk(xapk_path: str) -> tuple[bool, str]:
         return False, f"xapk 处理失败: {e}"
 
 
-def download_and_install(url: str, on_progress=None) -> tuple[bool, str]:
+def download_and_install(
+    url: str,
+    on_progress=None,
+    *,
+    referer: str = "",
+) -> tuple[bool, str]:
     """从 URL 下载 APK/XAPK 并安装到手机。
 
     on_progress(percent, status_text) — 可选进度回调
@@ -2085,11 +2221,14 @@ def download_and_install(url: str, on_progress=None) -> tuple[bool, str]:
         if on_progress:
             on_progress(0, f"正在下载: {filename}")
 
-        req = urllib.request.Request(url, headers={
+        headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
                           "Chrome/120.0.0.0 Safari/537.36"
-        })
+        }
+        if referer:
+            headers["Referer"] = referer
+        req = urllib.request.Request(url, headers=headers)
 
         with urllib.request.urlopen(req, timeout=300) as resp:
             total = resp.headers.get("Content-Length")
@@ -2097,6 +2236,15 @@ def download_and_install(url: str, on_progress=None) -> tuple[bool, str]:
             downloaded = 0
 
             with open(tmp_path, "wb") as f:
+                first_chunk = resp.read(8192)
+                if not first_chunk.startswith(b"PK"):
+                    content_type = str(resp.headers.get("Content-Type") or "")
+                    return False, (
+                        "下载内容不是有效的 APK/XAPK"
+                        + (f"（Content-Type: {content_type}）" if content_type else "")
+                    )
+                f.write(first_chunk)
+                downloaded += len(first_chunk)
                 while True:
                     chunk = resp.read(8192)
                     if not chunk:
@@ -2125,6 +2273,205 @@ def download_and_install(url: str, on_progress=None) -> tuple[bool, str]:
                 os.remove(tmp_path)
         except OSError:
             pass
+
+
+def _download_apkcombo_via_browser(
+    artifact_url: str,
+    package_name: str,
+    on_progress=None,
+    *,
+    timeout_seconds: int = 600,
+    downloads_dir: str = "",
+) -> tuple[bool, str]:
+    """Use the signed-in desktop browser when a download host blocks scripts."""
+    downloads_dir = downloads_dir or os.path.expanduser("~/Downloads")
+    if not os.path.isdir(downloads_dir):
+        return False, f"浏览器下载目录不存在: {downloads_dir}"
+
+    def _snapshot() -> dict[str, tuple[int, int]]:
+        snapshot = {}
+        try:
+            names = os.listdir(downloads_dir)
+        except OSError:
+            return snapshot
+        for name in names:
+            path = os.path.join(downloads_dir, name)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            snapshot[path] = (stat.st_mtime_ns, stat.st_size)
+        return snapshot
+
+    before = _snapshot()
+    started_at = time.monotonic()
+    if on_progress:
+        on_progress("APKCombo 下载被第三方风控拦截，正在改用 Chrome 下载...")
+    try:
+        if sys.platform == "darwin" and os.path.isdir(
+            "/Applications/Google Chrome.app"
+        ):
+            subprocess.Popen(
+                ["open", "-a", "Google Chrome", artifact_url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            import webbrowser
+
+            if not webbrowser.open(artifact_url):
+                return False, "无法打开浏览器下载地址"
+    except (OSError, ValueError) as exc:
+        return False, f"无法启动浏览器下载: {exc}"
+
+    last_progress_at = 0
+    while time.monotonic() - started_at < max(30, timeout_seconds):
+        current = _snapshot()
+        partial_download = False
+        candidates = []
+        for path, state in current.items():
+            previous = before.get(path)
+            changed = previous is None or state != previous
+            if not changed:
+                continue
+            lowered = path.casefold()
+            if lowered.endswith((".crdownload", ".part", ".download")):
+                partial_download = True
+                continue
+            if lowered.endswith((".apk", ".xapk")):
+                candidates.append((state[0], path))
+
+        if candidates:
+            _mtime, downloaded_path = max(candidates)
+            try:
+                with open(downloaded_path, "rb") as downloaded_file:
+                    if downloaded_file.read(2) != b"PK":
+                        return False, "浏览器下载完成，但文件不是有效的 APK/XAPK"
+            except OSError as exc:
+                return False, f"无法读取浏览器下载文件: {exc}"
+
+            temp_dir = tempfile.mkdtemp(prefix="apkcombo_browser_")
+            temp_path = os.path.join(temp_dir, os.path.basename(downloaded_path))
+            try:
+                shutil.move(downloaded_path, temp_path)
+                if on_progress:
+                    on_progress("浏览器下载完成，正在通过 ADB 安装...")
+                ok, message = push_apk(temp_path)
+                if not ok:
+                    return False, message
+                if not is_package_installed(package_name):
+                    return False, "浏览器包体已安装，但未检测到目标包名"
+                return True, "Chrome 下载并安装完成"
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        elapsed = int(time.monotonic() - started_at)
+        if on_progress and elapsed - last_progress_at >= 5:
+            state_text = "浏览器正在下载" if partial_download else "等待浏览器开始下载"
+            on_progress(f"{state_text}（已等待 {elapsed} 秒）")
+            last_progress_at = elapsed
+        time.sleep(1)
+
+    return False, (
+        "浏览器下载等待超时；请检查 Chrome 是否出现 Cloudflare 验证、"
+        "下载确认窗口，或是否启用了“下载前询问保存位置”"
+    )
+
+
+def download_and_install_apkcombo(
+    package_name: str,
+    on_progress=None,
+) -> dict:
+    """Resolve, immediately download and install an exact APKCombo package."""
+    package_name = resolve_google_play_package(package_name)
+    if not package_name:
+        return {
+            "ok": False,
+            "code": "APKCOMBO_INSTALL_FAILED",
+            "message": "无效包名，无法从 APKCombo 自动安装",
+        }
+    if is_package_installed(package_name):
+        return {
+            "ok": True,
+            "code": "ALREADY_INSTALLED",
+            "message": "目标包已安装",
+        }
+
+    if on_progress:
+        on_progress("正在解析 APKCombo 真实下载地址...")
+    inspected = inspect_apkcombo_package(package_name)
+    if inspected.get("available") is not True:
+        return {
+            "ok": False,
+            "code": inspected.get("code", "APKCOMBO_CHECK_FAILED"),
+            "message": inspected.get("message", "APKCombo 没有可用下载包"),
+            "apkcombo_result": inspected,
+        }
+    artifact_url = str(inspected.get("artifact_url") or "").strip()
+    if not artifact_url:
+        return {
+            "ok": False,
+            "code": "APKCOMBO_LINK_UNRESOLVED",
+            "message": "APKCombo 有包，但未解析到真实文件链接，请使用原人工下载按钮",
+            "apkcombo_result": inspected,
+        }
+
+    def _download_progress(percent: int, message: str):
+        if on_progress:
+            on_progress(f"APKCombo {message}")
+
+    ok, message = download_and_install(
+        artifact_url,
+        on_progress=_download_progress,
+        referer=str(inspected.get("download_url") or ""),
+    )
+    package_confirmed = False
+    if not ok and (
+        "403" in message
+        or "forbidden" in message.casefold()
+        or "不是有效的 APK/XAPK" in message
+    ):
+        ok, message = _download_apkcombo_via_browser(
+            artifact_url,
+            package_name,
+            on_progress=on_progress,
+        )
+    install_may_have_been_committed = any(
+        marker in str(message or "")
+        for marker in ("安装失败", "安装超时", "xapk 处理失败")
+    )
+    if not ok and install_may_have_been_committed:
+        if wait_for_package_install_confirmation(
+            package_name,
+            on_progress=on_progress,
+        ):
+            ok = True
+            package_confirmed = True
+            message = "ADB 安装结果异常，但手机已确认安装完成"
+    if not ok:
+        return {
+            "ok": False,
+            "code": "APKCOMBO_INSTALL_FAILED",
+            "message": message,
+            "apkcombo_result": inspected,
+        }
+    if not package_confirmed and not is_package_installed(package_name):
+        return {
+            "ok": False,
+            "code": "APKCOMBO_PACKAGE_MISMATCH",
+            "message": "安装命令已结束，但手机中未检测到目标包名；已停止后续自动化",
+            "apkcombo_result": inspected,
+        }
+    return {
+        "ok": True,
+        "code": "APKCOMBO_INSTALLED",
+        "message": (
+            "APKCombo 包体下载并安装完成"
+            if "手机已确认" not in message
+            else message
+        ),
+        "apkcombo_result": inspected,
+    }
 
 
 def push_config(local_path: str) -> tuple[bool, str]:

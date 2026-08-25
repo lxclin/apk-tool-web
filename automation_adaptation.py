@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import subprocess
 import time
 import urllib.parse
@@ -41,7 +42,47 @@ BACKEND_READBACK_DELAY_SECONDS = 1.0
 PRECHECK_BLACKLIST_REASONS = {
     "IAP_ONLY": "应用内购，无广告，加黑",
     "JAPANESE_PACKAGE": "日本包体，加黑",
+    "ALL_NETWORK_NO_PACKAGE": "全网无包，暂不适配",
 }
+
+
+def _system_ca_bundle_candidates() -> list[str]:
+    """Return existing OS/Python CA bundles suitable for a safe TLS retry."""
+    candidates = [
+        "/etc/ssl/cert.pem",
+        "/private/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        ssl.get_default_verify_paths().cafile or "",
+    ]
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = os.path.realpath(str(candidate or "").strip())
+        if candidate and candidate not in seen and os.path.isfile(candidate):
+            seen.add(candidate)
+            result.append(candidate)
+    return result
+
+
+def _get_with_system_ca_retry(http: Any, url: str, **kwargs):
+    """GET normally, retrying SSL failures only with trusted system CAs.
+
+    PyInstaller/Python distributions can carry a CA bundle that differs from
+    the macOS system bundle. A failed TLS handshake has not sent the HTTP
+    request, so retrying this package-scoped, idempotent cache clear is safe.
+    Certificate verification is never disabled.
+    """
+    try:
+        return http.get(url, **kwargs)
+    except requests.exceptions.SSLError as original_error:
+        last_error = original_error
+        for ca_bundle in _system_ca_bundle_candidates():
+            try:
+                return http.get(url, verify=ca_bundle, **kwargs)
+            except requests.exceptions.SSLError as exc:
+                last_error = exc
+        raise last_error
 
 
 def apply_aggregation_type_fallback(
@@ -171,6 +212,48 @@ def detection_field_issue(fields: dict[str, Any] | None) -> tuple[str, str] | No
     if not has_any_ad_unit_id(fields):
         return "AD_IDS_EMPTY", "插屏聚合id和激励视频聚合id均为空，再次确认"
     return None
+
+
+def reconcile_detection_result(result: dict[str, Any] | None) -> dict[str, Any]:
+    """Re-evaluate a stale terminal result against its final field snapshot.
+
+    Logcat is progressive.  A caller can receive an ``incomplete`` code from
+    an earlier snapshot while the returned field dictionary already contains
+    the exact IronSource ``video``/``inter`` pair.  Always let the final
+    structured fields win so this race cannot bypass the fallback rule.
+    """
+    normalized = dict(result or {})
+    if normalized.get("ok"):
+        return normalized
+    if normalized.get("code") not in {
+        "AGGREGATION_TYPE_EMPTY",
+        "AGGREGATION_RESULT_INCOMPLETE",
+        "AF_KEY_EMPTY",
+        "AD_IDS_EMPTY",
+    }:
+        return normalized
+
+    fields = normalized.get("fields")
+    if not isinstance(fields, dict):
+        return normalized
+    issue = detection_field_issue(fields)
+    if issue is None and has_aggregation_type(fields):
+        normalized.update(
+            {
+                "ok": True,
+                "code": "AGGREGATION_FIELDS_RECONCILED",
+                "message": (
+                    "最终字段已按 video/inter 规则推断为 IronSource，"
+                    "已纠正较早的不完整结论"
+                    if is_inferred_aggregation_result(fields)
+                    else "最终字段已完整，已纠正较早的不完整结论"
+                ),
+            }
+        )
+        return normalized
+    if issue is not None:
+        normalized["code"], normalized["message"] = issue
+    return normalized
 
 
 def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any]:
@@ -540,7 +623,11 @@ def detect_aggregation_with_one_retry(
         second_fields["_aggregation_detection_attempts"] = 2
         second_issue = detection_field_issue(second_fields)
         second_is_inferred = is_inferred_aggregation_result(second_fields)
-        if second_is_inferred:
+        # The provisional IronSource verdict must never hide a real blocking
+        # field issue.  In particular, AppsFlyer with a missing af_key still
+        # has to stop after the retry instead of being submitted merely because
+        # video/inter allow the aggregation type itself to be inferred.
+        if second_is_inferred and second_issue is None:
             second_issue = (
                 "AGGREGATION_TYPE_INFERRED",
                 "第二次仍只能根据 video/inter 推断 IronSource",
@@ -611,7 +698,11 @@ def detect_aggregation_with_one_retry(
         }
     second_fields["_aggregation_retry_exhausted"] = True
     second_fields["_detection_retry_exhausted"] = True
-    if is_inferred_aggregation_result(second_fields):
+    if (
+        is_inferred_aggregation_result(second_fields)
+        and second_issue
+        and second_issue[0] == "AGGREGATION_TYPE_INFERRED"
+    ):
         return {
             "ok": True,
             "code": "AGGREGATION_TYPE_INFERRED_AFTER_RETRY",
@@ -1090,7 +1181,8 @@ def submit_backend_via_api(
     # through a cache.  The new values do not take effect on device until this
     # package-scoped cache is cleared, so treat both calls as one commit step.
     try:
-        cache_response = http.get(
+        cache_response = _get_with_system_ca_retry(
+            http,
             BACKEND_CACHE_CLEAR_URL,
             headers=headers,
             params={"package_name": package_name.strip()},
@@ -1273,7 +1365,8 @@ def clear_backend_adaptation_via_api(
         }
 
     try:
-        cache_response = http.get(
+        cache_response = _get_with_system_ca_retry(
+            http,
             BACKEND_CACHE_CLEAR_URL,
             headers=headers,
             params={"package_name": package_name},
@@ -1342,13 +1435,13 @@ def submit_precheck_blacklist_via_api(
     sleep=time.sleep,
     session: Any = None,
 ) -> dict[str, Any]:
-    """Persist a terminal Play precheck blacklist decision and clear A2 cache."""
+    """Persist a terminal Play precheck decision and clear the A2 package cache."""
     code = str((result or {}).get("code") or "").strip().upper()
     package_name = str((result or {}).get("package_name") or "").strip()
     reason = PRECHECK_BLACKLIST_REASONS.get(code, "")
     missing = []
     if not reason:
-        missing.append("当前预检结果不是可自动加黑类型")
+        missing.append("当前预检结果不是可自动提交的终止类型")
     if not package_name:
         missing.append("缺少包名")
     if not str(api_url or "").strip():
@@ -1424,7 +1517,7 @@ def submit_precheck_blacklist_via_api(
         return {
             "ok": False,
             "code": "PRECHECK_BLACKLIST_RECORD_NOT_FOUND",
-            "message": f"后台未找到包名 {package_name}，未执行加黑提交",
+            "message": f"后台未找到包名 {package_name}，未执行预检结论提交",
         }
 
     preserved_fields = (
@@ -1459,13 +1552,13 @@ def submit_precheck_blacklist_via_api(
         return {
             "ok": False,
             "code": "PRECHECK_BLACKLIST_SUBMIT_TIMEOUT",
-            "message": "后台加黑接口提交超时",
+            "message": "后台预检结论接口提交超时",
         }
     except (requests.RequestException, ValueError) as exc:
         return {
             "ok": False,
             "code": "PRECHECK_BLACKLIST_SUBMIT_FAILED",
-            "message": f"后台加黑接口提交失败：{exc}",
+            "message": f"后台预检结论接口提交失败：{exc}",
         }
     submitted_record = submit_body.get("data") if isinstance(submit_body, dict) else None
     if (
@@ -1477,11 +1570,12 @@ def submit_precheck_blacklist_via_api(
         return {
             "ok": False,
             "code": "PRECHECK_BLACKLIST_SUBMIT_REJECTED",
-            "message": "后台加黑接口未返回一致的 block_ps 字段",
+            "message": "后台接口未返回一致的 block_ps 字段",
         }
 
     try:
-        cache_response = http.get(
+        cache_response = _get_with_system_ca_retry(
+            http,
             BACKEND_CACHE_CLEAR_URL,
             headers=headers,
             params={"package_name": package_name},
@@ -1493,13 +1587,13 @@ def submit_precheck_blacklist_via_api(
         return {
             "ok": False,
             "code": "PRECHECK_BLACKLIST_CACHE_TIMEOUT",
-            "message": "后台已加黑，但刷新 A2 包缓存超时",
+            "message": "后台结论已提交，但刷新 A2 包缓存超时",
         }
     except (requests.RequestException, ValueError) as exc:
         return {
             "ok": False,
             "code": "PRECHECK_BLACKLIST_CACHE_FAILED",
-            "message": f"后台已加黑，但刷新 A2 包缓存失败：{exc}",
+            "message": f"后台结论已提交，但刷新 A2 包缓存失败：{exc}",
         }
     if (
         not isinstance(cache_body, dict)
@@ -1509,7 +1603,7 @@ def submit_precheck_blacklist_via_api(
         return {
             "ok": False,
             "code": "PRECHECK_BLACKLIST_CACHE_REJECTED",
-            "message": "后台已加黑，但清缓存接口返回异常",
+            "message": "后台结论已提交，但清缓存接口返回异常",
         }
 
     attempts = max(1, int(readback_attempts))
@@ -1537,7 +1631,7 @@ def submit_precheck_blacklist_via_api(
             return {
                 "ok": True,
                 "code": "PRECHECK_BLACKLIST_SUBMITTED",
-                "message": "加黑原因已通过接口提交、刷新 A2 包缓存并回读确认生效",
+                "message": "预检结论已通过接口提交、刷新 A2 包缓存并回读确认生效",
                 "reason": reason,
                 "backend_record": persisted,
             }
@@ -1546,7 +1640,7 @@ def submit_precheck_blacklist_via_api(
     return {
         "ok": False,
         "code": "PRECHECK_BLACKLIST_READBACK_FAILED",
-        "message": "已提交加黑并刷新缓存，但后台回读未确认 block_ps 生效",
+        "message": "已提交预检结论并刷新缓存，但后台回读未确认 block_ps 生效",
     }
 
 
