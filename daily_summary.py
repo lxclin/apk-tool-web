@@ -22,7 +22,8 @@ ACTION_SUCCESS_RE = re.compile(
 )
 BLACKLIST_RE = re.compile(r"加黑|黑名单")
 BLACKLIST_NEGATION_RE = re.compile(
-    r"(?:不|未|无需|不要|避免|不能|不应|不做|禁止)[^。！？\n]{0,4}加黑"
+    r"不加黑|未加黑|无需加黑|不要加黑|避免加黑|不能据此加黑|"
+    r"不应加黑|禁止加黑|不做加黑"
 )
 NOT_ADAPTED_RE = re.compile(r"暂不适配|不适配|跳过适配|暂不自动适配")
 AGGREGATION_CONTEXT_RE = re.compile(
@@ -90,6 +91,16 @@ ISSUE_REASON_RULES = (
         "google_login",
         "需Google登录",
         re.compile(r"(?:Google|谷歌).{0,8}(?:登录|登陆|账号)|(?:登录|登陆).{0,8}(?:Google|谷歌)", re.I),
+    ),
+    (
+        "account_login",
+        "需账号登录",
+        re.compile(
+            r"(?:需要|要求|必须|需).{0,6}(?:账号|账户).{0,4}(?:登录|登陆|注册)|"
+            r"(?:登录|登陆|注册).{0,4}(?:账号|账户)|"
+            r"(?:账号|账户).{0,4}(?:登录|登陆|注册)",
+            re.I,
+        ),
     ),
     (
         "iap_only",
@@ -319,7 +330,7 @@ def render_daily_summary(
     blacklist_summary = _format_issue_state_summary(issues, "blacklist", "加黑")
     lines = [
         f"【{target_date.month}.{target_date.day}】",
-        f"完成{len(aggregation_success)}个聚合动作适配结果",
+        f"完成{len(aggregation_success)}个聚合适配",
         *aggregation_success,
         "",
         (

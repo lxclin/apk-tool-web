@@ -20,6 +20,11 @@ from automation_adaptation import (
     add_automation_comment_once,
     submit_precheck_blacklist_via_api,
 )
+from workflow_engine import (
+    needs_precheck_backend_submission,
+    precheck_comment_result,
+    should_install_after_precheck,
+)
 
 
 ProgressCallback = Optional[Callable[[str], None]]
@@ -46,27 +51,8 @@ def load_today_precheck_tasks(project_gid: str, asana_pat: str = "") -> dict:
 
 
 def comment_result_for_precheck(result: dict) -> dict:
-    """Convert nested install/launch output into the Asana terminal result."""
-    launch_result = result.get("launch_result") or {}
-    if launch_result and not launch_result.get("ok"):
-        summary = str(launch_result.get("summary") or "").strip()
-        detail = str(launch_result.get("message") or "应用启动预检失败")
-        if summary:
-            detail += "\n崩溃摘要：\n" + summary[-1800:]
-        return {
-            "code": launch_result.get("code", "LAUNCH_FAILED"),
-            "package_name": result.get("package_name", ""),
-            "detail": detail,
-        }
-
-    install_result = result.get("install_result") or {}
-    if install_result and not install_result.get("ok"):
-        return {
-            "code": "INSTALL_FAILED",
-            "package_name": result.get("package_name", ""),
-            "detail": install_result.get("message", "自动下载安装失败"),
-        }
-    return result
+    """Compatibility wrapper around the shared workflow engine."""
+    return precheck_comment_result(result)
 
 
 def run_web_precheck(
@@ -106,11 +92,7 @@ def run_web_precheck(
             on_progress("正在打开并识别 Google Play 页面...")
         result = run_google_play_precheck(value, verify_apkcombo=True)
 
-    if result.get("code") in {
-        "IAP_ONLY",
-        "JAPANESE_PACKAGE",
-        "ALL_NETWORK_NO_PACKAGE",
-    }:
+    if needs_precheck_backend_submission(result):
         if on_progress:
             on_progress("检测到终止预检结论，正在提交后台并刷新缓存...")
         backend_blacklist = submit_precheck_blacklist_via_api(
@@ -122,14 +104,7 @@ def run_web_precheck(
         )
         result = {**result, "backend_blacklist": backend_blacklist}
 
-    if auto_install and (
-        result.get("continue_adaptation") is True
-        or result.get("code") in {
-            "HAS_ADS",
-            "NO_ADS_OR_IAP",
-            "APKCOMBO_AVAILABLE",
-        }
-    ):
+    if auto_install and should_install_after_precheck(result):
         if on_progress:
             on_progress("页面结果需继续人工确认，准备自动下载安装...")
         if result.get("code") == "APKCOMBO_AVAILABLE":

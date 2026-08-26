@@ -64,6 +64,65 @@ class TestAdbConnectionState:
             assert check_device() is False
 
 
+class TestAppBitness:
+    def test_reports_running_64_bit_process_and_installed_abi(self):
+        from adb_pusher import get_app_bitness
+
+        responses = [
+            MagicMock(
+                returncode=0,
+                stdout="primaryCpuAbi=arm64-v8a\nsecondaryCpuAbi=null\n",
+                stderr="",
+            ),
+            MagicMock(returncode=0, stdout="12345\n", stderr=""),
+            MagicMock(
+                returncode=0,
+                stdout="/system/bin/app_process64\n",
+                stderr="",
+            ),
+        ]
+        with patch("adb_pusher._run_adb", side_effect=responses):
+            ok, message = get_app_bitness("com.example.game")
+
+        assert ok is True
+        assert "64 位运行" in message
+        assert "arm64-v8a" in message
+
+    def test_reports_32_bit_installed_app_when_not_running(self):
+        from adb_pusher import get_app_bitness
+
+        responses = [
+            MagicMock(
+                returncode=0,
+                stdout="primaryCpuAbi=armeabi-v7a\nsecondaryCpuAbi=null\n",
+                stderr="",
+            ),
+            MagicMock(returncode=1, stdout="", stderr=""),
+        ]
+        with patch("adb_pusher._run_adb", side_effect=responses):
+            ok, message = get_app_bitness("com.example.game")
+
+        assert ok is True
+        assert message.startswith("32 位")
+        assert "应用未运行" in message
+
+    def test_does_not_guess_when_app_has_no_native_abi_and_is_not_running(self):
+        from adb_pusher import get_app_bitness
+
+        responses = [
+            MagicMock(
+                returncode=0,
+                stdout="primaryCpuAbi=null\nsecondaryCpuAbi=null\n",
+                stderr="",
+            ),
+            MagicMock(returncode=1, stdout="", stderr=""),
+        ]
+        with patch("adb_pusher._run_adb", side_effect=responses):
+            ok, message = get_app_bitness("com.example.game")
+
+        assert ok is True
+        assert "需启动后确认" in message
+
 class TestGetDeviceList:
     def test_returns_device_ids(self):
         with patch("subprocess.run") as mock_run:
@@ -168,6 +227,104 @@ class TestPushApk:
         assert "4 个 APK" in msg
         mock_run.assert_called_once()
         assert mock_run.call_args.kwargs["timeout"] == 120
+
+
+class TestInstallAcceptance:
+    def test_extracts_package_from_xapk_manifest(self, tmp_path):
+        import zipfile
+        from adb_pusher import extract_package_name_from_artifact
+
+        artifact = tmp_path / "game.xapk"
+        with zipfile.ZipFile(artifact, "w") as archive:
+            archive.writestr(
+                "manifest.json",
+                json.dumps({"package_name": "com.example.game"}),
+            )
+            archive.writestr("base.apk", b"fake")
+
+        assert extract_package_name_from_artifact(str(artifact)) == "com.example.game"
+
+    def test_verifies_uid_and_launcher(self):
+        from adb_pusher import verify_installed_app
+
+        resolved = MagicMock(
+            returncode=0,
+            stdout="com.example.game/.MainActivity\n",
+            stderr="",
+        )
+        with patch("adb_pusher.is_package_installed", return_value=True), \
+             patch("adb_pusher.get_app_uid", return_value=(True, "10123")), \
+             patch("adb_pusher._run_adb", return_value=resolved):
+            result = verify_installed_app("com.example.game")
+
+        assert result["ok"] is True
+        assert result["uid"] == "10123"
+        assert result["launcher"].endswith(".MainActivity")
+
+    def test_ambiguous_install_is_reconciled_with_phone(self):
+        from adb_pusher import push_apk_with_acceptance
+
+        accepted = {
+            "ok": True,
+            "uid": "10123",
+            "launcher": "com.example.game/.MainActivity",
+        }
+        with patch(
+            "adb_pusher.push_apk",
+            return_value=(False, "安装超时：已等待 90 秒"),
+        ), patch(
+            "adb_pusher.wait_for_package_install_confirmation", return_value=True
+        ), patch("adb_pusher.verify_installed_app", return_value=accepted):
+            ok, message = push_apk_with_acceptance(
+                "/tmp/game.xapk",
+                expected_package="com.example.game",
+            )
+
+        assert ok is True
+        assert "手机已确认安装完成" in message
+        assert "UID 10123" in message
+
+
+class TestMaxDebuggerShareParsing:
+    def test_uses_first_id_of_each_type_and_preserves_order(self):
+        from adb_pusher import parse_max_debugger_ad_units
+
+        text = """
+---------- first_inter ----------
+Identifier - d247de3c04245cc9
+Format     - INTER
+---------- second_inter ----------
+Identifier - 3343cc667927214f
+Format     - INTER
+---------- first_reward ----------
+Identifier - 49ccb1123804ca51
+Format     - REWARDED
+---------- second_reward ----------
+Identifier - bccf27bfd37e10c9
+Format     - REWARDED
+"""
+        result = parse_max_debugger_ad_units(text)
+
+        assert result["ok"] is True
+        assert result["interstitial_id"] == "d247de3c04245cc9"
+        assert result["rewarded_id"] == "49ccb1123804ca51"
+        assert result["interstitial_ids"] == [
+            "d247de3c04245cc9",
+            "3343cc667927214f",
+        ]
+        assert result["rewarded_ids"] == [
+            "49ccb1123804ca51",
+            "bccf27bfd37e10c9",
+        ]
+
+    def test_ignores_banner_units(self):
+        from adb_pusher import parse_max_debugger_ad_units
+
+        result = parse_max_debugger_ad_units(
+            "Identifier - banner-id\nFormat - BANNER\n"
+        )
+
+        assert result["ok"] is False
 
     def test_install_multiple_timeout_has_short_message(self, tmp_path):
         from adb_pusher import _install_apks
@@ -861,6 +1018,45 @@ class TestAppLaunchPrecheck:
 
 
 class TestPackageRuntimeMonitor:
+    def test_parses_focused_anr_package(self):
+        from adb_pusher import parse_focused_anr_package
+
+        text = (
+            "mCurrentFocus=Window{123 u0 Application Not Responding: "
+            "co.vybs.app}\n"
+        )
+
+        assert parse_focused_anr_package(text) == "co.vybs.app"
+
+    def test_automation_keeps_selecting_wait_for_repeated_anr(self):
+        from adb_pusher import PackageRuntimeMonitor
+
+        action = {
+            "dismissed": True,
+            "code": "ANR_WAIT_SELECTED",
+            "message": "已点击等待",
+        }
+        with patch(
+            "adb_pusher.get_focused_anr_package",
+            return_value="com.example.game",
+        ), patch(
+            "adb_pusher.dismiss_anr_wait_dialog",
+            return_value=action,
+        ) as dismiss, patch(
+            "adb_pusher.time.monotonic",
+            side_effect=[0, 6, 12, 18],
+        ):
+            monitor = PackageRuntimeMonitor(
+                "com.example.game",
+                auto_recover_anr=True,
+                anr_repeat_threshold=2,
+            )
+            results = [monitor.poll(), monitor.poll(), monitor.poll()]
+
+        assert all(result["ok"] for result in results)
+        assert all(result["code"] == "APP_ANR_RECOVERY_WAIT" for result in results)
+        assert dismiss.call_count == 3
+
     def test_process_lookup_accepts_package_child_process(self):
         from adb_pusher import _is_app_process_running
 
@@ -1284,6 +1480,28 @@ class TestBuildBackendUrl:
         params = parse_qs(url.removeprefix(prefix))
         assert params["af_key"] == ["af-key-123"]
 
+    def test_tradplus_is_mapped_as_a_normal_backend_platform(self):
+        from urllib.parse import parse_qs
+
+        from adb_pusher import build_backend_url
+
+        url = build_backend_url(
+            {
+                "最终判断": "TradPlus聚合（自动化检测确认）",
+                "归因平台": "Adjust",
+                "插屏聚合id": "tradplus-inter",
+                "激励视频聚合id": "tradplus-reward",
+                "初始Activity": "com.demo.MainActivity",
+            },
+            "com.demo.tradplus",
+        )
+
+        prefix = "http://data_center_web_internet.hongdinghe.cn/#/CpAdaptManage/CpAdapt?"
+        params = parse_qs(url.removeprefix(prefix))
+        assert params["aggr_platform"] == ["tradplus"]
+        assert params["aggr_chaping_id"] == ["tradplus-inter"]
+        assert params["aggr_jilishipin_id"] == ["tradplus-reward"]
+
     def test_backend_url_uses_appsflyer_sdk_key_as_af_key(self):
         from urllib.parse import parse_qs
 
@@ -1500,6 +1718,25 @@ class TestParseAutodetectorFields:
 
         assert fields["激励视频聚合id"] == "iron-reward"
         assert fields["插屏聚合id"] == "iron-inter"
+
+    def test_uses_ids_for_detected_tradplus_platform(self):
+        from adb_pusher import parse_autodetector_fields
+
+        lines = [
+            "08-26 10:00:00 I ZGSDK.AutoDetector: 最终判断: TradPlus聚合（自动化检测确认）",
+            "08-26 10:00:00 I ZGSDK.AutoDetector: AppLovin:",
+            "08-26 10:00:00 I ZGSDK.AutoDetector:   激励视频聚合id: [max-reward]",
+            "08-26 10:00:00 I ZGSDK.AutoDetector:   插屏聚合id: [max-inter]",
+            "08-26 10:00:00 I ZGSDK.AutoDetector: TradPlus:",
+            "08-26 10:00:00 I ZGSDK.AutoDetector:   激励视频聚合id: [tp-reward]",
+            "08-26 10:00:00 I ZGSDK.AutoDetector:   插屏聚合id: [tp-inter]",
+        ]
+
+        fields = parse_autodetector_fields(lines)
+
+        assert fields["最终判断"].startswith("TradPlus聚合")
+        assert fields["激励视频聚合id"] == "tp-reward"
+        assert fields["插屏聚合id"] == "tp-inter"
 
 
 class TestExtractLogcatFields:

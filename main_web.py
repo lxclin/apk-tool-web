@@ -10,6 +10,7 @@ os.environ.setdefault("DEV_MODE", "true")
 
 import uvicorn
 from server import app
+from app_version import build_label
 
 
 def open_browser():
@@ -20,7 +21,7 @@ def open_browser():
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  APK Tool Web 已启动")
+    print(f"  {build_label()} Web 已启动")
     print("  浏览器访问 → http://localhost:8000")
     print("  按 Ctrl+C 停止服务")
     print("=" * 50)

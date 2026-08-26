@@ -12,6 +12,7 @@ from PIL import Image, ImageTk
 import os
 import selectors
 import subprocess
+from types import SimpleNamespace
 
 from qr_generator import generate_qr
 from auto_asana.main import (
@@ -32,8 +33,8 @@ from auto_asana.main import (
     CP_ADAPT_TOKEN as DEFAULT_CP_ADAPT_TOKEN,
 )
 from adb_pusher import (
-    check_device, push_apk, set_adb_path, get_adb_path,
-    get_app_uid, start_logcat_stream, stop_logcat_stream,
+    check_device, push_apk, push_apk_with_acceptance, set_adb_path, get_adb_path,
+    get_app_uid, get_app_bitness, start_logcat_stream, stop_logcat_stream,
     run_stream, cmd_to_str, clear_logcat_buffer,
     build_push_config_cmd, build_fix_zygotehole_permissions_cmd, build_zygote_build_cmd,
     build_get_uid_cmd, build_clear_cache_cmd, build_force_stop_cmd,
@@ -55,6 +56,7 @@ from adb_pusher import (
     run_app_launch_precheck,
     PackageRuntimeMonitor,
     dismiss_notification_permission_dialog,
+    capture_max_debugger_ad_units,
     run_google_play_precheck,
 )
 from ad_replay import (
@@ -90,6 +92,21 @@ from cp_candidate_assignment import (
     load_cp_assignment_candidates,
 )
 from private_features import private_feature_enabled
+from automation_checkpoint import (
+    AutomationCheckpointStore,
+    new_batch_checkpoint,
+    resumable_summary,
+)
+from automation_report import AutomationReportStore
+from device_health import run_device_health_check
+from retry_policy import is_transient_automation_error, run_with_retry
+from workflow_engine import (
+    needs_precheck_backend_submission,
+    precheck_comment_result,
+    precheck_task_status,
+    should_install_after_precheck,
+)
+from app_version import build_label
 
 CONFIG_DEFAULT = os.path.expanduser(
     "~/Documents/适配动作与聚合参数获取_260629/config.json"
@@ -101,6 +118,12 @@ WORK_DIR_DEFAULT = os.path.expanduser(
 
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "gui_settings.json")
 CRASH_LOG = os.path.join(os.path.dirname(__file__), "gui_crash.log")
+AUTOMATION_CHECKPOINT_PATH = os.path.join(
+    os.path.dirname(__file__), "automation_checkpoint.json"
+)
+AUTOMATION_REPORT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "automation_reports"
+)
 AUTOMATION_AGGREGATION_TASK_UUID = "mediation_test_snow"
 AUTOMATION_INFRASTRUCTURE_FAILURE_CODES = frozenset(
     {
@@ -186,7 +209,7 @@ class APKToolApp:
     def __init__(self, root: tk.Tk):
         _setup_crash_log()
         self.root = root
-        self.root.title("APK 工具")
+        self.root.title(build_label())
         self.root.geometry("900x820")
         self.root.minsize(820, 640)
         self.root.resizable(True, True)
@@ -231,6 +254,7 @@ class APKToolApp:
         )
         self._automation_task_notes = ""
         self._automation_precheck_item_id = ""
+        self._automation_task_outcome = ""
         self._automation_fields: dict = {}
         self._automation_replay_id_candidates: dict[str, tuple[str, ...]] = {}
         # Incremented whenever the current automation task/field extraction
@@ -243,6 +267,18 @@ class APKToolApp:
         self._automation_batch_active = False
         self._automation_batch_btn = None
         self._automation_pause_btn = None
+        self._automation_health_btn = None
+        self._automation_checkpoint_store = AutomationCheckpointStore(
+            AUTOMATION_CHECKPOINT_PATH
+        )
+        self._automation_checkpoint: dict | None = (
+            self._automation_checkpoint_store.load()
+        )
+        self._automation_resume_btn = None
+        self._automation_discard_checkpoint_btn = None
+        self._automation_report_store = AutomationReportStore(AUTOMATION_REPORT_DIR)
+        self._automation_report_path = ""
+        self._automation_report_store.cleanup()
         self._daily_summary_running = False
         self._cp_candidate_running = False
         self._cp_candidate_preview: list[dict] = []
@@ -311,6 +347,7 @@ class APKToolApp:
         )
 
         self._build_ui()
+        self._automation_refresh_checkpoint_ui()
         self._setup_sync_settings_memory()
         self._update_adb_status()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -386,6 +423,13 @@ class APKToolApp:
             self._logcat_thread = None
             self._active_pattern = None
         self._automation_stop_event.set()
+        if self._automation_checkpoint and self._automation_checkpoint.get("status") == "active":
+            try:
+                self._automation_checkpoint = self._automation_checkpoint_store.mark_interrupted(
+                    self._automation_checkpoint, "工具窗口已关闭"
+                )
+            except OSError:
+                pass
         self._cancel_pending_afters()
         try:
             self.root.destroy()
@@ -930,67 +974,10 @@ class APKToolApp:
 
     @staticmethod
     def _precheck_task_status_for_result(result: dict) -> str:
-        backend_blacklist = result.get("backend_blacklist") or {}
-        if result.get("code") == "ALL_NETWORK_NO_PACKAGE" and backend_blacklist:
-            return (
-                "全网无包(后台)"
-                if backend_blacklist.get("ok")
-                else "全网无包提交失败"
-            )
-        if result.get("code") in {"IAP_ONLY", "JAPANESE_PACKAGE"} and backend_blacklist:
-            return "已加黑(后台)" if backend_blacklist.get("ok") else "加黑提交失败"
-        review_monetization = result.get("code") == "NO_ADS_OR_IAP"
-        launch_result = result.get("launch_result") or {}
-        if launch_result:
-            launch_status = {
-                "LAUNCH_OK": "启动正常",
-                "APP_CRASHED": "包体闪退",
-                "APP_EXITED": "启动异常",
-                "LAUNCH_FAILED": "启动失败",
-            }.get(launch_result.get("code"), "启动异常")
-            if review_monetization and launch_result.get("ok"):
-                return "待人工检查"
-            return launch_status
-        install_result = result.get("install_result") or {}
-        if install_result:
-            install_code = install_result.get("code")
-            if install_code in {
-                "DOWNLOAD_LIMIT_REACHED",
-                "DOWNLOAD_DEFERRED",
-            }:
-                return "待补下载"
-            if install_code == "DOWNLOAD_PAUSED":
-                return "下载已暂停"
-            if install_code == "DOWNLOAD_STARTED":
-                return "后台下载中"
-            if install_result.get("ok"):
-                if review_monetization:
-                    return "待人工检查"
-                if install_code == "ALREADY_INSTALLED":
-                    return "已安装"
-                return "安装完成"
-            return "安装失败"
-        return {
-            "HAS_ADS": "有广告",
-            "GOOGLE_NO_PACKAGE": "google无包",
-            "ALL_NETWORK_NO_PACKAGE": "全网无包",
-            "APKCOMBO_AVAILABLE": "APKCombo有包",
-            "APKCOMBO_CHECK_FAILED": "APKCombo待确认",
-            "IAP_ONLY": "已加黑",
-            "JAPANESE_PACKAGE": "已加黑",
-            "NO_ADS_OR_IAP": "待人工检查",
-            "DEVICE_UNSUPPORTED": "设备不支持",
-            "COUNTRY_UNSUPPORTED": "地区不支持",
-            "UNKNOWN": "待人工",
-            "NO_DEVICE": "未执行",
-        }.get(result.get("code"), "失败")
+        return precheck_task_status(result)
 
     def _submit_precheck_blacklist(self, result: dict) -> dict:
-        if result.get("code") not in {
-            "IAP_ONLY",
-            "JAPANESE_PACKAGE",
-            "ALL_NETWORK_NO_PACKAGE",
-        }:
+        if not needs_precheck_backend_submission(result):
             return result
         backend_result = submit_precheck_blacklist_via_api(
             result,
@@ -1007,14 +994,7 @@ class APKToolApp:
         return_after_start: bool = False,
     ) -> dict:
         """Install one app after a successful ads precheck in a worker thread."""
-        if (
-            result.get("continue_adaptation") is not True
-            and result.get("code") not in {
-                "HAS_ADS",
-                "NO_ADS_OR_IAP",
-                "APKCOMBO_AVAILABLE",
-            }
-        ):
+        if not should_install_after_precheck(result):
             return result
 
         def _progress(message: str):
@@ -1055,43 +1035,57 @@ class APKToolApp:
                 ),
             )
 
-        launch_result = run_app_launch_precheck(
-            result.get("package_name", ""),
+        package_name = result.get("package_name", "")
+        first_result = run_app_launch_precheck(
+            package_name,
             observation_seconds=observation_seconds,
             on_progress=_progress,
         )
-        return {**result, "launch_result": launch_result}
+        retryable_codes = {
+            "APP_CRASHED",
+            "APP_EXITED",
+            "LAUNCH_FAILED",
+            "LAUNCH_CHECK_TIMEOUT",
+        }
+        if first_result.get("ok") or first_result.get("code") not in retryable_codes:
+            return {**result, "launch_result": first_result}
+
+        _progress(
+            f"首次启动检查异常（{first_result.get('code', 'UNKNOWN')}），"
+            "正在进行第二次确认..."
+        )
+        time.sleep(2)
+        second_result = run_app_launch_precheck(
+            package_name,
+            observation_seconds=observation_seconds,
+            on_progress=_progress,
+        )
+        if second_result.get("ok"):
+            second_result = {
+                **second_result,
+                "message": "首次启动异常，第二次启动正常；以第二次结果为准",
+                "attempts": 2,
+                "first_attempt": first_result,
+                "recovered_after_retry": True,
+            }
+        else:
+            first_code = str(first_result.get("code") or "UNKNOWN")
+            second_code = str(second_result.get("code") or "UNKNOWN")
+            second_result = {
+                **second_result,
+                "message": (
+                    "连续两次启动检查异常，按第二次结果处理："
+                    + str(second_result.get("message") or "应用启动异常")
+                ),
+                "attempts": 2,
+                "first_attempt": first_result,
+                "retry_summary": f"首次 {first_code}；第二次 {second_code}",
+            }
+        return {**result, "launch_result": second_result}
 
     @staticmethod
     def _comment_result_for_precheck(result: dict) -> dict:
-        launch_result = result.get("launch_result") or {}
-        if launch_result and not launch_result.get("ok"):
-            summary = str(launch_result.get("summary") or "").strip()
-            detail = str(launch_result.get("message") or "应用启动预检失败")
-            if summary:
-                detail += "\n崩溃摘要：\n" + summary[-1800:]
-            return {
-                "code": launch_result.get("code", "LAUNCH_FAILED"),
-                "package_name": result.get("package_name", ""),
-                "detail": detail,
-            }
-        install_result = result.get("install_result") or {}
-        if (
-            install_result
-            and install_result.get("code") not in {
-                "DOWNLOAD_LIMIT_REACHED",
-                "DOWNLOAD_DEFERRED",
-                "DOWNLOAD_PAUSED",
-                "DOWNLOAD_STARTED",
-            }
-            and not install_result.get("ok")
-        ):
-            return {
-                "code": "INSTALL_FAILED",
-                "package_name": result.get("package_name", ""),
-                "detail": install_result.get("message", "自动下载安装失败"),
-            }
-        return result
+        return precheck_comment_result(result)
 
     def _select_precheck_item(self, item_id: str):
         if not self.precheck_task_tree.exists(item_id):
@@ -2170,6 +2164,14 @@ class APKToolApp:
         self.uid_var = tk.StringVar(value="(未获取)")
         self.uid_label = ttk.Label(row5, textvariable=self.uid_var, foreground="gray")
         self.uid_label.pack(side=tk.LEFT, padx=5)
+        ttk.Label(row5, text="应用位数:").pack(side=tk.LEFT, padx=(18, 0))
+        self.app_bitness_var = tk.StringVar(value="(未检测)")
+        self.app_bitness_label = ttk.Label(
+            row5,
+            textvariable=self.app_bitness_var,
+            foreground="gray",
+        )
+        self.app_bitness_label.pack(side=tk.LEFT, padx=5)
 
         # --- 操作按钮 ---
         action_frame = ttk.LabelFrame(parent, text="操作指令", padding=10)
@@ -2182,6 +2184,7 @@ class APKToolApp:
             ("推送 Config", self._on_push_config),
             ("执行 zygote_build", self._on_zygote_build),
             ("获取应用 UID", self._on_get_uid),
+            ("检测应用位数", self._on_get_app_bitness),
             ("清除缓存", self._on_clear_cache),
         ]:
             b = ttk.Button(btn_row1, text=text, command=cmd)
@@ -3040,6 +3043,14 @@ class APKToolApp:
     # ── 整体布局 ──────────────────────────────────────────────────
 
     def _build_ui(self):
+        # Reserve the bottom status bar before the expanding notebook. Packing
+        # it after the notebook lets a tall tab consume the whole window and
+        # leaves the status text clipped even though background jobs update it.
+        self.status_label = ttk.Label(
+            self.root, text="就绪", relief=tk.SUNKEN, anchor=tk.W, padding=(6, 2)
+        )
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
+
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill=tk.BOTH, expand=True)
 
@@ -3072,11 +3083,6 @@ class APKToolApp:
         sync_tab = ttk.Frame(notebook)
         notebook.add(sync_tab, text="数据同步")
         self._build_sync_tab(sync_tab)
-
-        self.status_label = ttk.Label(
-            self.root, text="就绪", relief=tk.SUNKEN, anchor=tk.W, padding=(6, 2)
-        )
-        self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
 
     def _on_notebook_tab_changed(self, event):
         if self._daily_summary_built:
@@ -3308,6 +3314,12 @@ class APKToolApp:
             command=self._automation_run_eligible_batch,
         )
         self._automation_batch_btn.pack(side=tk.LEFT, padx=6)
+        self._automation_health_btn = ttk.Button(
+            control,
+            text="执行前设备体检",
+            command=self._automation_run_device_health,
+        )
+        self._automation_health_btn.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(
             control,
             text="仅开始聚合回放检测",
@@ -3329,6 +3341,27 @@ class APKToolApp:
         self._automation_pause_btn.pack(side=tk.LEFT, padx=(6, 0))
         self._automation_status = ttk.Label(control, text="就绪", foreground="gray")
         self._automation_status.pack(side=tk.RIGHT)
+
+        recovery = ttk.Frame(outer)
+        recovery.pack(fill=tk.X, pady=(0, 8))
+        self._automation_checkpoint_status = ttk.Label(
+            recovery, text="没有未完成的自动化队列", foreground="gray"
+        )
+        self._automation_checkpoint_status.pack(side=tk.LEFT)
+        self._automation_discard_checkpoint_btn = ttk.Button(
+            recovery,
+            text="放弃恢复记录",
+            command=self._automation_discard_checkpoint,
+            state=tk.DISABLED,
+        )
+        self._automation_discard_checkpoint_btn.pack(side=tk.RIGHT)
+        self._automation_resume_btn = ttk.Button(
+            recovery,
+            text="恢复上次队列",
+            command=self._automation_resume_checkpoint,
+            state=tk.DISABLED,
+        )
+        self._automation_resume_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
         log_frame = ttk.LabelFrame(outer, text="自动化日志", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True)
@@ -3359,11 +3392,225 @@ class APKToolApp:
     def _automation_set_status(self, text: str, color: str = "#616161"):
         self._automation_status.config(text=text, foreground=color)
 
+    def _automation_begin_report(self, mode: str) -> None:
+        package_name = self.automation_package_var.get().strip()
+        if not package_name:
+            return
+        self._automation_report_path = self._automation_report_store.begin_task(
+            package_name=package_name,
+            task_gid=self.automation_task_gid_var.get().strip(),
+            appid=self.automation_appid_var.get().strip(),
+            mode=mode,
+        )
+        self._automation_report_store.add_event(
+            self._automation_report_path,
+            "started",
+            message="开始自动化适配",
+        )
+
+    def _automation_report_event(self, stage: str, message: str = "") -> None:
+        if not self._automation_report_path:
+            return
+        try:
+            self._automation_report_store.add_event(
+                self._automation_report_path,
+                stage,
+                message=message,
+                data={"fields": dict(self._automation_fields or {})},
+            )
+        except OSError as exc:
+            self._safe_after(0, self._automation_log, f"执行报告写入失败: {exc}")
+
+    def _automation_finish_report(
+        self, status: str, code: str, message: str
+    ) -> None:
+        if not self._automation_report_path:
+            return
+        try:
+            current = self._automation_report_store.load(self._automation_report_path)
+            if current and current.get("status") == "running":
+                self._automation_report_store.finish(
+                    self._automation_report_path,
+                    status=status,
+                    result_code=code,
+                    message=message,
+                    data={"fields": dict(self._automation_fields or {})},
+                )
+                self._safe_after(
+                    0,
+                    self._automation_log,
+                    f"结构化执行报告已保存: {self._automation_report_path}",
+                )
+        except OSError as exc:
+            self._safe_after(0, self._automation_log, f"执行报告保存失败: {exc}")
+
+    def _automation_device_health_sync(self):
+        report = run_device_health_check(
+            adb_path=get_adb_path(),
+            package_name=self.automation_package_var.get().strip(),
+            config_path=self.config_path_var.get().strip(),
+            work_dir=self.work_dir_var.get().strip(),
+        )
+        for line in report.lines():
+            self._safe_after(0, self._automation_log, f"设备体检 | {line}")
+        summary = "设备体检通过" if report.ok else "设备体检未通过"
+        self._safe_after(
+            0,
+            self._automation_set_status,
+            summary,
+            "#2e7d32" if report.ok else "#e53935",
+        )
+        return report
+
+    def _automation_run_device_health(self):
+        if self._automation_running:
+            return
+        if self._automation_health_btn is not None:
+            self._automation_health_btn.configure(state=tk.DISABLED)
+        self._automation_set_status("正在执行设备体检...", "#ef6c00")
+
+        def _run():
+            try:
+                self._automation_device_health_sync()
+            except Exception as exc:
+                self._safe_after(
+                    0, self._automation_log, f"设备体检执行失败: {exc}"
+                )
+                self._safe_after(
+                    0, self._automation_set_status, "设备体检执行失败", "#e53935"
+                )
+            finally:
+                if self._automation_health_btn is not None:
+                    self._safe_after(
+                        0,
+                        lambda: self._automation_health_btn.configure(state=tk.NORMAL),
+                    )
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _automation_refresh_checkpoint_ui(self):
+        if not hasattr(self, "_automation_checkpoint_status"):
+            return
+        summary = resumable_summary(self._automation_checkpoint)
+        enabled = bool(summary) and not self._automation_running
+        self._automation_checkpoint_status.config(
+            text=summary or "没有未完成的自动化队列",
+            foreground="#ef6c00" if summary else "gray",
+        )
+        state = tk.NORMAL if enabled else tk.DISABLED
+        self._automation_resume_btn.configure(state=state)
+        self._automation_discard_checkpoint_btn.configure(state=state)
+
+    def _automation_save_checkpoint(
+        self,
+        stage: str,
+        *,
+        error: str = "",
+    ) -> None:
+        self._automation_report_event(stage, error)
+        checkpoint = self._automation_checkpoint
+        if not checkpoint:
+            return
+        checkpoint["status"] = "active"
+        checkpoint["stage"] = stage
+        checkpoint["current_fields"] = dict(self._automation_fields or {})
+        checkpoint["replay_id_candidates"] = {
+            key: list(values)
+            for key, values in (self._automation_replay_id_candidates or {}).items()
+        }
+        checkpoint["last_error"] = str(error or "")
+        try:
+            self._automation_checkpoint = self._automation_checkpoint_store.save(
+                checkpoint
+            )
+        except OSError as exc:
+            self._safe_after(
+                0, self._automation_log, f"断点记录保存失败: {exc}"
+            )
+        self._safe_after(0, self._automation_refresh_checkpoint_ui)
+
+    def _automation_finish_checkpoint_task(
+        self,
+        index: int,
+        *,
+        success: bool,
+        message: str = "",
+        outcome: str = "",
+    ) -> None:
+        terminal_outcome = outcome or ("success" if success else "failed")
+        self._automation_finish_report(
+            "success" if success else ("skipped" if outcome else "handled"),
+            (
+                "AUTOMATION_TASK_SUCCESS"
+                if success
+                else (
+                    "UNSUPPORTED_ATTRIBUTION"
+                    if outcome == "other_attribution"
+                    else "AUTOMATION_TASK_HANDLED"
+                )
+            ),
+            message or ("聚合适配成功" if success else "当前包体已处理"),
+        )
+        checkpoint = self._automation_checkpoint
+        if not checkpoint:
+            return
+        tasks = checkpoint.get("tasks") or []
+        if 0 <= index < len(tasks):
+            tasks[index]["result"] = terminal_outcome
+            tasks[index]["message"] = str(message or "")
+        next_index = index + 1
+        if next_index >= len(tasks):
+            self._automation_checkpoint_store.clear()
+            self._automation_checkpoint = None
+        else:
+            checkpoint["current_index"] = next_index
+            checkpoint["stage"] = "queued"
+            checkpoint["current_fields"] = {}
+            checkpoint["replay_id_candidates"] = {}
+            checkpoint["last_error"] = ""
+            self._automation_checkpoint = self._automation_checkpoint_store.save(
+                checkpoint
+            )
+        self._safe_after(0, self._automation_refresh_checkpoint_ui)
+
+    def _automation_discard_checkpoint(self):
+        if self._automation_running:
+            return
+        self._automation_checkpoint_store.clear()
+        self._automation_checkpoint = None
+        self._automation_refresh_checkpoint_ui()
+        self._automation_log("已放弃上次自动化队列记录")
+
+    @staticmethod
+    def _automation_checkpoint_task(record: dict):
+        return SimpleNamespace(
+            gid=str(record.get("gid") or ""),
+            package_name=str(record.get("package_name") or ""),
+            up2_appid=str(record.get("up2_appid") or ""),
+            gp_link=str(record.get("gp_link") or ""),
+            notes=str(record.get("notes") or ""),
+            completed=bool(record.get("completed", False)),
+        )
+
+    def _automation_checkpoint_item_id(self, record: dict) -> str:
+        item_id = str(record.get("item_id") or "")
+        if item_id and self.precheck_task_tree.exists(item_id):
+            return item_id
+        gid = str(record.get("gid") or "")
+        for candidate, task in self._precheck_tasks.items():
+            if str(getattr(task, "gid", "") or "") == gid:
+                return candidate
+        return ""
+
     def _automation_set_running(self, running: bool):
         self._automation_running = running
         self._automation_run_btn.configure(state=tk.DISABLED if running else tk.NORMAL)
         if self._automation_batch_btn is not None:
             self._automation_batch_btn.configure(
+                state=tk.DISABLED if running else tk.NORMAL
+            )
+        if self._automation_health_btn is not None:
+            self._automation_health_btn.configure(
                 state=tk.DISABLED if running else tk.NORMAL
             )
         if self._precheck_auto_adapt_btn is not None:
@@ -3386,6 +3633,7 @@ class APKToolApp:
         else:
             self._automation_pause_event.clear()
             self._automation_batch_active = False
+        self._automation_refresh_checkpoint_ui()
 
     def _automation_use_selected_precheck_task(self):
         item_id, task = self._selected_precheck_task()
@@ -3448,15 +3696,25 @@ class APKToolApp:
         confidence = assessment["confidence"]
         method = assessment["method"]
         policy = assessment["policy"]
+        unsupported_attribution = (
+            assessment.get("terminal_outcome") == "unsupported_attribution"
+        )
         color = (
-            "#2e7d32"
+            "#ef6c00"
+            if unsupported_attribution
+            else "#2e7d32"
             if confidence == "高" and assessment["auto_submit"]
             else "#ef6c00"
             if assessment["auto_submit"]
             else "#e53935"
         )
+        status_text = (
+            f"其他归因 · {method} · {policy}"
+            if unsupported_attribution
+            else f"{confidence}置信度 · {method} · {policy}"
+        )
         self._automation_field_status.config(
-            text=f"{confidence}置信度 · {method} · {policy}",
+            text=status_text,
             foreground=color,
         )
 
@@ -3467,6 +3725,7 @@ class APKToolApp:
         context_version = self._automation_context_version
         self._automation_set_running(True)
         self._automation_set_status("正在提取参数...", "#ef6c00")
+        self._automation_begin_report("single")
 
         def _run():
             try:
@@ -3477,7 +3736,11 @@ class APKToolApp:
                 )
                 initial_fields = self._automation_prepare_detection_sync()
                 runtime_monitor = PackageRuntimeMonitor(
-                    self.automation_package_var.get().strip()
+                    self.automation_package_var.get().strip(),
+                    auto_recover_anr=True,
+                    on_event=lambda text: self._safe_after(
+                        0, self._automation_log, f"ADB | {text}"
+                    ),
                 )
                 result = detect_aggregation_with_one_retry(
                     self.automation_package_var.get().strip(),
@@ -3661,16 +3924,51 @@ class APKToolApp:
     ) -> dict:
         if not self._automation_fields:
             raise ValueError("请先提取并校对聚合参数")
-        return submit_backend_via_api(
-            self._automation_fields,
-            self.automation_package_var.get().strip(),
-            api_url=self.cp_adapt_api_url_var.get().strip(),
-            x_token=self.cp_adapt_x_token_var.get().strip(),
-            token=self.cp_adapt_token_var.get().strip(),
-            user_name=self.cp_adapt_assign_var.get().strip() or "rain",
-            stop_event=self._automation_stop_event,
-            allow_unsupported_attribution=allow_unsupported_attribution,
-        )
+        last_result = {}
+
+        def _submit():
+            nonlocal last_result
+            last_result = submit_backend_via_api(
+                self._automation_fields,
+                self.automation_package_var.get().strip(),
+                api_url=self.cp_adapt_api_url_var.get().strip(),
+                x_token=self.cp_adapt_x_token_var.get().strip(),
+                token=self.cp_adapt_token_var.get().strip(),
+                user_name=self.cp_adapt_assign_var.get().strip() or "rain",
+                stop_event=self._automation_stop_event,
+                allow_unsupported_attribution=allow_unsupported_attribution,
+            )
+            if not last_result.get("ok") and is_transient_automation_error(
+                last_result.get("message", "")
+            ):
+                raise RuntimeError(last_result.get("message") or "后台连接暂时失败")
+            return last_result
+
+        def _on_retry(next_attempt, total_attempts, exc, delay):
+            message = (
+                f"后台提交遇到瞬时网络错误：{exc}；"
+                f"{delay:g} 秒后执行第 {next_attempt}/{total_attempts} 次尝试"
+            )
+            self._safe_after(0, self._automation_log, message)
+            self._automation_report_event(
+                "retry",
+                status="retrying",
+                message=message,
+                details={"operation": "backend_submit", "attempt": next_attempt},
+            )
+
+        try:
+            return run_with_retry(
+                _submit,
+                attempts=3,
+                delays=(2.0, 4.0),
+                on_retry=_on_retry,
+                stop_event=self._automation_stop_event,
+            )
+        except RuntimeError:
+            if last_result:
+                return last_result
+            raise
 
     def _automation_clear_inferred_backend_sync(
         self,
@@ -3808,6 +4106,7 @@ class APKToolApp:
         return False
 
     def _automation_comment_failure(self, code: str, message: str):
+        self._automation_finish_report("failed", code, message)
         task_gid = self.automation_task_gid_var.get().strip()
         if not task_gid:
             return
@@ -3819,9 +4118,28 @@ class APKToolApp:
         except Exception as exc:
             self._safe_after(0, self._automation_log, f"Asana 评论失败: {exc}")
 
+    def _automation_comment_business_outcome(self, code: str, message: str):
+        """Write a terminal business decision without reporting automation failure."""
+        self._automation_finish_report("skipped", code, message)
+        task_gid = self.automation_task_gid_var.get().strip()
+        if not task_gid:
+            return
+        try:
+            add_automation_comment_once(
+                self._automation_asana_client(), task_gid, code, message
+            )
+            self._safe_after(0, self._automation_log, "业务结论已写入 Asana 评论")
+        except Exception as exc:
+            self._safe_after(0, self._automation_log, f"Asana 评论失败: {exc}")
+
     def _automation_comment_success(self, result: dict):
         task_gid = self.automation_task_gid_var.get().strip()
         package_name = self.automation_package_var.get().strip()
+        self._automation_finish_report(
+            "success",
+            "AGGREGATION_REPLAY_SUCCESS",
+            result.get("message", "聚合广告回放成功"),
+        )
         if not task_gid:
             return
         interstitial = result.get("interstitial") or {}
@@ -3864,21 +4182,26 @@ class APKToolApp:
             )
 
     def _automation_mark_not_adapted(self, message: str):
-        self._safe_after(0, self._automation_set_status, "归因暂不适配", "#ef6c00")
+        self._automation_task_outcome = "other_attribution"
+        self._safe_after(0, self._automation_set_status, "其他归因", "#ef6c00")
         self._safe_after(0, self._automation_log, message)
         if self._automation_precheck_item_id:
             self._safe_after(
                 0,
                 self._set_precheck_task_status,
                 self._automation_precheck_item_id,
-                "归因暂不适配",
+                "其他归因",
             )
 
     def _automation_complete_unsupported_attribution_sync(
         self, message: str
     ) -> bool:
-        """Persist unsupported-attribution parameters, then skip replay."""
+        """Persist evidence to Asana, write only a backend note, skip replay."""
         package_name = self.automation_package_var.get().strip()
+        attribution = normalize_optional_parameter(
+            self._automation_fields.get("归因平台")
+        ) or "未知"
+        terminal_note = f"归因为{attribution}，暂不适配"
         self._safe_after(
             0,
             self._automation_log,
@@ -3890,7 +4213,7 @@ class APKToolApp:
             self._automation_log,
             "非白名单归因的聚合检测结果已回填至 Asana 描述",
         )
-        self._automation_comment_failure(
+        self._automation_comment_business_outcome(
             "UNSUPPORTED_ATTRIBUTION",
             f"{message}\n包名：{package_name}",
         )
@@ -3899,10 +4222,10 @@ class APKToolApp:
         self._safe_after(
             0,
             self._automation_log,
-            "[归因暂不适配 2/2] 提交适配后台、清除缓存并回读校验",
+            "[归因暂不适配 2/2] 清空适配参数，仅提交备注并回读校验",
         )
-        submit = self._automation_submit_backend_sync(
-            allow_unsupported_attribution=True
+        submit = self._automation_clear_inferred_backend_sync(
+            note=terminal_note
         )
         self._safe_after(0, self._automation_log, submit.get("message", ""))
         if self._automation_stop_event.is_set():
@@ -3923,7 +4246,7 @@ class APKToolApp:
         self._safe_after(
             0,
             self._automation_log,
-            "非白名单归因参数已提交并清除缓存；按规则跳过聚合回放",
+            f"后台已仅保留备注“{terminal_note}”并清除缓存；按规则跳过聚合回放",
         )
         return False
 
@@ -4254,6 +4577,7 @@ class APKToolApp:
                 0, self._automation_set_status, "自动化已停止", "#ef6c00"
             )
             return False
+        self._automation_save_checkpoint("fields_detected")
         self._automation_prepare_replay_id_candidates()
         self._safe_after(0, self._automation_log, "[1/3] 回填 Asana 描述")
         self._automation_fill_asana_sync()
@@ -4279,6 +4603,7 @@ class APKToolApp:
                 submit.get("code", "BACKEND_SUBMIT_FAILED"), message
             )
             return False
+        self._automation_save_checkpoint("backend_verified")
         self._safe_after(0, self._automation_log, "[3/3] 重启应用并检测聚合回放")
         try:
             replay = self._automation_replay_with_id_rotation_sync()
@@ -4322,7 +4647,11 @@ class APKToolApp:
                     else:
                         first_fields = self._automation_fields or self._automation_prepare_detection_sync()
                         runtime_monitor = PackageRuntimeMonitor(
-                            self.automation_package_var.get().strip()
+                            self.automation_package_var.get().strip(),
+                            auto_recover_anr=True,
+                            on_event=lambda text: self._safe_after(
+                                0, self._automation_log, f"ADB | {text}"
+                            ),
                         )
                         detection = detect_aggregation_with_one_retry(
                             self.automation_package_var.get().strip(),
@@ -4409,6 +4738,7 @@ class APKToolApp:
 
     def _automation_apply_task_context(self, item_id: str, task):
         self._automation_clear_detected_fields()
+        self._automation_task_outcome = ""
         self._automation_precheck_item_id = item_id
         self.automation_task_gid_var.set(str(getattr(task, "gid", "") or ""))
         self.automation_package_var.set(
@@ -4427,6 +4757,7 @@ class APKToolApp:
         self._safe_after(0, self.uid_var.set, "")
         if threading.current_thread() is threading.main_thread():
             self._automation_apply_task_context(item_id, task)
+            self._automation_begin_report("batch")
             return
         applied = threading.Event()
 
@@ -4439,6 +4770,7 @@ class APKToolApp:
         self._safe_after(0, _apply)
         if not applied.wait(timeout=10):
             raise RuntimeError("切换自动化任务超时")
+        self._automation_begin_report("batch")
 
     def _automation_run_command_sync(
         self,
@@ -4504,6 +4836,49 @@ class APKToolApp:
                 f"命令失败 (exit={proc.returncode})：{output or display}"
             )
         return output
+
+    def _automation_run_command_with_retry_sync(
+        self,
+        cmd: list[str],
+        *,
+        cwd: str | None = None,
+        timeout: int = 180,
+        attempts: int = 3,
+        operation_name: str = "ADB 命令",
+        respect_control: bool = True,
+    ) -> str:
+        """Retry bounded ADB operations only for transient failures."""
+
+        def _on_retry(next_attempt, total_attempts, exc, delay):
+            message = (
+                f"{operation_name}遇到瞬时错误：{exc}；"
+                f"{delay:g} 秒后执行第 {next_attempt}/{total_attempts} 次尝试"
+            )
+            self._safe_after(0, self._automation_log, message)
+            self._automation_report_event(
+                "retry",
+                status="retrying",
+                message=message,
+                details={
+                    "operation": operation_name,
+                    "attempt": next_attempt,
+                    "total_attempts": total_attempts,
+                },
+            )
+
+        return run_with_retry(
+            lambda: self._automation_run_command_sync(
+                cmd,
+                cwd=cwd,
+                timeout=timeout,
+                respect_control=respect_control,
+            ),
+            attempts=attempts,
+            delays=(1.0, 2.0),
+            should_retry=is_transient_automation_error,
+            on_retry=_on_retry,
+            stop_event=self._automation_stop_event if respect_control else None,
+        )
 
     def _automation_extract_logcat_fields(
         self,
@@ -4591,13 +4966,22 @@ class APKToolApp:
         work_dir = self.work_dir_var.get().strip()
         if not package_name or not appid:
             raise ValueError("当前任务缺少包名或 UP2 appid")
-        if not check_device():
-            raise RuntimeError("没有已连接的 ADB 设备")
-        if not os.path.isfile(config_path):
-            raise ValueError(f"配置文件不存在: {config_path}")
-        script_path = os.path.join(work_dir, "zygote_build.sh")
-        if not os.path.isfile(script_path):
-            raise ValueError(f"构建脚本不存在: {script_path}")
+        self._safe_after(0, self._automation_log, "[设备体检] 检查执行环境")
+        health_report = self._automation_device_health_sync()
+        if not health_report.ok:
+            errors = [
+                check.message
+                for check in health_report.checks
+                if check.level == "error"
+            ]
+            raise RuntimeError("设备体检未通过: " + "；".join(errors))
+
+        bitness_ok, bitness = get_app_bitness(package_name)
+        self._safe_after(
+            0,
+            self._automation_log,
+            f"ADB | 应用位数: {bitness}",
+        )
 
         self._safe_after(0, self._automation_log, "[ADB 1/6] 写入当前包体配置")
         self._write_automation_task_config(package_name, appid)
@@ -4614,6 +4998,12 @@ class APKToolApp:
         )
         self._safe_after(
             0,
+            self._set_app_bitness,
+            bitness,
+            bitness_ok,
+        )
+        self._safe_after(
+            0,
             self._automation_log,
             (
                 f"ADB | packageName={package_name} appId={appid} "
@@ -4622,13 +5012,22 @@ class APKToolApp:
         )
 
         self._safe_after(0, self._automation_log, "[ADB 2/6] 推送 config.json")
-        self._automation_run_command_sync(build_push_config_cmd(config_path), timeout=45)
+        self._automation_run_command_with_retry_sync(
+            build_push_config_cmd(config_path),
+            timeout=45,
+            attempts=3,
+            operation_name="推送 config.json",
+        )
         if self._automation_stop_event.is_set():
             raise RuntimeError("用户已停止自动化")
 
         self._safe_after(0, self._automation_log, "[ADB 3/6] 执行 zygote_build")
-        self._automation_run_command_sync(
-            build_zygote_build_cmd(work_dir), cwd=work_dir, timeout=180
+        self._automation_run_command_with_retry_sync(
+            build_zygote_build_cmd(work_dir),
+            cwd=work_dir,
+            timeout=180,
+            attempts=2,
+            operation_name="zygote_build",
         )
         if self._automation_stop_event.is_set():
             raise RuntimeError("用户已停止自动化")
@@ -4643,8 +5042,31 @@ class APKToolApp:
 
         self._safe_after(0, self._automation_log, "[ADB 5/6] 清理旧日志并启动应用")
         clear_logcat_buffer()
-        self._automation_run_command_sync(build_open_app_cmd(package_name), timeout=20)
-        runtime_monitor = PackageRuntimeMonitor(package_name)
+        self._automation_run_command_with_retry_sync(
+            build_open_app_cmd(package_name),
+            timeout=20,
+            attempts=3,
+            operation_name="启动应用",
+        )
+        runtime_monitor = PackageRuntimeMonitor(
+            package_name,
+            auto_recover_anr=True,
+            on_event=lambda text: self._safe_after(
+                0, self._automation_log, f"ADB | {text}"
+            ),
+        )
+        runtime_bitness_ok, runtime_bitness = get_app_bitness(package_name)
+        self._safe_after(
+            0,
+            self._set_app_bitness,
+            runtime_bitness,
+            runtime_bitness_ok,
+        )
+        self._safe_after(
+            0,
+            self._automation_log,
+            f"ADB | 启动后应用位数: {runtime_bitness}",
+        )
 
         self._safe_after(
             0,
@@ -4759,6 +5181,8 @@ class APKToolApp:
         self.pkg_entry.insert(0, package_name)
         self.appid_entry.delete(0, tk.END)
         self.appid_entry.insert(0, appid)
+        self.app_bitness_var.set("(未检测)")
+        self.app_bitness_label.configure(foreground="gray")
         if task_uuid in self.task_uuid_combo["values"]:
             self.task_uuid_var.set(task_uuid)
         else:
@@ -4768,8 +5192,15 @@ class APKToolApp:
     def _automation_process_current_task_sync(self) -> bool:
         context_version = self._automation_context_version
         package_name = self.automation_package_var.get().strip()
+        self._automation_save_checkpoint("detecting")
         initial_fields = self._automation_prepare_detection_sync()
-        runtime_monitor = PackageRuntimeMonitor(package_name)
+        runtime_monitor = PackageRuntimeMonitor(
+            package_name,
+            auto_recover_anr=True,
+            on_event=lambda text: self._safe_after(
+                0, self._automation_log, f"ADB | {text}"
+            ),
+        )
         detection = detect_aggregation_with_one_retry(
             package_name,
             lambda: self._automation_extract_logcat_fields(),
@@ -4795,6 +5226,78 @@ class APKToolApp:
                 self._automation_fields,
                 context_version,
             )
+        if not detection.get("ok") and detection.get("code") in {
+            "AD_IDS_EMPTY",
+            "AGGREGATION_RESULT_INCOMPLETE",
+        }:
+            fields_text = json.dumps(
+                self._automation_fields, ensure_ascii=False
+            ).casefold()
+            if "max" in fields_text or "applovin" in fields_text:
+                self._safe_after(
+                    0,
+                    self._automation_log,
+                    "常规日志未取得广告 ID，尝试自动读取 MAX Debugger 分享文本",
+                )
+                captured = capture_max_debugger_ad_units(
+                    timeout_seconds=30,
+                    on_progress=lambda text: self._safe_after(
+                        0, self._automation_log, f"MAX Debugger | {text}"
+                    ),
+                )
+                if captured.get("ok"):
+                    rewarded_ids = captured.get("rewarded_ids") or []
+                    interstitial_ids = captured.get("interstitial_ids") or []
+                    if rewarded_ids:
+                        self._automation_fields["激励视频聚合id"] = ", ".join(
+                            rewarded_ids
+                        )
+                    if interstitial_ids:
+                        self._automation_fields["插屏聚合id"] = ", ".join(
+                            interstitial_ids
+                        )
+                    if not normalize_optional_parameter(
+                        self._automation_fields.get("最终判断")
+                    ):
+                        self._automation_fields["最终判断"] = (
+                            "MAX聚合（MAX Mediation Debugger 确认）"
+                        )
+                    self._automation_fields["识别方式"] = (
+                        "AutoDetector + MAX Mediation Debugger 分享文本"
+                    )
+                    issue = detection_field_issue(self._automation_fields)
+                    detection["fields"] = self._automation_fields
+                    if issue is None:
+                        detection.update(
+                            {
+                                "ok": True,
+                                "code": "MAX_DEBUGGER_FIELDS_RECOVERED",
+                                "message": captured.get("message", "广告 ID 已补齐"),
+                            }
+                        )
+                    else:
+                        detection["code"], detection["message"] = issue
+                    self._safe_after(
+                        0,
+                        self._automation_render_fields,
+                        self._automation_fields,
+                        context_version,
+                    )
+                    self._safe_after(
+                        0,
+                        self._automation_log,
+                        (
+                            "MAX Debugger 已提取："
+                            f"插屏 {len(interstitial_ids)} 个，"
+                            f"激励 {len(rewarded_ids)} 个"
+                        ),
+                    )
+                else:
+                    self._safe_after(
+                        0,
+                        self._automation_log,
+                        f"MAX Debugger 自动提取未完成: {captured.get('message')}",
+                    )
         if not detection.get("ok"):
             message = detection.get("message", "聚合参数提取失败")
             failure_code = detection.get(
@@ -4837,6 +5340,7 @@ class APKToolApp:
 
         if not self._automation_wait_if_paused():
             return False
+        self._automation_save_checkpoint("fields_detected")
         self._automation_prepare_replay_id_candidates()
         self._safe_after(0, self._automation_log, "[1/3] 回填 Asana 描述")
         self._automation_fill_asana_sync()
@@ -4862,6 +5366,7 @@ class APKToolApp:
                 submit.get("code", "BACKEND_SUBMIT_FAILED"), message
             )
             return False
+        self._automation_save_checkpoint("backend_verified")
         if self._automation_stop_event.is_set():
             return False
         if not self._automation_wait_if_paused():
@@ -4920,6 +5425,17 @@ class APKToolApp:
     def _automation_run_eligible_batch(self):
         if self._automation_running:
             return
+        existing_checkpoint = self._automation_checkpoint_store.load()
+        if resumable_summary(existing_checkpoint):
+            self._automation_checkpoint = existing_checkpoint
+            self._automation_refresh_checkpoint_ui()
+            self._automation_set_status(
+                "存在未完成队列，请先恢复或放弃恢复记录", "#e53935"
+            )
+            self._automation_log(
+                "未启动新队列：检测到上次未完成记录，避免覆盖断点"
+            )
+            return
         queue = self._automation_eligible_precheck_tasks()
         if not queue:
             self._automation_set_status("预检列表中没有可自动适配的已安装任务", "#e53935")
@@ -4927,25 +5443,120 @@ class APKToolApp:
                 "批量队列为空：仅处理状态为启动正常、安装完成或已安装的任务"
             )
             return
+        try:
+            replay_timeout = validate_replay_timeout(
+                self.automation_replay_timeout_var.get()
+            )
+        except ValueError as exc:
+            self._automation_set_status(str(exc), "#e53935")
+            return
+        self._automation_checkpoint = new_batch_checkpoint(
+            queue, replay_timeout_seconds=replay_timeout
+        )
+        self._automation_checkpoint = self._automation_checkpoint_store.save(
+            self._automation_checkpoint
+        )
+        self._automation_start_batch_queue(
+            queue, start_index=0, resume_stage="queued"
+        )
+
+    def _automation_resume_checkpoint(self):
+        if self._automation_running:
+            return
+        checkpoint = self._automation_checkpoint_store.load()
+        summary = resumable_summary(checkpoint)
+        if not checkpoint or not summary:
+            self._automation_checkpoint = None
+            self._automation_refresh_checkpoint_ui()
+            self._automation_set_status("没有可恢复的自动化队列", "#e53935")
+            return
+        self._automation_checkpoint = checkpoint
+        start_index = int(checkpoint.get("current_index", 0))
+        queue = []
+        for record in (checkpoint.get("tasks") or [])[start_index:]:
+            queue.append(
+                (
+                    self._automation_checkpoint_item_id(record),
+                    self._automation_checkpoint_task(record),
+                )
+            )
+        self.automation_replay_timeout_var.set(
+            str(
+                checkpoint.get("replay_timeout_seconds")
+                or DEFAULT_REPLAY_TIMEOUT_SECONDS
+            )
+        )
+        self._automation_log(summary)
+        self._automation_log(
+            "恢复策略：已识别参数会从回填继续；后台已生效时会重新校验后回放；"
+            "ADB 或检测中断会从当前包体前置步骤重跑"
+        )
+        self._automation_start_batch_queue(
+            queue,
+            start_index=start_index,
+            resume_stage=str(checkpoint.get("stage") or "queued"),
+        )
+
+    def _automation_start_batch_queue(
+        self,
+        queue,
+        *,
+        start_index: int,
+        resume_stage: str,
+    ):
         self._automation_batch_active = True
         self._automation_set_running(True)
-        self._automation_set_status(f"批量自动适配 0/{len(queue)}", "#ef6c00")
+        total_count = len((self._automation_checkpoint or {}).get("tasks") or queue)
+        self._automation_set_status(
+            f"批量自动适配 {start_index}/{total_count}", "#ef6c00"
+        )
 
         def _run():
             succeeded = 0
             failed = 0
+            other_attribution = 0
+            interrupted = False
             try:
-                for position, (item_id, task) in enumerate(queue, start=1):
+                for offset, (item_id, task) in enumerate(queue):
+                    checkpoint_index = start_index + offset
+                    position = checkpoint_index + 1
                     if self._automation_stop_event.is_set():
+                        interrupted = True
                         break
                     if not self._automation_wait_if_paused():
+                        interrupted = True
                         break
                     self._automation_switch_task_sync(item_id, task)
                     package_name = str(getattr(task, "package_name", "") or "")
+                    checkpoint = self._automation_checkpoint or {}
+                    checkpoint["current_index"] = checkpoint_index
+                    is_resumed_current = bool(
+                        offset == 0
+                        and resume_stage in {"fields_detected", "backend_verified"}
+                        and checkpoint.get("current_fields")
+                    )
+                    if is_resumed_current:
+                        self._automation_fields = dict(
+                            checkpoint.get("current_fields") or {}
+                        )
+                        self._automation_replay_id_candidates = {
+                            key: tuple(values or ())
+                            for key, values in (
+                                checkpoint.get("replay_id_candidates") or {}
+                            ).items()
+                        }
+                        self._safe_after(
+                            0,
+                            self._automation_render_fields,
+                            self._automation_fields,
+                            self._automation_context_version,
+                        )
+                    else:
+                        self._automation_save_checkpoint("preparing")
                     self._safe_after(
                         0,
                         self._automation_set_status,
-                        f"批量自动适配 {position}/{len(queue)}",
+                        f"批量自动适配 {position}/{total_count}",
                         "#ef6c00",
                     )
                     self._safe_after(
@@ -4953,9 +5564,25 @@ class APKToolApp:
                         self._automation_log,
                         f"========== [{position}/{len(queue)}] {package_name} ==========",
                     )
+                    task_succeeded = False
                     try:
-                        if self._automation_process_current_task_sync():
+                        if is_resumed_current:
+                            self._safe_after(
+                                0,
+                                self._automation_log,
+                                "已恢复聚合参数，从 Asana 回填和后台幂等校验继续",
+                            )
+                            task_succeeded = (
+                                self._automation_execute_post_detection_sync()
+                            )
+                        else:
+                            task_succeeded = (
+                                self._automation_process_current_task_sync()
+                            )
+                        if task_succeeded:
                             succeeded += 1
+                        elif self._automation_task_outcome == "other_attribution":
+                            other_attribution += 1
                         else:
                             failed += 1
                     except Exception as exc:
@@ -4963,6 +5590,8 @@ class APKToolApp:
                         message = f"自动化执行失败: {exc}"
                         self._automation_mark_failed(message)
                         self._automation_comment_failure("AUTOMATION_FAILED", message)
+                        if self._automation_checkpoint:
+                            self._automation_checkpoint["last_error"] = message
                     finally:
                         self._automation_stop_active_logcat("当前包体已完成")
                         try:
@@ -4977,20 +5606,54 @@ class APKToolApp:
                                 self._automation_log,
                                 f"停止当前应用失败: {exc}",
                             )
+                    if self._automation_stop_event.is_set():
+                        interrupted = True
+                        break
+                    self._automation_finish_checkpoint_task(
+                        checkpoint_index,
+                        success=task_succeeded,
+                        outcome=self._automation_task_outcome,
+                        message=(
+                            "聚合适配成功"
+                            if task_succeeded
+                            else (
+                                "其他归因，已回填并提交后台，跳过回放"
+                                if self._automation_task_outcome == "other_attribution"
+                                else "当前包体已处理"
+                            )
+                        ),
+                    )
                 stopped = self._automation_stop_event.is_set()
                 summary = (
-                    f"批量自动适配已停止：成功 {succeeded}，失败 {failed}"
-                    if stopped
-                    else f"批量自动适配完成：成功 {succeeded}，失败 {failed}"
+                    f"批量自动适配已停止：成功 {succeeded}，其他归因 {other_attribution}，失败 {failed}"
+                    if stopped or interrupted
+                    else f"批量自动适配完成：成功 {succeeded}，其他归因 {other_attribution}，失败 {failed}"
                 )
                 self._safe_after(0, self._automation_log, summary)
                 self._safe_after(
                     0,
                     self._automation_set_status,
                     summary,
-                    "#ef6c00" if stopped or failed else "#2e7d32",
+                    "#ef6c00" if stopped or interrupted or failed else "#2e7d32",
                 )
             finally:
+                if interrupted and self._automation_checkpoint:
+                    self._automation_finish_report(
+                        "interrupted",
+                        "AUTOMATION_INTERRUPTED",
+                        "用户停止或执行环境中断",
+                    )
+                    try:
+                        self._automation_checkpoint = (
+                            self._automation_checkpoint_store.mark_interrupted(
+                                self._automation_checkpoint,
+                                "用户停止或执行环境中断",
+                            )
+                        )
+                    except OSError as exc:
+                        self._safe_after(
+                            0, self._automation_log, f"断点记录保存失败: {exc}"
+                        )
                 self._safe_after(0, self._automation_set_running, False)
 
         threading.Thread(target=_run, daemon=True).start()
@@ -5316,7 +5979,12 @@ class APKToolApp:
                 self._safe_after(0, lambda: self.status_label.config(text="没有已连接的设备"))
                 return
             self._safe_after(0, lambda: self.status_label.config(text="正在安装..."))
-            ok, msg = push_apk(path)
+            ok, msg = push_apk_with_acceptance(
+                path,
+                on_progress=lambda progress: self._safe_after(
+                    0, lambda: self.status_label.config(text=progress)
+                ),
+            )
             self._safe_after(0, lambda: self.status_label.config(text=msg))
             if ok:
                 self._safe_after(0, lambda: self._console_line(f"[安装成功] {msg}", "done"))
@@ -5692,6 +6360,45 @@ class APKToolApp:
                 self._safe_after(0, _finish)
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _on_get_app_bitness(self):
+        if not check_device():
+            self.status_label.config(text="没有已连接的设备")
+            return
+        package_name = self.pkg_entry.get().strip()
+        if not package_name:
+            self.status_label.config(text="请输入包名")
+            return
+
+        self.app_bitness_var.set("检测中...")
+        self.app_bitness_label.configure(foreground="#ef6c00")
+        self.status_label.config(text="正在检测应用位数...")
+
+        def _run():
+            ok, message = get_app_bitness(package_name)
+
+            def _finish():
+                self._set_app_bitness(message, ok)
+                self.status_label.config(
+                    text=(f"应用位数: {message}" if ok else message)
+                )
+                self._console_line(
+                    f"[应用位数] {package_name}: {message}",
+                    "done" if ok else "error",
+                )
+
+            if threading.current_thread() is threading.main_thread():
+                _finish()
+            else:
+                self._safe_after(0, _finish)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _set_app_bitness(self, message: str, ok: bool = True):
+        self.app_bitness_var.set(str(message or "(未检测)"))
+        self.app_bitness_label.configure(
+            foreground="black" if ok else "#e53935"
+        )
 
     def _set_uid(self, uid: str):
         self._cached_uid = uid

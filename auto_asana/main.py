@@ -132,7 +132,7 @@ _PRECHECK_CODE_STATUSES = {
 
 _AUTOMATION_CODE_STATUSES = {
     "AGGREGATION_REPLAY_SUCCESS": "聚合适配成功",
-    "UNSUPPORTED_ATTRIBUTION": "归因暂不适配",
+    "UNSUPPORTED_ATTRIBUTION": "其他归因",
     "AGGREGATION_TYPE_EMPTY": "参数待确认",
     "AGGREGATION_RESULT_INCOMPLETE": "参数待确认",
     "AF_KEY_EMPTY": "参数待确认",
@@ -215,7 +215,7 @@ def classify_precheck_workflow_status(stories: list[dict[str, Any]]) -> tuple[st
         elif "包体闪退" in normalized or ("闪退" in normalized and "暂不适配" in normalized):
             latest_status = "包体闪退"
         elif "归因" in normalized and ("暂不适配" in normalized or "不适配" in normalized):
-            latest_status = "归因暂不适配"
+            latest_status = "其他归因"
         elif "暂不适配" in normalized or "跳过适配" in normalized:
             latest_status = "暂不适配"
         elif "回放" in normalized and ("失败" in normalized or "未确认" in normalized):

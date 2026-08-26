@@ -28,6 +28,8 @@ android/share-receiver/debug.keystore
 
 # Local app state
 gui_settings.json
+automation_checkpoint.json
+automation_reports/
 
 # Local Claude settings
 .claude/

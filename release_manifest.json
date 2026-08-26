@@ -1,0 +1,8 @@
+{
+  "name": "APK Tool",
+  "version": "1.4.0",
+  "checkpoint_schema": 1,
+  "report_schema": 1,
+  "workflow_schema": 1,
+  "release_notes": "UPDATE_NOTES_2026-08-04_TO_2026-08-26.md"
+}

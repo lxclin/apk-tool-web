@@ -106,6 +106,8 @@ def replay_platform_log_token(aggregation_verdict: str | None) -> str:
         return "admob"
     if "max" in verdict or "applovin" in verdict:
         return "max"
+    if "tradplus" in verdict or "trad_plus" in verdict:
+        return "tradplus"
     return ""
 
 
@@ -483,7 +485,11 @@ def run_ad_replay_check(
         raise ValueError("请输入应用 UID")
 
     evaluator = AdReplayEvaluator(expectation, action_success_patterns)
-    runtime_monitor = PackageRuntimeMonitor(package_name)
+    runtime_monitor = PackageRuntimeMonitor(
+        package_name,
+        auto_recover_anr=True,
+        on_event=on_progress,
+    )
     stop_event = stop_event or threading.Event()
     ok, message = force_stop_app(package_name)
     if not ok:

@@ -539,6 +539,29 @@ def test_ironsource_symbolic_video_and_inter_are_valid_ad_ids():
     assert payload["aggr_jilishipin_id"] == "video"
 
 
+def test_tradplus_is_a_normal_high_confidence_aggregation_type():
+    fields = {
+        "最终判断": "TradPlus聚合（自动化检测确认）",
+        "初始Activity": "com.demo.MainActivity",
+        "归因平台": "AppsFlyer",
+        "af_key": "af-key",
+        "激励视频聚合id": "tp-reward",
+        "插屏聚合id": "tp-inter",
+        "SDK列表": [{"名称": "TradPlus", "key": "tp-key"}],
+        "完整日志": "ZGSDK.AutoDetector: TradPlus: 18 次匹配",
+    }
+
+    assert detection_field_issue(fields) is None
+    assert validate_backend_fields(fields, "com.demo") == []
+    assessment = build_aggregation_assessment(fields)
+    assert assessment["confidence"] == "高"
+    assert assessment["auto_submit"] is True
+    assert assessment["submit_mode"] == "full"
+    assert "日志分析中 TradPlus 匹配 18 次" in assessment["evidence"]
+    payload = build_backend_submission_payload(fields, "com.demo", "rain")
+    assert payload["aggr_platform"] == "tradplus"
+
+
 def test_empty_verdict_with_exact_video_inter_pair_is_inferred_as_ironsource():
     first = {
         "ok": True,
@@ -907,7 +930,31 @@ def test_unsupported_attribution_can_be_persisted_by_terminal_workflow():
     client.tasks.update_task.assert_called_once()
     assessment = build_aggregation_assessment(fields)
     assert assessment["auto_submit"] is True
-    assert assessment["policy"] == "允许提交并跳过回放"
+    assert assessment["confidence"] == "不评级"
+    assert assessment["policy"] == "仅提交备注并跳过回放"
+    assert assessment["submit_mode"] == "note_only"
+
+
+def test_unsupported_attribution_note_only_payload_clears_all_adaptation_fields():
+    payload = build_backend_clear_payload(
+        "com.solar.game",
+        "rain",
+        "归因为SolarEngine，暂不适配",
+    )
+
+    assert payload["ps"] == "归因为SolarEngine，暂不适配"
+    for field in (
+        "aggr_platform",
+        "attribution_platform",
+        "aggr_chaping_id",
+        "aggr_jilishipin_id",
+        "block_ps",
+        "af_key",
+        "manual_applovin_sdk_key",
+        "activity_main_page",
+        "activity_guide_page",
+    ):
+        assert payload[field] is None
 
 
 def test_automation_comment_is_idempotent():

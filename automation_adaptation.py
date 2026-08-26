@@ -185,7 +185,8 @@ def has_partial_aggregation_evidence(fields: dict[str, Any] | None) -> bool:
     if has_any_ad_unit_id(fields):
         return True
     aggregation_sdks = {
-        "applovin", "max", "ironsource", "levelplay", "admob", "unityads"
+        "applovin", "max", "ironsource", "levelplay", "admob", "unityads",
+        "tradplus",
     }
     for sdk in fields.get("SDK列表", []) or []:
         name = str(sdk.get("名称") or "").casefold().replace(" ", "")
@@ -303,6 +304,8 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
         platform_token = "AppLovin MAX"
     elif "admob" in verdict_compact:
         platform_token = "AdMob"
+    elif "tradplus" in verdict_compact:
+        platform_token = "TradPlus"
     if platform_token:
         match = re.search(
             rf"{re.escape(platform_token)}\s*:\s*(\d+)\s*次匹配",
@@ -317,23 +320,35 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
     unsupported_attribution = bool(
         issue and issue[0] == "UNSUPPORTED_ATTRIBUTION"
     )
-    auto_submit = (issue is None or unsupported_attribution) and bool(activity)
-    if not activity:
+    if unsupported_attribution:
+        # A clear mediation verdict does not make a non-whitelisted
+        # attribution an adaptable/high-confidence task. This is a terminal
+        # business outcome whose only backend write is a note-only payload.
+        method = "其他归因终态规则"
+        confidence = "不评级"
+        auto_submit = True
+    else:
+        auto_submit = issue is None and bool(activity)
+    if not activity and not unsupported_attribution:
         evidence.append("缺少初始 Activity，禁止自动提交")
     if issue and not unsupported_attribution:
         evidence.append(f"阻断原因：{issue[1]}")
     elif unsupported_attribution:
-        evidence.append(f"终态规则：{issue[1]}，提交参数后跳过回放")
+        evidence.append(f"终态规则：{issue[1]}，仅提交备注字段并跳过回放")
     return {
         "method": method,
         "confidence": confidence,
         "evidence": evidence,
         "auto_submit": auto_submit,
         "policy": (
-            "允许提交并跳过回放"
+            "仅提交备注并跳过回放"
             if auto_submit and unsupported_attribution
             else ("允许自动提交" if auto_submit else "禁止自动提交")
         ),
+        "terminal_outcome": (
+            "unsupported_attribution" if unsupported_attribution else ""
+        ),
+        "submit_mode": "note_only" if unsupported_attribution else "full",
     }
 
 

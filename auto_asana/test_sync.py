@@ -147,7 +147,7 @@ class TestAsanaPrecheckTasks:
         ("comment", "expected"),
         [
             ("【APK Tool 页面预检：APP_CRASHED】\n包体闪退，暂不适配", "包体闪退"),
-            ("Singular归因，暂不适配", "归因暂不适配"),
+            ("Singular归因，暂不适配", "其他归因"),
             ("【APK Tool 自动化适配：AF_KEY_EMPTY】\naf_key为空", "参数待确认"),
             ("【APK Tool 自动化适配：AD_REPLAY_FAILED】\n未确认广告展示", "回放失败"),
             (

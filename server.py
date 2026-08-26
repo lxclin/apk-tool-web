@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
+from app_version import APP_VERSION, get_build_info
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -89,7 +90,7 @@ def _base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-app = FastAPI(title="APK Tool Web")
+app = FastAPI(title="APK Tool Web", version=APP_VERSION)
 app.add_middleware(IPWhitelistMiddleware)
 
 # logcat 全局状态
@@ -100,6 +101,11 @@ _logcat_task: asyncio.Task | None = None
 @app.get("/")
 async def index():
     return FileResponse(os.path.join(_base_dir(), "static", "index.html"))
+
+
+@app.get("/api/version")
+async def api_version():
+    return {"ok": True, **get_build_info()}
 
 
 # ── 配置 REST ─────────────────────────────────────────────────────

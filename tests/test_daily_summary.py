@@ -132,7 +132,7 @@ def test_render_matches_requested_layout():
 
     assert text == (
         "【8.3】\n"
-        "完成1个聚合动作适配结果\n"
+        "完成1个聚合适配\n"
         "com.success\n\n"
         "2个聚合适配问题:1个暂不适配，其中1个包体闪退或运行异常；"
         "1个加黑，其中1个应用内购无广告\n\n"
@@ -184,6 +184,31 @@ def test_issue_reasons_are_exclusive_and_grouped_by_terminal_state():
     ]
     assert summarize_issue_reasons(issues, "blacklist") == [
         {"key": "google_login", "label": "需Google登录", "count": 1},
+        {"key": "iap_only", "label": "应用内购无广告", "count": 1},
+    ]
+
+
+def test_account_login_blacklist_is_counted_not_mistaken_for_negation():
+    result = classify_task_comments(
+        "co.vybs.app",
+        [DailyComment("需要账号登录，不做适配，加黑")],
+    )
+
+    assert result["aggregation_state"] == "blacklist"
+    assert result["aggregation_reason"] == "需要账号登录，不做适配，加黑"
+    assert classify_issue_reason(result["aggregation_reason"]) == "account_login"
+
+
+def test_report_counts_google_login_account_login_and_iap_separately():
+    issues = [
+        {"package_name": "a", "state": "blacklist", "reason": "需要google登录，加黑"},
+        {"package_name": "b", "state": "blacklist", "reason": "需要账号登录，不做适配，加黑"},
+        {"package_name": "c", "state": "blacklist", "reason": "应用内购，无广告，加黑"},
+    ]
+
+    assert summarize_issue_reasons(issues, "blacklist") == [
+        {"key": "google_login", "label": "需Google登录", "count": 1},
+        {"key": "account_login", "label": "需账号登录", "count": 1},
         {"key": "iap_only", "label": "应用内购无广告", "count": 1},
     ]
 

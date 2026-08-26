@@ -14,6 +14,7 @@ import html
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+import glob
 
 DEFAULT_KEEP_THIRD_PARTY_PACKAGES = [
     "com.apktool.sharereceiver",
@@ -23,6 +24,8 @@ DEFAULT_KEEP_THIRD_PARTY_PACKAGES = [
     "com.google.ar.core",
     "org.telegram.messenger",
 ]
+SHARE_RECEIVER_PACKAGE = "com.apktool.sharereceiver"
+SHARE_RECEIVER_URI = "content://com.apktool.sharereceiver.data/latest"
 
 # 常见 adb 安装位置
 _COMMON_ADB_PATHS = [
@@ -841,6 +844,178 @@ def collect_device_ui_texts() -> list[str]:
     return _normalized_play_store_texts(values)
 
 
+def parse_max_debugger_ad_units(text: str) -> dict:
+    """Extract ordered INTER/REWARDED IDs from MAX Debugger shared text."""
+    interstitial: list[str] = []
+    rewarded: list[str] = []
+    current_identifier = ""
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        identifier_match = re.match(r"Identifier\s*-\s*(\S+)", line, re.I)
+        if identifier_match:
+            current_identifier = identifier_match.group(1).strip()
+            continue
+        format_match = re.match(r"Format\s*-\s*(\S+)", line, re.I)
+        if not format_match or not current_identifier:
+            continue
+        ad_format = format_match.group(1).strip().casefold()
+        target = None
+        if ad_format in {"inter", "interstitial"}:
+            target = interstitial
+        elif ad_format in {"reward", "rewarded", "rewarded_video"}:
+            target = rewarded
+        if target is not None and current_identifier not in target:
+            target.append(current_identifier)
+        current_identifier = ""
+    return {
+        "ok": bool(interstitial or rewarded),
+        "interstitial_ids": interstitial,
+        "rewarded_ids": rewarded,
+        "interstitial_id": interstitial[0] if interstitial else "",
+        "rewarded_id": rewarded[0] if rewarded else "",
+    }
+
+
+def _share_receiver_capture_time() -> int:
+    try:
+        result = _run_adb(
+            ["shell", "content", "query", "--uri", SHARE_RECEIVER_URI],
+            timeout=8,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return 0
+    match = re.search(r"captured_at=(\d+)", result.stdout or "")
+    return int(match.group(1)) if match else 0
+
+
+def _read_share_receiver_text() -> str:
+    try:
+        result = _run_adb(
+            ["shell", "content", "read", "--uri", SHARE_RECEIVER_URI],
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def ensure_share_receiver_installed() -> tuple[bool, str]:
+    """Install the bundled lightweight receiver when it is not on the phone."""
+    if is_package_installed(SHARE_RECEIVER_PACKAGE):
+        return True, "MAX 分享接收器已安装"
+    roots = [os.path.dirname(os.path.abspath(__file__))]
+    if getattr(sys, "_MEIPASS", ""):
+        roots.append(str(sys._MEIPASS))
+    candidates = [
+        os.path.join(
+            root,
+            "android",
+            "share-receiver",
+            "build",
+            "apk-tool-share-receiver.apk",
+        )
+        for root in roots
+    ]
+    apk_path = next((path for path in candidates if os.path.isfile(path)), "")
+    if not apk_path:
+        return False, "未找到内置 MAX 分享接收器 APK"
+    try:
+        result = _run_adb(["install", "-r", apk_path], timeout=90)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return False, f"安装 MAX 分享接收器失败: {exc}"
+    if result.returncode != 0 or not is_package_installed(SHARE_RECEIVER_PACKAGE):
+        detail = (result.stderr or result.stdout or "未知错误").strip()
+        return False, f"安装 MAX 分享接收器失败: {detail}"
+    return True, "MAX 分享接收器安装完成"
+
+
+def capture_max_debugger_ad_units(
+    *, timeout_seconds: float = 30,
+    on_progress=None,
+) -> dict:
+    """Click MAX Debugger Share, choose our receiver and read captured IDs."""
+    receiver_ok, receiver_message = ensure_share_receiver_installed()
+    if not receiver_ok:
+        return {"ok": False, "code": "SHARE_RECEIVER_UNAVAILABLE", "message": receiver_message}
+    if on_progress:
+        on_progress(receiver_message)
+
+    before = _share_receiver_capture_time()
+    nodes = collect_device_ui_nodes()
+    share_node = next(
+        (
+            node
+            for node in nodes
+            if _node_label(node) in {"share", "分享"}
+        ),
+        None,
+    )
+    center = _node_center(share_node or {})
+    if not center:
+        return {
+            "ok": False,
+            "code": "MAX_DEBUGGER_SHARE_NOT_FOUND",
+            "message": "未检测到 MAX Mediation Debugger 的 Share 按钮",
+        }
+    _run_adb(["shell", "input", "tap", str(center[0]), str(center[1])], timeout=5)
+    if on_progress:
+        on_progress("已点击 MAX Debugger Share，正在选择 APK Tool 接收器")
+
+    deadline = time.monotonic() + max(5.0, float(timeout_seconds))
+    receiver_clicked = False
+    while time.monotonic() < deadline:
+        nodes = collect_device_ui_nodes()
+        receiver_node = next(
+            (
+                node
+                for node in nodes
+                if "apk tool" in _node_label(node)
+                or "apk工具" in _node_label(node).replace(" ", "")
+                or "接收器" in _node_label(node)
+            ),
+            None,
+        )
+        receiver_center = _node_center(receiver_node or {})
+        if receiver_center and not receiver_clicked:
+            _run_adb(
+                [
+                    "shell", "input", "tap",
+                    str(receiver_center[0]), str(receiver_center[1]),
+                ],
+                timeout=5,
+            )
+            receiver_clicked = True
+            if on_progress:
+                on_progress("已选择 APK Tool 接收器，等待分享文本")
+
+        captured_at = _share_receiver_capture_time()
+        if captured_at > before:
+            text = _read_share_receiver_text()
+            parsed = parse_max_debugger_ad_units(text)
+            if parsed.get("ok"):
+                parsed.update(
+                    {
+                        "code": "MAX_DEBUGGER_IDS_CAPTURED",
+                        "message": "已从 MAX Mediation Debugger 分享文本提取广告 ID",
+                        "captured_at": captured_at,
+                        "raw_text": text,
+                    }
+                )
+                return parsed
+            return {
+                "ok": False,
+                "code": "MAX_DEBUGGER_IDS_EMPTY",
+                "message": "已收到 MAX Debugger 分享文本，但未解析到 INTER/REWARDED ID",
+                "raw_text": text,
+            }
+        time.sleep(1)
+    return {
+        "ok": False,
+        "code": "MAX_DEBUGGER_SHARE_TIMEOUT",
+        "message": "等待 MAX Debugger 分享文本超时",
+    }
+
+
 def is_package_installed(package_name: str) -> bool:
     """Return whether Android's package manager can resolve the package."""
     if not resolve_google_play_package(package_name):
@@ -881,6 +1056,145 @@ def wait_for_package_install_confirmation(
             return False
         interval = max(0.0, float(poll_interval_seconds))
         time.sleep(min(interval, remaining) if interval else 0)
+
+
+def verify_installed_app(package_name: str, *, require_launcher: bool = True) -> dict:
+    """Verify PackageManager, UID and launcher state after an installation."""
+    package_name = resolve_google_play_package(package_name)
+    if not package_name:
+        return {"ok": False, "code": "INVALID_PACKAGE", "message": "无法验收：包名无效"}
+    if not is_package_installed(package_name):
+        return {
+            "ok": False,
+            "code": "PACKAGE_NOT_INSTALLED",
+            "message": f"未检测到目标包名: {package_name}",
+        }
+
+    uid_ok, uid = get_app_uid(package_name)
+    if not uid_ok:
+        return {
+            "ok": False,
+            "code": "PACKAGE_UID_UNRESOLVED",
+            "message": f"应用已安装，但 UID 验收失败: {uid}",
+        }
+
+    launcher = ""
+    try:
+        result = _run_adb(
+            [
+                "shell", "cmd", "package", "resolve-activity", "--brief",
+                "-a", "android.intent.action.MAIN",
+                "-c", "android.intent.category.LAUNCHER", package_name,
+            ],
+            timeout=10,
+        )
+        output = (result.stdout or "").strip()
+        if result.returncode == 0 and output and "No activity found" not in output:
+            launcher = output.splitlines()[-1].strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        launcher = ""
+
+    if require_launcher and not launcher:
+        return {
+            "ok": False,
+            "code": "PACKAGE_NOT_LAUNCHABLE",
+            "message": "应用已安装并取得 UID，但没有可启动的桌面 Activity",
+            "package_name": package_name,
+            "uid": uid,
+            "launcher": "",
+        }
+    return {
+        "ok": True,
+        "code": "INSTALL_ACCEPTED",
+        "message": "安装验收通过",
+        "package_name": package_name,
+        "uid": uid,
+        "launcher": launcher,
+    }
+
+
+def extract_package_name_from_artifact(artifact_path: str) -> str:
+    """Best-effort package extraction for APK/XAPK acceptance checks."""
+    import zipfile
+
+    path = os.path.abspath(str(artifact_path or ""))
+    if not os.path.isfile(path):
+        return ""
+    if path.casefold().endswith(".xapk") or _zip_contains_apks(path):
+        try:
+            with zipfile.ZipFile(path, "r") as archive:
+                names = {name.casefold(): name for name in archive.namelist()}
+                manifest_name = names.get("manifest.json")
+                if manifest_name:
+                    manifest = json.loads(archive.read(manifest_name).decode("utf-8"))
+                    candidate = str(
+                        manifest.get("package_name")
+                        or manifest.get("packageName")
+                        or manifest.get("package")
+                        or ""
+                    ).strip()
+                    if resolve_google_play_package(candidate):
+                        return candidate
+        except (OSError, zipfile.BadZipFile, json.JSONDecodeError, UnicodeError):
+            pass
+
+    candidates = [shutil.which("aapt"), shutil.which("aapt2")]
+    candidates.extend(
+        sorted(
+            glob.glob(os.path.expanduser("~/Library/Android/sdk/build-tools/*/aapt")),
+            reverse=True,
+        )
+    )
+    for aapt_path in candidates:
+        if not aapt_path or not os.path.isfile(aapt_path):
+            continue
+        try:
+            result = subprocess.run(
+                [aapt_path, "dump", "badging", path],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        match = re.search(r"^package:\s+name='([^']+)'", result.stdout, re.M)
+        if match and resolve_google_play_package(match.group(1)):
+            return match.group(1)
+    return ""
+
+
+def push_apk_with_acceptance(
+    apk_path: str,
+    *,
+    expected_package: str = "",
+    on_progress=None,
+) -> tuple[bool, str]:
+    """Install an artifact and reconcile the host result with the phone."""
+    package_name = resolve_google_play_package(expected_package)
+    if not package_name and os.path.isfile(apk_path):
+        package_name = extract_package_name_from_artifact(apk_path)
+
+    ok, message = push_apk(apk_path)
+    if not package_name:
+        return ok, message
+
+    if not ok:
+        if not wait_for_package_install_confirmation(
+            package_name,
+            on_progress=on_progress,
+        ):
+            return False, message
+        message = "ADB 安装结果异常，但手机已确认安装完成"
+
+    acceptance = verify_installed_app(package_name)
+    if not acceptance.get("ok"):
+        return False, f"安装验收失败: {acceptance.get('message', '未知原因')}"
+    return True, (
+        f"{message}；验收通过（包名 {package_name}，UID {acceptance['uid']}，"
+        f"启动页 {acceptance['launcher']}）"
+    )
 
 
 def _node_label(node: dict) -> str:
@@ -932,6 +1246,86 @@ NOTIFICATION_PERMISSION_DENY_LABELS = {
     "不允许",
     "拒绝",
 }
+
+ANR_WAIT_LABELS = {"wait", "等待", "继续等待"}
+ANR_REPEAT_THRESHOLD = 3
+ANR_ACTION_COOLDOWN_SECONDS = 5
+
+
+def parse_focused_anr_package(window_text: str) -> str:
+    """Return the package owning the currently focused Android ANR dialog."""
+    for line in (window_text or "").splitlines():
+        if not any(
+            marker in line
+            for marker in ("mCurrentFocus", "mFocusedApp", "topFocusedDisplayId")
+        ):
+            continue
+        match = re.search(
+            r"Application Not Responding:\s*([A-Za-z0-9_.$-]+)", line
+        )
+        if match:
+            return match.group(1)
+    return ""
+
+
+def get_focused_anr_package() -> str:
+    """Read the package name from Android's currently focused ANR window."""
+    try:
+        result = _run_adb(["shell", "dumpsys", "window", "windows"], timeout=8)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    return parse_focused_anr_package(
+        (result.stdout or "") + (result.stderr or "")
+    )
+
+
+def dismiss_anr_wait_dialog(package_name: str) -> dict:
+    """Choose Wait on the target app's focused ANR dialog when possible."""
+    package_name = resolve_google_play_package(package_name)
+    focused_package = get_focused_anr_package()
+    if not package_name or focused_package != package_name:
+        return {
+            "dismissed": False,
+            "code": "NO_TARGET_ANR_DIALOG",
+            "message": "未发现当前应用的无响应弹窗",
+        }
+    try:
+        nodes = collect_device_ui_nodes()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return {
+            "dismissed": False,
+            "code": "ANR_UI_READ_FAILED",
+            "message": str(exc) or "无法读取无响应弹窗",
+        }
+    wait_node = _find_action_node(nodes, ANR_WAIT_LABELS)
+    if wait_node is None:
+        wait_node = next(
+            (
+                node
+                for node in nodes
+                if node.get("enabled", True)
+                and str(node.get("resource_id") or "").endswith("aerr_wait")
+                and _node_center(node) is not None
+            ),
+            None,
+        )
+    if wait_node is None:
+        return {
+            "dismissed": False,
+            "code": "ANR_WAIT_BUTTON_NOT_FOUND",
+            "message": "发现应用无响应弹窗，但没有找到“等待”按钮",
+        }
+    if not _tap_ui_node(wait_node):
+        return {
+            "dismissed": False,
+            "code": "ANR_WAIT_TAP_FAILED",
+            "message": "点击无响应弹窗的“等待”按钮失败",
+        }
+    return {
+        "dismissed": True,
+        "code": "ANR_WAIT_SELECTED",
+        "message": "检测到应用偶发无响应，已自动点击“等待”并继续适配",
+    }
 
 
 def dismiss_notification_permission_dialog() -> dict:
@@ -1228,10 +1622,16 @@ class PackageRuntimeMonitor:
         package_name: str,
         missing_threshold: int = 2,
         startup_grace_seconds: float = 25,
+        auto_recover_anr: bool = False,
+        anr_repeat_threshold: int = ANR_REPEAT_THRESHOLD,
+        on_event=None,
     ):
         self.package_name = resolve_google_play_package(package_name)
         self.missing_threshold = max(1, int(missing_threshold))
         self.startup_grace_seconds = max(0.0, float(startup_grace_seconds))
+        self.auto_recover_anr = bool(auto_recover_anr)
+        self.anr_repeat_threshold = max(1, int(anr_repeat_threshold))
+        self.on_event = on_event
         self.reset()
 
     def reset(self) -> None:
@@ -1239,6 +1639,49 @@ class PackageRuntimeMonitor:
         self.started_at = time.monotonic()
         self.seen_running = False
         self.consecutive_missing = 0
+        self.anr_occurrences = 0
+        self.last_anr_action_at = 0.0
+
+    def _emit_event(self, message: str) -> None:
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(message)
+        except Exception:
+            pass
+
+    def _poll_anr(self) -> dict | None:
+        if get_focused_anr_package() != self.package_name:
+            return None
+        now = time.monotonic()
+        if now - self.last_anr_action_at < ANR_ACTION_COOLDOWN_SECONDS:
+            return {
+                "ok": True,
+                "code": "APP_ANR_RECOVERY_WAIT",
+                "message": "应用无响应弹窗正在恢复，继续等待",
+            }
+        self.last_anr_action_at = now
+        action = dismiss_anr_wait_dialog(self.package_name)
+        self.anr_occurrences += 1
+        self._emit_event(action.get("message", "检测到应用无响应"))
+
+        # Automation intentionally keeps choosing Wait. Some games show a
+        # short-lived system ANR while loading large resources or initializing
+        # SDKs, but recover and remain adaptable afterwards. The caller's
+        # normal detection/replay timeout remains the hard upper bound.
+        if self.auto_recover_anr or self.anr_occurrences < self.anr_repeat_threshold:
+            return {
+                "ok": True,
+                "code": "APP_ANR_RECOVERY_WAIT",
+                "message": action.get("message", "检测到应用无响应，继续等待恢复"),
+                "anr_occurrences": self.anr_occurrences,
+            }
+        return {
+            "ok": False,
+            "code": "APP_ANR_PERSISTENT",
+            "message": "应用多次无响应，自动等待后仍未恢复，请人工确认",
+            "anr_occurrences": self.anr_occurrences,
+        }
 
     def poll(self) -> dict:
         if not self.package_name:
@@ -1247,6 +1690,10 @@ class PackageRuntimeMonitor:
                 "code": "INVALID_PACKAGE",
                 "message": "无效的应用包名",
             }
+
+        anr_result = self._poll_anr()
+        if anr_result is not None:
+            return anr_result
 
         if _is_app_process_running(self.package_name):
             self.seen_running = True
@@ -1740,6 +2187,8 @@ def _canonical_aggr_name(name: str) -> str:
         return "topon"
     if normalized in {"fyber"}:
         return "fyber"
+    if normalized in {"tradplus", "tradplusads"}:
+        return "tradplus"
     return normalized
 
 
@@ -1757,6 +2206,8 @@ def _target_aggr_from_final(final: str) -> str:
         return "topon"
     if "fyber" in final_lower:
         return "fyber"
+    if "tradplus" in final_lower or "trad_plus" in final_lower:
+        return "tradplus"
     platform_match = re.match(r"^([A-Za-z_]+)", final)
     if platform_match:
         return _canonical_aggr_name(platform_match.group(1))
@@ -2356,7 +2807,11 @@ def _download_apkcombo_via_browser(
                 shutil.move(downloaded_path, temp_path)
                 if on_progress:
                     on_progress("浏览器下载完成，正在通过 ADB 安装...")
-                ok, message = push_apk(temp_path)
+                ok, message = push_apk_with_acceptance(
+                    temp_path,
+                    expected_package=package_name,
+                    on_progress=on_progress,
+                )
                 if not ok:
                     return False, message
                 if not is_package_installed(package_name):
@@ -2530,6 +2985,95 @@ def get_app_uid(package_name: str) -> tuple[bool, str]:
         return False, "未找到 ADB 工具"
     except subprocess.TimeoutExpired:
         return False, "查询 UID 超时，请检查设备连接或 ADB 状态"
+
+
+_ABI_64_BIT = frozenset({"arm64-v8a", "x86_64", "mips64"})
+_ABI_32_BIT = frozenset({"armeabi-v7a", "armeabi", "x86", "mips"})
+
+
+def get_app_bitness(package_name: str) -> tuple[bool, str]:
+    """Describe an installed package's native ABI and current process bitness.
+
+    The running process is authoritative. Package ABI remains useful before
+    launch and distinguishes 32-only, 64-only and multi-ABI installations.
+    """
+    package_name = str(package_name or "").strip()
+    if not package_name:
+        return False, "请输入包名"
+    try:
+        package = _run_adb(
+            ["shell", "dumpsys", "package", package_name],
+            timeout=10,
+        )
+        output = (package.stdout or "") + (package.stderr or "")
+        if package.returncode != 0 or re.search(
+            r"unable to find package|unknown package|not found",
+            output,
+            re.I,
+        ):
+            return False, f"未找到包名 {package_name}，请确认应用已安装"
+
+        abi_values: list[str] = []
+        for field in ("primaryCpuAbi", "secondaryCpuAbi", "cpuAbiOverride"):
+            match = re.search(rf"\b{field}=([^\s]+)", output)
+            value = (match.group(1) if match else "").strip().casefold()
+            if value and value not in {"null", "none", "-"} and value not in abi_values:
+                abi_values.append(value)
+
+        pid_result = _run_adb(
+            ["shell", "pidof", package_name],
+            timeout=5,
+        )
+        pid = ((pid_result.stdout or "").strip().split() or [""])[0]
+        runtime_bits = ""
+        runtime_source = ""
+        if pid.isdigit():
+            executable = _run_adb(
+                ["shell", "readlink", f"/proc/{pid}/exe"],
+                timeout=5,
+            )
+            executable_text = (
+                (executable.stdout or "") + (executable.stderr or "")
+            ).strip()
+            if "app_process64" in executable_text:
+                runtime_bits = "64"
+                runtime_source = "app_process64"
+            elif "app_process32" in executable_text:
+                runtime_bits = "32"
+                runtime_source = "app_process32"
+            else:
+                maps = _run_adb(
+                    ["shell", "cat", f"/proc/{pid}/maps"],
+                    timeout=8,
+                )
+                maps_text = maps.stdout or ""
+                if re.search(r"/(?:system/)?lib64/(?:libc|libart)\.so", maps_text):
+                    runtime_bits = "64"
+                    runtime_source = "进程内存映射"
+                elif re.search(r"/(?:system/)?lib/(?:libc|libart)\.so", maps_text):
+                    runtime_bits = "32"
+                    runtime_source = "进程内存映射"
+
+        has_64 = any(value in _ABI_64_BIT for value in abi_values)
+        has_32 = any(value in _ABI_32_BIT for value in abi_values)
+        abi_text = ", ".join(abi_values) if abi_values else "无专用原生 ABI"
+        if runtime_bits:
+            return True, (
+                f"{runtime_bits} 位运行（{runtime_source}；安装 ABI: {abi_text}）"
+            )
+        if has_64 and has_32:
+            return True, f"同时支持 32/64 位（ABI: {abi_text}；应用未运行）"
+        if has_64:
+            return True, f"64 位（ABI: {abi_text}；应用未运行）"
+        if has_32:
+            return True, f"32 位（ABI: {abi_text}；应用未运行）"
+        if abi_values:
+            return True, f"ABI: {abi_text}（位数未知；应用未运行）"
+        return True, "无专用原生 ABI，应用未运行；需启动后确认实际位数"
+    except FileNotFoundError:
+        return False, "未找到 ADB 工具"
+    except subprocess.TimeoutExpired:
+        return False, "检测应用位数超时，请检查设备连接"
 
 
 def clear_app_cache(package_name: str) -> tuple[bool, str]:
@@ -2869,6 +3413,8 @@ def build_backend_url(fields: dict, package_name: str) -> str:
         "fyber": "fyber",
         "levelplay": "level_play",
         "level": "level_play",
+        "tradplus": "tradplus",
+        "trad_plus": "tradplus",
     }
     final = normalize_optional_parameter(fields.get("最终判断", ""))
     platform_match = re.match(r"^([A-Za-z_]+)", final)

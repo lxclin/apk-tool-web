@@ -226,6 +226,7 @@ def test_platform_log_filter_mapping_for_supported_mediation_types():
     assert ReplayExpectation.from_values("a", "", "LevelPlay聚合").platform_log_token == "level"
     assert ReplayExpectation.from_values("a", "", "IronSource聚合").platform_log_token == "iron"
     assert ReplayExpectation.from_values("a", "", "AdMob聚合").platform_log_token == "admob"
+    assert ReplayExpectation.from_values("a", "", "TradPlus聚合").platform_log_token == "tradplus"
 
 
 def test_in_flight_attempt_tracks_matching_session_until_terminal_status():

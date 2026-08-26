@@ -6,8 +6,8 @@ import time
 
 
 @pytest.fixture(autouse=True)
-def isolate_gui_settings(monkeypatch):
-    """GUI tests must not read or overwrite the operator's real settings file."""
+def isolate_gui_settings(monkeypatch, tmp_path):
+    """GUI tests must not touch the operator's real settings/checkpoint files."""
     import gui
 
     original_load = gui.load_gui_settings
@@ -22,6 +22,16 @@ def isolate_gui_settings(monkeypatch):
 
     monkeypatch.setattr(gui, "load_gui_settings", load_settings)
     monkeypatch.setattr(gui, "save_gui_settings", save_settings)
+    monkeypatch.setattr(
+        gui,
+        "AUTOMATION_CHECKPOINT_PATH",
+        str(tmp_path / "automation_checkpoint.json"),
+    )
+    monkeypatch.setattr(
+        gui,
+        "AUTOMATION_REPORT_DIR",
+        str(tmp_path / "automation_reports"),
+    )
 
 
 def wait_until(predicate, root=None, timeout=1.0):
@@ -238,6 +248,8 @@ class TestAppInit:
                 assert hasattr(app, "task_uuid_var")
                 assert hasattr(app, "output_text")
                 assert hasattr(app, "uid_var")
+                assert hasattr(app, "app_bitness_var")
+                assert hasattr(app, "_on_get_app_bitness")
                 assert hasattr(app, "_on_fix_zygotehole_permissions")
                 assert hasattr(app, "_stop_command_btn")
                 assert hasattr(app, "cleanup_preview_text")
@@ -280,6 +292,7 @@ class TestAppInit:
                     "推送 Config",
                     "执行 zygote_build",
                     "获取应用 UID",
+                    "检测应用位数",
                     "清除缓存",
                     "强制停止",
                     "打开应用",
@@ -696,12 +709,12 @@ class TestAutomationBatchActions:
                     app, "_automation_fill_asana_sync"
                 ) as fill_asana, patch.object(
                     app,
-                    "_automation_submit_backend_sync",
+                    "_automation_clear_inferred_backend_sync",
                     return_value={"ok": True, "message": "后台已生效"},
                 ) as submit, patch.object(
                     app, "_automation_replay_sync"
                 ) as replay, patch.object(
-                    app, "_automation_comment_failure"
+                    app, "_automation_comment_business_outcome"
                 ) as comment:
                     result = app._automation_process_current_task_sync()
 
@@ -709,9 +722,7 @@ class TestAutomationBatchActions:
                 fill_asana.assert_called_once_with(
                     allow_unsupported_attribution=True
                 )
-                submit.assert_called_once_with(
-                    allow_unsupported_attribution=True
-                )
+                submit.assert_called_once_with(note="归因为SolarEngine，暂不适配")
                 replay.assert_not_called()
                 comment.assert_called_once_with(
                     "UNSUPPORTED_ATTRIBUTION",
@@ -720,6 +731,8 @@ class TestAutomationBatchActions:
                 assert "跳过聚合回放" in app.automation_log_text.get(
                     "1.0", tk.END
                 )
+                assert app._automation_task_outcome == "other_attribution"
+                assert app._automation_status.cget("text") == "其他归因"
         finally:
             root.destroy()
 
@@ -753,21 +766,19 @@ class TestAutomationBatchActions:
                     app, "_automation_fill_asana_sync"
                 ) as fill_asana, patch.object(
                     app,
-                    "_automation_submit_backend_sync",
+                    "_automation_clear_inferred_backend_sync",
                     return_value={"ok": True, "message": "后台已生效"},
                 ) as submit, patch.object(
                     app, "_automation_replay_sync"
                 ) as replay, patch.object(
-                    app, "_automation_comment_failure"
+                    app, "_automation_comment_business_outcome"
                 ) as comment:
                     app._automation_extract_fields()
 
                 fill_asana.assert_called_once_with(
                     allow_unsupported_attribution=True
                 )
-                submit.assert_called_once_with(
-                    allow_unsupported_attribution=True
-                )
+                submit.assert_called_once_with(note="归因为未知，暂不适配")
                 replay.assert_not_called()
                 comment.assert_called_once_with(
                     "UNSUPPORTED_ATTRIBUTION",
@@ -1107,6 +1118,11 @@ class TestAutomationBatchActions:
                      patch("gui.get_app_uid", return_value=(True, "10123")), \
                      patch("gui.clear_logcat_buffer"), \
                      patch("gui.PackageRuntimeMonitor") as runtime_monitor, \
+                     patch.object(
+                         app,
+                         "_automation_device_health_sync",
+                         return_value=MagicMock(ok=True, checks=[]),
+                     ), \
                      patch.object(app, "_automation_run_command_sync") as mock_command, \
                      patch.object(
                          app,
@@ -1174,7 +1190,7 @@ class TestAutomationBatchActions:
                 assert "com.auto1.game" in output
                 assert "com.auto2.game" not in output
                 assert "com.auto3.game" in output
-                assert "成功 1，失败 1" in output
+                assert "成功 1，其他归因 0，失败 1" in output
         finally:
             root.destroy()
 
@@ -1358,6 +1374,79 @@ class TestAutomationBatchActions:
         comment_result = APKToolApp._comment_result_for_precheck(result)
         assert comment_result["code"] == "APP_CRASHED"
         assert "FATAL EXCEPTION" in comment_result["detail"]
+
+    def test_launch_precheck_retries_once_and_uses_second_success(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            source = {
+                "package_name": "com.example.game",
+                "install_result": {"ok": True, "code": "INSTALLED"},
+            }
+            first = {
+                "ok": False,
+                "code": "APP_EXITED",
+                "message": "应用启动后进程退出",
+            }
+            second = {
+                "ok": True,
+                "code": "LAUNCH_OK",
+                "message": "应用持续运行 20 秒",
+            }
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                with patch(
+                    "gui.run_app_launch_precheck",
+                    side_effect=[first, second],
+                ) as launch, patch("gui.time.sleep"):
+                    result = app._launch_check_after_install(source, 20)
+
+            assert launch.call_count == 2
+            assert result["launch_result"]["ok"] is True
+            assert result["launch_result"]["code"] == "LAUNCH_OK"
+            assert result["launch_result"]["recovered_after_retry"] is True
+            assert result["launch_result"]["first_attempt"] == first
+            assert APKToolApp._precheck_task_status_for_result(result) == "启动正常"
+        finally:
+            root.destroy()
+
+    def test_launch_precheck_requires_two_failures_before_terminal_status(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            source = {
+                "package_name": "com.example.game",
+                "install_result": {"ok": True, "code": "INSTALLED"},
+            }
+            first = {
+                "ok": False,
+                "code": "APP_EXITED",
+                "message": "首次进程退出",
+            }
+            second = {
+                "ok": False,
+                "code": "APP_CRASHED",
+                "message": "包体闪退，暂不适配",
+                "summary": "FATAL EXCEPTION: main",
+            }
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                with patch(
+                    "gui.run_app_launch_precheck",
+                    side_effect=[first, second],
+                ) as launch, patch("gui.time.sleep"):
+                    result = app._launch_check_after_install(source, 20)
+
+            assert launch.call_count == 2
+            assert result["launch_result"]["ok"] is False
+            assert result["launch_result"]["code"] == "APP_CRASHED"
+            assert result["launch_result"]["attempts"] == 2
+            assert "连续两次" in result["launch_result"]["message"]
+            assert APKToolApp._precheck_task_status_for_result(result) == "包体闪退"
+        finally:
+            root.destroy()
 
     def test_batch_precheck_skips_completed_and_comments_results(self):
         root = tk.Tk()
@@ -2065,7 +2154,7 @@ class TestPushApkAction:
         try:
             from gui import APKToolApp
             with patch("gui.check_device") as mock_check, \
-                 patch("gui.push_apk") as mock_push, \
+                 patch("gui.push_apk_with_acceptance") as mock_push, \
                  patch("os.path.isfile") as mock_isfile, \
                  patch("os.path.isdir") as mock_isdir, \
                  patch.object(root, "mainloop"):
@@ -2077,7 +2166,9 @@ class TestPushApkAction:
                 app.url_entry.insert(0, "/tmp/split-apks")
                 with patch("gui.threading.Thread", ImmediateThread):
                     app._on_push_apk()
-                mock_push.assert_called_once_with("/tmp/split-apks")
+                mock_push.assert_called_once()
+                assert mock_push.call_args.args == ("/tmp/split-apks",)
+                assert callable(mock_push.call_args.kwargs["on_progress"])
                 assert "安装成功" in app.status_label.cget("text")
         finally:
             root.destroy()
@@ -2087,7 +2178,7 @@ class TestPushApkAction:
         try:
             from gui import APKToolApp
             with patch("gui.check_device") as mock_check, \
-                 patch("gui.push_apk") as mock_push, \
+                 patch("gui.push_apk_with_acceptance") as mock_push, \
                  patch("os.path.isfile") as mock_isfile, \
                  patch("os.path.isdir") as mock_isdir, \
                  patch.object(root, "mainloop"):
@@ -2099,7 +2190,9 @@ class TestPushApkAction:
                 app.url_entry.insert(0, "/tmp/app.xapk")
                 with patch("gui.threading.Thread", ImmediateThread):
                     app._on_apkcombo_download()
-                mock_push.assert_called_once_with("/tmp/app.xapk")
+                mock_push.assert_called_once()
+                assert mock_push.call_args.args == ("/tmp/app.xapk",)
+                assert callable(mock_push.call_args.kwargs["on_progress"])
                 assert "安装成功" in app.status_label.cget("text")
         finally:
             root.destroy()

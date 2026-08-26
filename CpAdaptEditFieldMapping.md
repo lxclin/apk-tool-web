@@ -25,7 +25,7 @@ POST /admin/gd_web/overseas/s10_package_info
 | 修改页面显示字段 | URL query字段 | API请求字段 | 说明 |
 | --- | --- | --- | --- |
 | 包名 | `package_name` | `package_name` | 必填；URL 自动打开修改弹窗时必须携带 |
-| 聚合平台 | `aggr_platform` | `aggr_platform` | 下拉选择；当前可选值见页面 `select_platform_list` |
+| 聚合平台 | `aggr_platform` | `aggr_platform` | 下拉选择；TradPlus 使用值 `tradplus`，其他可选值见页面 `select_platform_list` |
 | 归因平台 | `attribution_platform` | `attribution_platform` | 文本输入 |
 | 聚合id-插屏 | `aggr_chaping_id` | `aggr_chaping_id` | 文本输入 |
 | 聚合id-激励视频 | `aggr_jilishipin_id` | `aggr_jilishipin_id` | 文本输入 |
