@@ -596,6 +596,29 @@ select.form-input {
 .field-raw { background:#f5f5f5; color:#666666; font-family:Menlo,monospace; font-size:11px; padding:10px; border-radius:6px; margin-top:12px; max-height:200px; overflow:auto; white-space:pre-wrap; word-break:break-all; border:1px solid #eee; }
 .field-modal-close { float:right; background:none; border:none; color:#999999; font-size:20px; cursor:pointer; line-height:1; }
 .field-modal-close:hover { color:#333333; }
+
+/* ── 页面预检 ── */
+.precheck-help { color:var(--text-muted); font-size:12px; line-height:1.7; }
+.precheck-grid { display:grid; grid-template-columns:1fr 1fr; gap:var(--space-md); }
+.precheck-options { display:flex; flex-wrap:wrap; align-items:center; gap:12px 18px; font-size:12px; color:var(--text-secondary); }
+.precheck-options label { display:inline-flex; align-items:center; gap:6px; }
+.precheck-options input[type="number"] { width:70px; }
+.precheck-table-wrap { max-height:300px; overflow:auto; border:1px solid var(--border-subtle); border-radius:var(--radius-md); }
+.precheck-table { width:100%; border-collapse:collapse; font-size:12px; }
+.precheck-table th { position:sticky; top:0; z-index:1; background:var(--bg-elevated); color:var(--text-muted); text-align:left; padding:8px; border-bottom:1px solid var(--border-default); }
+.precheck-table td { padding:8px; border-bottom:1px solid var(--border-subtle); vertical-align:top; }
+.precheck-table tr { cursor:pointer; }
+.precheck-table tbody tr:hover { background:rgba(59,124,255,.07); }
+.precheck-table tbody tr.selected { background:rgba(59,124,255,.14); }
+.precheck-table tbody tr.completed { opacity:.55; }
+.precheck-status { font-size:12px; color:var(--text-muted); }
+.precheck-status.ok { color:var(--success); }
+.precheck-status.busy { color:var(--warning); }
+.precheck-status.error { color:var(--danger); }
+.precheck-result { min-height:180px; max-height:360px; overflow:auto; margin:0; padding:14px; border-radius:var(--radius-md); background:#111827; color:#d7e0ed; font:12px/1.65 Menlo,Monaco,monospace; white-space:pre-wrap; word-break:break-word; }
+.automation-result { min-height:180px; max-height:360px; overflow:auto; margin:0; padding:14px; border-radius:var(--radius-md); background:#111827; color:#d7e0ed; font:12px/1.65 Menlo,Monaco,monospace; white-space:pre-wrap; word-break:break-word; }
+.daily-summary-text { width:100%; min-height:480px; resize:vertical; margin:0; padding:14px; border:1px solid var(--border-default); border-radius:var(--radius-md); background:#111827; color:#d7e0ed; font:13px/1.65 Menlo,Monaco,monospace; white-space:pre-wrap; }
+@media (max-width:760px) { .precheck-grid { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -641,11 +664,180 @@ select.form-input {
 <!-- ═══════ TABS ═══════ -->
 <nav class="tab-bar">
   <button class="tab-item active" onclick="switchTab('apk')">APK 工具</button>
+  <button class="tab-item" onclick="switchTab('precheck')">页面预检</button>
   <button class="tab-item" onclick="switchTab('adb')">ADB 指令</button>
+  <button class="tab-item" onclick="switchTab('automation')">自动化适配</button>
+  <button class="tab-item" onclick="switchTab('summary')">当日总结</button>
 </nav>
 
 <!-- ═══════ MAIN ═══════ -->
 <main class="main">
+
+  <!-- TAB: 页面预检 -->
+  <div id="tab-precheck" class="tab-panel">
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--info)"></div>
+        <h2>Google Play 页面预检</h2>
+      </div>
+      <div class="precheck-help">
+        只读取今日 Asana 区段并跳过已完成任务。仅内购无广告时加黑；包名含独立 jp 段且页面存在明显日文内容时按日本包体加黑。加黑结论会使用“自动化适配”页的后台接口凭证自动提交并刷新缓存；提交失败会保留明确状态和 Asana 失败评论。未发现广告和内购标识时继续下载并人工确认。正常识别优先读取手机 UI 控件，信息不足时才使用内存截图 OCR，不保留截图文件。
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--brand)"></div>
+        <h2>今日 Asana 任务</h2>
+      </div>
+      <div class="precheck-grid">
+        <div class="form-group">
+          <span class="form-label">Asana 项目 GID</span>
+          <input class="form-input mono" type="text" id="precheckProjectGid" placeholder="项目数字 GID">
+        </div>
+        <div class="form-group">
+          <span class="form-label">Asana PAT</span>
+          <input class="form-input mono" type="password" id="precheckAsanaPat" placeholder="仅保存在当前页面内存中">
+        </div>
+      </div>
+      <div class="form-inline gap-sm mt-sm">
+        <button class="btn btn-primary" id="btnLoadToday" onclick="loadTodayTasks()">读取今日任务</button>
+        <button class="btn btn-primary" id="btnBatchPrecheck" onclick="startBatchPrecheck()">按顺序批量预检</button>
+        <button class="btn btn-danger" id="btnStopPrecheck" onclick="stopBatchPrecheck()" disabled>当前任务后停止</button>
+        <span id="precheckAsanaStatus" class="precheck-status">尚未读取</span>
+      </div>
+      <div class="precheck-table-wrap mt-sm">
+        <table class="precheck-table">
+          <thead><tr><th style="width:46px">顺序</th><th>包名</th><th>GP 链接</th><th style="width:92px">状态</th></tr></thead>
+          <tbody id="precheckTaskBody"><tr><td colspan="4" style="color:var(--text-muted)">请先读取今日任务</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--warning)"></div>
+        <h2>检查与下载设置</h2>
+      </div>
+      <div class="form-group">
+        <span class="form-label">GP 链接或包名</span>
+        <input class="form-input mono" type="text" id="precheckValue" placeholder="https://play.google.com/store/apps/details?id=com.example.game">
+      </div>
+      <div class="precheck-options mt-sm">
+        <label><input type="checkbox" id="precheckAutoInstall" checked> 有广告且可下载时自动安装</label>
+        <label><input type="checkbox" id="precheckLaunchCheck" checked> 安装后启动并检查闪退</label>
+        <label>单批新下载上限 <input class="form-input" type="number" id="precheckDownloadLimit" min="1" max="10" value="6"></label>
+        <label>下载间隔(秒) <input class="form-input" type="number" id="precheckCooldown" min="0" max="600" value="60"></label>
+        <label>启动观察(秒) <input class="form-input" type="number" id="precheckObservation" min="5" max="120" value="20"></label>
+      </div>
+      <div class="form-inline gap-sm mt-sm">
+        <button class="btn btn-primary" id="btnSinglePrecheck" onclick="startSinglePrecheck()">开始页面预检</button>
+        <button class="btn btn-secondary" onclick="copyFromApkTab()">从 APK 工具带入</button>
+        <span id="precheckRunStatus" class="precheck-status">就绪</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--success)"></div>
+        <h2>预检结果</h2>
+      </div>
+      <pre id="precheckResult" class="precheck-result">等待检查</pre>
+    </div>
+  </div>
+
+  <!-- TAB: 自动化适配 -->
+  <div id="tab-automation" class="tab-panel">
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--warning)"></div>
+        <h2>聚合自动化适配</h2>
+      </div>
+      <div class="precheck-help">
+        独立调用自动化功能，不改变 ADB 指令页的手动按钮。当前阶段处理聚合参数回填、后台接口提交与回读校验，以及聚合广告真实回放验证。
+      </div>
+    </div>
+
+    <div class="card" id="privateCpCandidateCard" style="display:none">
+      <div class="card-header"><div class="dot" style="background:var(--brand)"></div><h2>高概率 CP 分配</h2></div>
+      <div class="precheck-help">
+        使用下方“当前 Asana 任务”区域的后台接口凭证，读取尚未分配的待适配 CP，按照历史包名成功率预估并默认勾选推荐项。评分只用于队列排序，提交前可以手动增删；确认后才会分配给 rain。
+      </div>
+      <div class="form-inline gap-sm mt-sm">
+        <button class="btn btn-primary" id="btnCpCandidatePreview" onclick="previewCpCandidates()">读取并筛选</button>
+        <button class="btn btn-secondary" onclick="selectRecommendedCpCandidates()">恢复推荐勾选</button>
+        <button class="btn btn-secondary" onclick="clearCpCandidateSelection()">清空选择</button>
+        <button class="btn btn-success" id="btnCpCandidateAssign" onclick="assignSelectedCpCandidates()">将勾选项分配为 rain</button>
+        <span id="cpCandidateStatus" class="precheck-status">尚未读取</span>
+      </div>
+      <div class="precheck-table-wrap mt-sm">
+        <table class="precheck-table">
+          <thead><tr><th>选择</th><th>预计成功率</th><th>包名</th><th>类型</th><th>判断依据</th></tr></thead>
+          <tbody id="cpCandidateBody"><tr><td colspan="5">点击“读取并筛选”加载后台数据</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><div class="dot" style="background:var(--brand)"></div><h2>当前 Asana 任务</h2></div>
+      <div class="precheck-grid">
+        <div class="form-group"><span class="form-label">Task GID</span><input class="form-input mono" id="automationTaskGid"></div>
+        <div class="form-group"><span class="form-label">包名</span><input class="form-input mono" id="automationPackage"></div>
+        <div class="form-group"><span class="form-label">UP2 appid</span><input class="form-input mono" id="automationAppId"></div>
+        <div class="form-group"><span class="form-label">回放监听（秒）</span><input class="form-input" type="number" id="automationTimeout" min="10" max="600" value="500"></div>
+        <div class="form-group"><span class="form-label">后台列表接口</span><input class="form-input mono" id="automationApiUrl" value="http://8.131.54.114/admin/gd_web/overseas/cp_adapt/list"></div>
+        <div class="form-group"><span class="form-label">后台 X-Token</span><input class="form-input mono" type="password" id="automationXToken" placeholder="当前登录会话 token"></div>
+        <div class="form-group"><span class="form-label">后台固定 token</span><input class="form-input mono" type="password" id="automationFixedToken" placeholder="固定 token"></div>
+        <div class="form-group"><span class="form-label">适配人员</span><input class="form-input mono" id="automationUserName" value="rain"></div>
+      </div>
+      <div class="form-inline gap-sm mt-sm">
+        <button class="btn btn-secondary" onclick="automationUseSelectedTask()">从页面预检选中任务带入</button>
+        <button class="btn btn-primary" onclick="automationExtractFields()">提取当前聚合参数</button>
+        <span id="automationStatus" class="precheck-status">就绪</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><div class="dot" style="background:var(--success)"></div><h2>参数校对与执行</h2></div>
+      <pre id="automationFields" class="automation-result">尚未提取聚合参数</pre>
+      <div class="form-inline gap-sm mt-sm">
+        <button class="btn btn-secondary" onclick="automationFillAsana()">自动回填 Asana</button>
+        <button class="btn btn-secondary" onclick="automationSubmitBackend()">接口提交并验证后台</button>
+        <button class="btn btn-primary" id="btnAutomationRun" onclick="automationRunAll()">参数确认无误：回填 → 提交 → 回放</button>
+        <button class="btn btn-primary" onclick="automationReplay()">仅开始聚合回放检测</button>
+        <button class="btn btn-danger" id="btnAutomationStop" onclick="automationStop()" disabled>停止</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><div class="dot" style="background:var(--info)"></div><h2>自动化结果</h2></div>
+      <pre id="automationResult" class="automation-result">等待执行</pre>
+    </div>
+  </div>
+
+  <!-- TAB: 当日总结 -->
+  <div id="tab-summary" class="tab-panel">
+    <div class="card">
+      <div class="card-header">
+        <div class="dot" style="background:var(--success)"></div>
+        <h2>Asana 当日适配总结</h2>
+      </div>
+      <div class="precheck-help">
+        读取对应日期执行分组中的当日评论，自动汇总聚合通过、动作通过、暂不适配和加黑。使用“页面预检”中的 Asana 项目 GID 与 PAT。
+      </div>
+      <div class="form-inline gap-sm mt-sm">
+        <label class="form-label">日期</label>
+        <input class="form-input" type="date" id="dailySummaryDate" style="max-width:180px">
+        <button class="btn btn-primary" id="btnDailySummary" onclick="generateDailySummary()">生成总结</button>
+        <button class="btn btn-secondary" onclick="copyDailySummary()">一键复制</button>
+        <span id="dailySummaryStatus" class="precheck-status">就绪</span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><div class="dot" style="background:var(--info)"></div><h2>总结预览</h2></div>
+      <textarea id="dailySummaryText" class="daily-summary-text" placeholder="点击“生成总结”读取 Asana 评论"></textarea>
+    </div>
+  </div>
 
   <!-- TAB: ADB 指令 -->
   <div id="tab-adb" class="tab-panel">
@@ -856,6 +1048,16 @@ select.form-input {
 // ═══════════════════════════════════════════════════════════════════
 
 let ws = null, cachedUid = null, reconnectTimer = null;
+let precheckTasks = [], selectedPrecheckIndex = -1;
+let precheckBatchRunning = false, precheckStopRequested = false;
+let precheckManualSelection = false;
+const precheckRequests = new Map();
+const automationRequests = new Map();
+let automationTaskNotes = '';
+let automationRunning = false;
+let automationAssessment = null;
+let automationFieldData = null;
+let automationContextVersion = 0;
 
 const $ = id => document.getElementById(id);
 const pkgEl=$('pkgName'),appIdEl=$('appId'),taskUuidEl=$('taskUUID');
@@ -964,11 +1166,26 @@ function connect() {
         break;
       case 'logline': cOut(m.text); break;
       case 'logcat_stopped': monitorTag.textContent='空闲'; monitorTag.className='monitor-indicator'; break;
-      case 'device_status': updateDeviceStatus(m.connected, m.adb_path); break;
+      case 'device_status':
+        updateDeviceStatus(m.connected, m.adb_path);
+        updatePrivateFeatures(m.private_features || {});
+        break;
       case 'config_data': handleConfigData(m); break;
       case 'config_saved': cOk('配置已写入'); setBtns(true); break;
       case 'extracted_fields': showFieldModal(m); break;
       case 'fill_data': handleFillData(m.data); break;
+      case 'asana_today_tasks_result': resolvePrecheckRequest(m); break;
+      case 'play_precheck_result': resolvePrecheckRequest(m); break;
+      case 'daily_summary_result': resolvePrecheckRequest(m); break;
+      case 'cp_candidate_result': resolveAutomationRequest(m); break;
+      case 'play_precheck_progress':
+        setPrecheckStatus(m.text || '处理中...', 'busy');
+        break;
+      case 'automation_result': resolveAutomationRequest(m); break;
+      case 'automation_progress':
+        setAutomationStatus(m.text || '处理中...', 'busy');
+        appendAutomationResult(m.text || '处理中...');
+        break;
       case 'error': cErr(m.text); setBtns(true);
         if (_pendingLogcat) { _pendingLogcat=null; }
         break;
@@ -979,6 +1196,8 @@ function connect() {
     proxyBanner.style.display = 'flex';
     updateDeviceStatus(false);
     setBtns(true);
+    for (const pending of precheckRequests.values()) pending.reject(new Error('本地代理连接已断开'));
+    precheckRequests.clear();
     reconnectTimer = setTimeout(connect, 3000);
   };
   ws.onerror = () => ws.close();
@@ -987,6 +1206,11 @@ function connect() {
 function send(data) {
   if (!ws || ws.readyState !== WebSocket.OPEN) { cErr('WebSocket 未连接'); return false; }
   ws.send(JSON.stringify(data)); return true;
+}
+
+function updatePrivateFeatures(features) {
+  const card = $('privateCpCandidateCard');
+  if (card) card.style.display = features.cp_candidate_assignment ? '' : 'none';
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1111,7 +1335,16 @@ function apkComboDownload() {
   const m = url.match(/[?&]id=([^&]+)/);
   if (!m) { cErr('无法从 URL 提取包名'); return; }
   setBtns(false);
-  send({type:'cmd',action:'open_apkcombo',params:{packageName:m[1]}});
+  send({type:'cmd',action:'open_apkcombo',params:{packageName:m[1],url:url}});
+}
+
+function apkComboSearchUrl(value) {
+  const normalized = value.trim().toLowerCase();
+  const pathValue = encodeURIComponent(normalized)
+    .replace(/%3A/gi, ':')
+    .replace(/%3D/gi, '=');
+  return 'https://apkcombo.com/search/' + pathValue
+    + '#gsc.tab=0&gsc.q=' + encodeURIComponent(normalized) + '&gsc.sort=';
 }
 
 function apkPureSearch() {
@@ -1136,8 +1369,8 @@ function downloadInstall() {
   // Google Play 链接 → 在新标签页打开 apkcombo
   const m = url.match(/[?&]id=([^&]+)/);
   if (m) {
-    window.open('https://apkcombo.com/' + m[1] + '/download/apk', '_blank');
-    cOk('已在浏览器打开 apkcombo，下载后将 xapk 路径粘贴到「本地 APK 安装」中安装');
+    window.open(apkComboSearchUrl(url), '_blank');
+    cOk('已打开 APKCombo 搜索结果页');
     return;
   }
 
@@ -1153,9 +1386,1053 @@ function installLocalApk() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// PAGE PRECHECK
+// ═══════════════════════════════════════════════════════════════════
+
+function precheckRequest(type, payload) {
+  return new Promise((resolve, reject) => {
+    const requestId = (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : Date.now() + '-' + Math.random().toString(16).slice(2);
+    precheckRequests.set(requestId, {resolve, reject});
+    if (!send({type, request_id:requestId, ...payload})) {
+      precheckRequests.delete(requestId);
+      reject(new Error('本地代理未连接'));
+    }
+  });
+}
+
+function resolvePrecheckRequest(message) {
+  const pending = precheckRequests.get(message.request_id);
+  if (!pending) return;
+  precheckRequests.delete(message.request_id);
+  if (message.ok) pending.resolve(message);
+  else pending.reject(new Error(message.error || '操作失败'));
+}
+
+function setPrecheckStatus(text, kind='') {
+  const el = $('precheckRunStatus');
+  el.textContent = text;
+  el.className = 'precheck-status' + (kind ? ' ' + kind : '');
+}
+
+function setAsanaStatus(text, kind='') {
+  const el = $('precheckAsanaStatus');
+  el.textContent = text;
+  el.className = 'precheck-status' + (kind ? ' ' + kind : '');
+}
+
+function precheckPackage(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/[?&]id=([^&#]+)/);
+  return match ? decodeURIComponent(match[1]) : text;
+}
+
+function renderPrecheckTasks() {
+  const body = $('precheckTaskBody');
+  if (!precheckTasks.length) {
+    body.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted)">今日没有任务</td></tr>';
+    return;
+  }
+  body.innerHTML = precheckTasks.map((task, index) => {
+    const classes = [index === selectedPrecheckIndex ? 'selected' : '', (task.completed || task.workflow_terminal) ? 'completed' : ''].filter(Boolean).join(' ');
+    const status = task._status || (task.completed ? '已完成（跳过）' : (task.workflow_status || '待处理'));
+    return `<tr class="${classes}" onclick="selectPrecheckTask(${index})">
+      <td>${index + 1}</td>
+      <td class="mono">${esc(task.package_name || task.name || '')}</td>
+      <td class="mono">${esc(task.gp_link || '未填写')}</td>
+      <td>${esc(status)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function selectPrecheckTask(index, manualSelection = true) {
+  const task = precheckTasks[index];
+  if (!task) return;
+  selectedPrecheckIndex = index;
+  precheckManualSelection = manualSelection;
+  $('precheckValue').value = task.gp_link || task.package_name || '';
+  renderPrecheckTasks();
+}
+
+function updatePrecheckTask(index, status) {
+  const task = precheckTasks[index];
+  if (task) {
+    task._status = status;
+    const activeStatuses = new Set(['新增待预检', '检查中', '下载中', '补下载中', '启动检查', '后台下载中', '待补下载', '下载已暂停']);
+    if (task._incrementalNew && !activeStatuses.has(status)) {
+      task._incrementalNew = false;
+      const projectGid = $('precheckProjectGid').value.trim();
+      const pending = loadPendingPrecheckGids(projectGid);
+      pending.delete(String(task.gid || ''));
+      rememberPendingPrecheckGids(projectGid, pending);
+    }
+  }
+  renderPrecheckTasks();
+}
+
+function copyFromApkTab() {
+  const value = apkUrlEl.value.trim();
+  if (!value) { setPrecheckStatus('APK 工具页没有 GP 链接', 'error'); return; }
+  $('precheckValue').value = value;
+  setPrecheckStatus('已从 APK 工具带入', 'ok');
+}
+
+function savePrecheckSettings() {
+  localStorage.setItem('apkToolPrecheckProjectGid', $('precheckProjectGid').value.trim());
+}
+
+function precheckSeenStorageKey(projectGid) {
+  const now = new Date();
+  const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, '0'), String(now.getDate()).padStart(2, '0')].join('-');
+  return `apkToolPrecheckSeen:${projectGid}:${date}`;
+}
+
+function loadSeenPrecheckGids(projectGid) {
+  try {
+    const value = JSON.parse(localStorage.getItem(precheckSeenStorageKey(projectGid)) || '[]');
+    return new Set(Array.isArray(value) ? value.map(String) : []);
+  } catch (_) { return new Set(); }
+}
+
+function rememberSeenPrecheckGids(projectGid, gids) {
+  localStorage.setItem(precheckSeenStorageKey(projectGid), JSON.stringify([...gids].sort()));
+}
+
+function precheckPendingStorageKey(projectGid) {
+  const now = new Date();
+  const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, '0'), String(now.getDate()).padStart(2, '0')].join('-');
+  return `apkToolPrecheckPending:${projectGid}:${date}`;
+}
+
+function loadPendingPrecheckGids(projectGid) {
+  try {
+    const value = JSON.parse(localStorage.getItem(precheckPendingStorageKey(projectGid)) || '[]');
+    return new Set(Array.isArray(value) ? value.map(String) : []);
+  } catch (_) { return new Set(); }
+}
+
+function rememberPendingPrecheckGids(projectGid, gids) {
+  localStorage.setItem(precheckPendingStorageKey(projectGid), JSON.stringify([...gids].sort()));
+}
+
+function precheckOptions() {
+  const limit = Number($('precheckDownloadLimit').value);
+  const cooldown = Number($('precheckCooldown').value);
+  const observation = Number($('precheckObservation').value);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 10) throw new Error('单批新下载上限需为 1-10');
+  if (!Number.isFinite(cooldown) || cooldown < 0 || cooldown > 600) throw new Error('下载间隔需为 0-600 秒');
+  if (!Number.isFinite(observation) || observation < 5 || observation > 120) throw new Error('启动观察时间需为 5-120 秒');
+  return {
+    autoInstall: $('precheckAutoInstall').checked,
+    launchCheck: $('precheckLaunchCheck').checked,
+    limit,
+    cooldown,
+    observation,
+    asanaPat: $('precheckAsanaPat').value.trim(),
+  };
+}
+
+async function loadTodayTasks() {
+  const projectGid = $('precheckProjectGid').value.trim();
+  if (!projectGid) { setAsanaStatus('请输入 Asana 项目 GID', 'error'); return; }
+  if (!$('precheckAsanaPat').value.trim()) { setAsanaStatus('请输入 Asana PAT', 'error'); return; }
+  savePrecheckSettings();
+  $('btnLoadToday').disabled = true;
+  setAsanaStatus('正在读取今日任务...', 'busy');
+  try {
+    const previousStatusByGid = new Map(
+      precheckTasks.filter(task => task.gid && task._status).map(task => [task.gid, task._status])
+    );
+    const response = await precheckRequest('asana_today_tasks', {
+      project_gid: projectGid,
+      asana_pat: $('precheckAsanaPat').value.trim(),
+    });
+    precheckTasks = response.tasks || [];
+    const seenGids = loadSeenPrecheckGids(projectGid);
+    const currentGids = new Set(precheckTasks.filter(task => task.gid).map(task => String(task.gid)));
+    const pendingGids = loadPendingPrecheckGids(projectGid);
+    precheckTasks.forEach(task => {
+      const actionableRestored = task.workflow_status === 'APKCombo有包';
+      const eligible = !!task.gid && !task.completed && !task.workflow_terminal && (!task.workflow_status || actionableRestored);
+      task._incrementalNew = eligible && (actionableRestored || !seenGids.has(String(task.gid)) || pendingGids.has(String(task.gid)));
+      if (!task.completed && !task.workflow_status && previousStatusByGid.has(task.gid)) {
+        task._status = previousStatusByGid.get(task.gid);
+      } else if (!task.completed && !task.workflow_status && task._incrementalNew) {
+        task._status = '新增待预检';
+      }
+    });
+    rememberSeenPrecheckGids(projectGid, new Set([...seenGids, ...currentGids]));
+    rememberPendingPrecheckGids(projectGid, new Set(precheckTasks.filter(task => task._incrementalNew).map(task => String(task.gid))));
+    selectedPrecheckIndex = precheckTasks.findIndex(task => task._incrementalNew && !task.completed && !task.workflow_terminal);
+    if (selectedPrecheckIndex < 0 && precheckTasks.length) selectedPrecheckIndex = 0;
+    renderPrecheckTasks();
+    if (selectedPrecheckIndex >= 0) selectPrecheckTask(selectedPrecheckIndex, false);
+    const pending = precheckTasks.filter(task => !task.completed && !task.workflow_terminal).length;
+    const incremental = precheckTasks.filter(task => task._incrementalNew).length;
+    const restored = precheckTasks.filter(task => task.workflow_status).length;
+    const commentErrors = response.comment_status_errors || [];
+    setAsanaStatus(`${response.section_name || '今日区段'} · ${precheckTasks.length} 个任务，本次新增 ${incremental} 个，${pending} 个未终态，评论恢复 ${restored} 个状态${commentErrors.length ? `，${commentErrors.length} 个评论读取失败` : ''}`, commentErrors.length ? 'busy' : 'ok');
+  } catch (error) {
+    setAsanaStatus('读取失败: ' + error.message, 'error');
+  } finally {
+    $('btnLoadToday').disabled = false;
+  }
+}
+
+function precheckTaskStatus(result) {
+  const code = result.code || 'UNKNOWN';
+  const install = result.install_result || {};
+  const launch = result.launch_result || {};
+  const backendBlacklist = result.backend_blacklist || null;
+  if (code === 'ALL_NETWORK_NO_PACKAGE' && backendBlacklist) {
+    return backendBlacklist.ok ? '全网无包(后台)' : '全网无包提交失败';
+  }
+  if ((code === 'IAP_ONLY' || code === 'JAPANESE_PACKAGE') && backendBlacklist) {
+    return backendBlacklist.ok ? '已加黑(后台)' : '加黑提交失败';
+  }
+  if (launch.code === 'APP_CRASHED') return '包体闪退';
+  if (code === 'NO_ADS_OR_IAP') {
+    if (install.code === 'DOWNLOAD_STARTED') return '后台下载中';
+    if (install.code === 'DOWNLOAD_DEFERRED') return '待补下载';
+    if (install.code === 'DOWNLOAD_PAUSED') return '下载已暂停';
+    if (install.code && install.ok === false) return '下载失败';
+    if (!launch.code || launch.ok === true) return '待人工检查';
+  }
+  if (launch.ok === true) return '启动正常';
+  if (launch.code) return '需人工确认';
+  if (install.code === 'INSTALLED' || install.code === 'APKCOMBO_INSTALLED') return '已下载';
+  if (install.code === 'ALREADY_INSTALLED') return '已安装';
+  if (install.code && !install.ok) return '下载失败';
+  return ({
+    HAS_ADS:'含广告，可继续', GOOGLE_NO_PACKAGE:'google无包', ALL_NETWORK_NO_PACKAGE:'全网无包', APKCOMBO_AVAILABLE:'APKCombo有包', APKCOMBO_CHECK_FAILED:'APKCombo待确认', IAP_ONLY:'加黑', JAPANESE_PACKAGE:'日本包体，加黑', NO_ADS_OR_IAP:'待人工检查',
+    DEVICE_UNSUPPORTED:'设备不支持', COUNTRY_UNSUPPORTED:'地区不支持',
+    NO_DEVICE:'设备未连接', OPEN_FAILED:'页面打开失败', UNKNOWN:'人工确认',
+  })[code] || code;
+}
+
+function formatPrecheckResult(result) {
+  const lines = [
+    `包名：${result.package_name || ''}`,
+    `结论：${result.title || result.code || ''}`,
+    `建议：${result.detail || ''}`,
+    `识别方式：${result.source || '—'}`,
+  ];
+  if (result.evidence && result.evidence.length) {
+    lines.push('', '判断依据：', ...result.evidence.map(item => '- ' + item));
+  }
+  if (result.install_result) {
+    lines.push('', '自动下载：', `- 状态：${result.install_result.code || ''}`, `- 结果：${result.install_result.message || ''}`);
+  }
+  if (result.launch_result) {
+    lines.push('', '启动预检：', `- 状态：${result.launch_result.code || ''}`, `- 结果：${result.launch_result.message || ''}`);
+    if (result.launch_result.summary) lines.push('- 崩溃摘要：', result.launch_result.summary);
+  }
+  if (result.asana_comment && result.asana_comment.attempted) {
+    lines.push('', 'Asana：' + (result.asana_comment.message || '已处理'));
+  }
+  if (result.backend_blacklist) {
+    lines.push('', '后台提交：', `- 状态：${result.backend_blacklist.code || ''}`, `- 结果：${result.backend_blacklist.message || ''}`);
+  }
+  if (result.visible_texts && result.visible_texts.length) {
+    lines.push('', '页面识别文字：', ...result.visible_texts.map(item => '- ' + item));
+  }
+  return lines.join('\n');
+}
+
+async function runOneWebPrecheck(value, task, autoInstall, options) {
+  const response = await precheckRequest('play_precheck', {
+    value,
+    auto_install: autoInstall,
+    launch_check: options.launchCheck,
+    observation_seconds: options.observation,
+    task_gid: task ? task.gid : '',
+    asana_pat: options.asanaPat,
+    backend_api_url: $('automationApiUrl').value.trim(),
+    backend_x_token: $('automationXToken').value.trim(),
+    backend_token: $('automationFixedToken').value.trim(),
+    backend_user_name: $('automationUserName').value.trim() || 'rain',
+    force_apkcombo: !!task && task.workflow_status === 'APKCombo有包',
+  });
+  $('precheckResult').textContent = formatPrecheckResult(response.result);
+  return response.result;
+}
+
+async function startSinglePrecheck() {
+  if (precheckBatchRunning) return;
+  const value = $('precheckValue').value.trim();
+  if (!value) { setPrecheckStatus('请输入 GP 链接或包名', 'error'); return; }
+  let options;
+  try { options = precheckOptions(); } catch (error) { setPrecheckStatus(error.message, 'error'); return; }
+  savePrecheckSettings();
+  const selected = precheckTasks[selectedPrecheckIndex];
+  const task = selected && precheckPackage(value) === selected.package_name ? selected : null;
+  $('btnSinglePrecheck').disabled = true;
+  setPrecheckStatus('正在执行页面预检...', 'busy');
+  try {
+    const result = await runOneWebPrecheck(value, task, options.autoInstall, options);
+    if (task) updatePrecheckTask(selectedPrecheckIndex, precheckTaskStatus(result));
+    const comment = result.asana_comment || {};
+    const backendBlacklist = result.backend_blacklist || null;
+    if (backendBlacklist && !backendBlacklist.ok) {
+      setPrecheckStatus('预检完成，但后台提交失败：' + (backendBlacklist.message || backendBlacklist.code || ''), 'error');
+    } else if (comment.message && comment.message.startsWith('Asana 评论失败')) {
+      setPrecheckStatus(comment.message, 'error');
+    } else {
+      setPrecheckStatus(backendBlacklist?.ok ? '预检完成，后台提交及缓存刷新成功' : '预检完成', 'ok');
+    }
+  } catch (error) {
+    setPrecheckStatus('预检失败: ' + error.message, 'error');
+  } finally {
+    $('btnSinglePrecheck').disabled = false;
+  }
+}
+
+function stopBatchPrecheck() {
+  if (!precheckBatchRunning) return;
+  precheckStopRequested = true;
+  setPrecheckStatus('将在当前任务结束后停止...', 'busy');
+}
+
+function delay(milliseconds) { return new Promise(resolve => setTimeout(resolve, milliseconds)); }
+
+async function startBatchPrecheck() {
+  if (precheckBatchRunning) return;
+  const selectedTask = precheckTasks[selectedPrecheckIndex];
+  const manualOldStart = precheckManualSelection && selectedTask && !selectedTask._incrementalNew;
+  const queue = precheckTasks.map((task, index) => ({task, index})).filter(item => {
+    if (item.task.completed || item.task.workflow_terminal) return false;
+    if (manualOldStart) return item.index >= selectedPrecheckIndex;
+    return item.task._incrementalNew && (
+      item.task._status === '新增待预检' || item.task.workflow_status === 'APKCombo有包'
+    );
+  });
+  if (!queue.length) { setPrecheckStatus('本次读取没有新增待预检任务', 'error'); return; }
+  let options;
+  try { options = precheckOptions(); } catch (error) { setPrecheckStatus(error.message, 'error'); return; }
+  savePrecheckSettings();
+  precheckBatchRunning = true;
+  precheckStopRequested = false;
+  $('btnBatchPrecheck').disabled = true;
+  $('btnSinglePrecheck').disabled = true;
+  $('btnLoadToday').disabled = true;
+  $('btnStopPrecheck').disabled = false;
+  let processed = 0, newDownloads = 0, downloadedTotal = 0;
+  let downloadsPaused = false, commentFailures = 0, backendBlacklistFailures = 0;
+  const deferredDownloads = [];
+  try {
+    for (const item of queue) {
+      if (precheckStopRequested) break;
+      selectPrecheckTask(item.index, false);
+      updatePrecheckTask(item.index, '检查中');
+      setPrecheckStatus(`正在检查 ${processed + 1}/${queue.length}：${item.task.package_name}`, 'busy');
+      const canAutoInstall = options.autoInstall && !downloadsPaused && newDownloads < options.limit;
+      let result;
+      try {
+        result = await runOneWebPrecheck(item.task.gp_link || item.task.package_name, item.task, canAutoInstall, options);
+      } catch (error) {
+        updatePrecheckTask(item.index, '执行失败');
+        setPrecheckStatus(`任务失败：${error.message}`, 'error');
+        processed += 1;
+        continue;
+      }
+      const commentFailed = (result.asana_comment || {}).message?.startsWith('Asana 评论失败');
+      if (result.backend_blacklist && !result.backend_blacklist.ok) backendBlacklistFailures += 1;
+      if (commentFailed) {
+        commentFailures += 1;
+        updatePrecheckTask(item.index, '评论失败');
+      } else if (options.autoInstall && result.continue_adaptation === true && !canAutoInstall) {
+        if (downloadsPaused) {
+          updatePrecheckTask(item.index, '下载已暂停');
+        } else {
+          deferredDownloads.push(item);
+          updatePrecheckTask(item.index, '待补下载');
+        }
+      } else {
+        updatePrecheckTask(item.index, precheckTaskStatus(result));
+      }
+      const install = result.install_result || {};
+      if (install.code === 'INSTALLED') {
+        newDownloads += 1;
+        downloadedTotal += 1;
+      }
+      else if (install.code && install.ok === false) downloadsPaused = true;
+      processed += 1;
+      if (result.code === 'NO_DEVICE') break;
+      if (install.code === 'INSTALLED' && options.cooldown > 0 && processed < queue.length) {
+        let remaining = options.cooldown;
+        while (remaining > 0 && !precheckStopRequested) {
+          setPrecheckStatus(`安装冷却中，${remaining} 秒后继续...`, 'busy');
+          const step = Math.min(5, remaining);
+          await delay(step * 1000);
+          remaining -= step;
+        }
+      }
+    }
+
+    if (deferredDownloads.length && !precheckStopRequested && !downloadsPaused) {
+      newDownloads = 0;
+      for (let deferredIndex = 0; deferredIndex < deferredDownloads.length; deferredIndex += 1) {
+        if (precheckStopRequested || downloadsPaused) break;
+        const item = deferredDownloads[deferredIndex];
+        selectPrecheckTask(item.index);
+        updatePrecheckTask(item.index, '补下载中');
+        setPrecheckStatus(`页面预检已完成，正在补下载 ${deferredIndex + 1}/${deferredDownloads.length}：${item.task.package_name}`, 'busy');
+        let result;
+        try {
+          result = await runOneWebPrecheck(
+            item.task.gp_link || item.task.package_name,
+            item.task,
+            true,
+            options,
+          );
+        } catch (error) {
+          updatePrecheckTask(item.index, '补下载失败');
+          downloadsPaused = true;
+          setPrecheckStatus(`补下载失败：${error.message}`, 'error');
+          break;
+        }
+
+        const commentFailed = (result.asana_comment || {}).message?.startsWith('Asana 评论失败');
+        if (commentFailed) {
+          commentFailures += 1;
+          updatePrecheckTask(item.index, '评论失败');
+        } else {
+          updatePrecheckTask(item.index, precheckTaskStatus(result));
+        }
+        const install = result.install_result || {};
+        if (install.code === 'INSTALLED') {
+          newDownloads += 1;
+          downloadedTotal += 1;
+        } else if (install.code && install.ok === false) {
+          downloadsPaused = true;
+        }
+
+        if (downloadsPaused) {
+          for (const pending of deferredDownloads.slice(deferredIndex + 1)) {
+            updatePrecheckTask(pending.index, '下载已暂停');
+          }
+          break;
+        }
+        if (newDownloads >= options.limit) newDownloads = 0;
+        if (install.code === 'INSTALLED' && options.cooldown > 0 && deferredIndex + 1 < deferredDownloads.length) {
+          let remaining = options.cooldown;
+          while (remaining > 0 && !precheckStopRequested) {
+            setPrecheckStatus(`补下载冷却中，${remaining} 秒后继续...`, 'busy');
+            const step = Math.min(5, remaining);
+            await delay(step * 1000);
+            remaining -= step;
+          }
+        }
+      }
+    }
+
+    const finalText = precheckStopRequested
+      ? `已停止，完成 ${processed}/${queue.length}`
+      : `批量预检完成，共处理 ${processed} 个任务，新增下载 ${downloadedTotal} 个${downloadsPaused ? '，后续下载已暂停' : ''}${backendBlacklistFailures ? `，${backendBlacklistFailures} 个后台提交失败` : ''}${commentFailures ? `，${commentFailures} 条 Asana 评论失败` : ''}`;
+    setPrecheckStatus(finalText, precheckStopRequested ? 'busy' : ((commentFailures || backendBlacklistFailures) ? 'error' : 'ok'));
+  } finally {
+    precheckBatchRunning = false;
+    precheckStopRequested = false;
+    $('btnBatchPrecheck').disabled = false;
+    $('btnSinglePrecheck').disabled = false;
+    $('btnLoadToday').disabled = false;
+    $('btnStopPrecheck').disabled = true;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 聚合自动化适配（独立于原手动按钮）
+// ═══════════════════════════════════════════════════════════════════
+
+function setAutomationStatus(text, kind='') {
+  const el = $('automationStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'precheck-status' + (kind ? ' ' + kind : '');
+}
+
+function appendAutomationResult(text) {
+  const el = $('automationResult');
+  if (!el) return;
+  if (el.textContent === '等待执行') el.textContent = '';
+  el.textContent += (el.textContent ? '\n' : '') + '[' + new Date().toLocaleTimeString() + '] ' + text;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setAutomationRunning(running) {
+  automationRunning = running;
+  $('btnAutomationRun').disabled = running;
+  $('btnAutomationStop').disabled = !running;
+}
+
+function automationRequest(type, payload={}) {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      reject(new Error('本地代理未连接'));
+      return;
+    }
+    const requestId = (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : Date.now() + '-' + Math.random().toString(16).slice(2);
+    automationRequests.set(requestId, {resolve, reject});
+    send({type, request_id: requestId, ...payload});
+    setTimeout(() => {
+      const pending = automationRequests.get(requestId);
+      if (!pending) return;
+      automationRequests.delete(requestId);
+      pending.reject(new Error('自动化步骤等待响应超时'));
+    }, (type === 'automation_replay' || type === 'cp_candidate_assign') ? 650000 : 150000);
+  });
+}
+
+function resolveAutomationRequest(message) {
+  const pending = automationRequests.get(message.request_id);
+  if (!pending) return;
+  automationRequests.delete(message.request_id);
+  pending.resolve(message);
+}
+
+let cpCandidates = [];
+
+function setCpCandidateStatus(text, state='') {
+  const el = $('cpCandidateStatus');
+  el.textContent = text;
+  el.className = 'precheck-status' + (state ? ' ' + state : '');
+}
+
+function renderCpCandidates() {
+  const body = $('cpCandidateBody');
+  if (!cpCandidates.length) {
+    body.innerHTML = '<tr><td colspan="5">没有可供选择的未分配 CP</td></tr>';
+    return;
+  }
+  body.innerHTML = cpCandidates.map((item, index) => `
+    <tr>
+      <td><input type="checkbox" data-cp-index="${index}" ${item.selected ? 'checked' : ''}></td>
+      <td>${Number(item.score || 0)}%</td>
+      <td class="mono">${esc(item.package_name || '')}</td>
+      <td>${esc(item.category || '')}</td>
+      <td>${esc(item.reason || '')}</td>
+    </tr>
+  `).join('');
+  body.querySelectorAll('input[data-cp-index]').forEach(input => {
+    input.addEventListener('change', event => {
+      cpCandidates[Number(event.target.dataset.cpIndex)].selected = event.target.checked;
+    });
+  });
+}
+
+function cpCandidateCredentials() {
+  return {
+    api_url: $('automationApiUrl').value.trim(),
+    x_token: $('automationXToken').value.trim(),
+    token: $('automationFixedToken').value.trim(),
+  };
+}
+
+async function previewCpCandidates() {
+  const button = $('btnCpCandidatePreview');
+  const credentials = cpCandidateCredentials();
+  if (!credentials.api_url || !credentials.x_token || !credentials.token) {
+    setCpCandidateStatus('请先填写本页后台接口、X-Token 和固定 token', 'error');
+    return;
+  }
+  button.disabled = true;
+  setCpCandidateStatus('正在读取后台候选数据...', 'busy');
+  try {
+    const result = await automationRequest('cp_candidate_preview', credentials);
+    if (!result.ok) throw new Error(result.error || '候选读取失败');
+    cpCandidates = (result.candidates || []).map(item => ({
+      ...item,
+      selected: Boolean(item.recommended),
+    }));
+    renderCpCandidates();
+    setCpCandidateStatus(
+      `未分配 ${result.unassigned_count || 0} 条，默认推荐 ${result.recommended_count || 0} 条`,
+      'ok'
+    );
+  } catch (error) {
+    setCpCandidateStatus('读取失败：' + error.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function selectRecommendedCpCandidates() {
+  cpCandidates.forEach(item => { item.selected = Boolean(item.recommended); });
+  renderCpCandidates();
+}
+
+function clearCpCandidateSelection() {
+  cpCandidates.forEach(item => { item.selected = false; });
+  renderCpCandidates();
+}
+
+async function assignSelectedCpCandidates() {
+  const packages = cpCandidates.filter(item => item.selected).map(item => item.package_name);
+  if (!packages.length) {
+    setCpCandidateStatus('请至少勾选一个包体', 'error');
+    return;
+  }
+  if (!window.confirm(`确定把 ${packages.length} 个包体分配给 rain 吗？`)) return;
+  const button = $('btnCpCandidateAssign');
+  button.disabled = true;
+  setCpCandidateStatus('正在分配并回读确认...', 'busy');
+  try {
+    const result = await automationRequest('cp_candidate_assign', {
+      ...cpCandidateCredentials(),
+      package_names: packages,
+    });
+    if (!result.results) throw new Error(result.error || '批量分配失败');
+    const failed = (result.results || []).filter(item => !item.ok);
+    const succeeded = new Set(
+      (result.results || []).filter(item => item.ok).map(item => item.package_name)
+    );
+    cpCandidates = cpCandidates.filter(item => !succeeded.has(item.package_name));
+    renderCpCandidates();
+    setCpCandidateStatus(
+      `分配完成：成功 ${result.success_count || 0}，失败 ${result.failure_count || 0}`,
+      failed.length ? 'error' : 'ok'
+    );
+    failed.forEach(item => appendAutomationResult(
+      `${item.package_name} 分配失败：${item.error || '未知错误'}`
+    ));
+  } catch (error) {
+    setCpCandidateStatus('分配失败：' + error.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function automationUseSelectedTask() {
+  const task = precheckTasks[selectedPrecheckIndex];
+  if (!task) {
+    setAutomationStatus('请先在页面预检中选择任务', 'error');
+    return;
+  }
+  clearAutomationDetectedFields();
+  $('automationTaskGid').value = task.gid || '';
+  $('automationPackage').value = task.package_name || '';
+  $('automationAppId').value = task.up2_appid || '';
+  automationTaskNotes = task.notes || '';
+  setAutomationStatus('任务已带入', 'ok');
+  appendAutomationResult('已带入任务：' + (task.package_name || ''));
+}
+
+async function automationExtractFields() {
+  if (automationRunning) return {ok:false, code:'AUTOMATION_RUNNING'};
+  const packageName = $('automationPackage').value.trim();
+  const taskGid = $('automationTaskGid').value.trim();
+  const asanaPat = $('precheckAsanaPat').value.trim();
+  if (!packageName) {
+    setAutomationStatus('缺少包名', 'error');
+    return {ok:false, code:'PACKAGE_MISSING'};
+  }
+  clearAutomationDetectedFields('正在提取当前应用参数...');
+  const contextVersion = automationContextVersion;
+  setAutomationRunning(true);
+  setAutomationStatus('正在提取聚合参数...', 'busy');
+  try {
+    const result = await automationRequest('automation_extract_fields', {
+      package_name:packageName, task_gid:taskGid, asana_pat:asanaPat,
+    });
+    if (contextVersion !== automationContextVersion) {
+      appendAutomationResult('已丢弃上一应用延迟返回的聚合参数');
+      return {ok:false, code:'STALE_AUTOMATION_RESULT'};
+    }
+    const data = result.fields || {};
+    automationFieldData = data;
+    automationAssessment = result.assessment || null;
+    renderAutomationFields(data, automationAssessment);
+    appendAutomationResult(result.message || result.code || '聚合参数提取结束');
+    if (!result.ok) {
+      if (result.code === 'UNSUPPORTED_ATTRIBUTION') {
+        const finalized = await automationFinalizeUnsupportedAttribution(
+          result.message || '未知归因，暂不适配'
+        );
+        result.unsupported_finalized = true;
+        result.unsupported_finalize_ok = finalized;
+        return result;
+      }
+      if (selectedPrecheckIndex >= 0) {
+        updatePrecheckTask(
+          selectedPrecheckIndex,
+          '自动化失败'
+        );
+      }
+      setAutomationStatus(
+        ['AGGREGATION_TYPE_EMPTY','AGGREGATION_RESULT_INCOMPLETE','AF_KEY_EMPTY','AD_IDS_EMPTY','UNSUPPORTED_ATTRIBUTION'].includes(result.code)
+          ? (result.message || '必要参数识别为空')
+          : '参数提取失败',
+        'error'
+      );
+      return result;
+    }
+    if (
+      automationAssessment
+      && automationAssessment.confidence === '高'
+      && automationAssessment.auto_submit
+    ) {
+      appendAutomationResult('高置信度且参数校验通过，自动继续回填 → 提交 → 回放');
+      result.auto_continued = true;
+      result.auto_continue_ok = await automationExecutePostDetection();
+      return result;
+    }
+    setAutomationStatus('参数待人工校对', 'busy');
+    return result;
+  } catch (error) {
+    appendAutomationResult('聚合参数提取失败：' + error.message);
+    setAutomationStatus('参数提取失败', 'error');
+    return {ok:false, code:'AGGREGATION_DETECTION_FAILED', error:error.message};
+  } finally {
+    setAutomationRunning(false);
+  }
+}
+
+function automationHasAggregationType(data) {
+  const value = String((data || {})['最终判断'] || '').trim().toLowerCase();
+  const missing = new Set(['', '未找到', '未提取到', '未知', '无', '-', 'n/a', 'na', 'none', 'null', 'undefined', 'unknown']);
+  return !missing.has(value);
+}
+
+function automationCleanDetectedValue(value) {
+  const cleaned = String(value || '').trim();
+  const missing = new Set(['', '未找到', '未提取到', '未知', '无', '-', 'n/a', 'na', 'none', 'null', 'undefined', 'unknown']);
+  return missing.has(cleaned.toLowerCase()) ? '' : cleaned;
+}
+
+function automationGetAfKey(data) {
+  const direct = automationCleanDetectedValue((data || {}).af_key);
+  if (direct) return direct;
+  for (const sdk of ((data || {})['SDK列表'] || [])) {
+    if (String(sdk['名称'] || '').replace(/\s/g, '').toLowerCase() === 'appsflyer') {
+      const key = automationCleanDetectedValue(sdk.key);
+      if (key) return key;
+    }
+  }
+  return '';
+}
+
+function automationGetAdId(data, fieldName) {
+  const value = automationCleanDetectedValue((data || {})[fieldName]);
+  const first = value ? value.split(',', 1)[0].trim() : '';
+  const labels = new Set(['video','reward','rewarded','rewarded_video','inter','interstitial']);
+  if (!labels.has(first.toLowerCase())) return first;
+  const verdict = automationCleanDetectedValue((data || {})['最终判断']).toLowerCase();
+  const ironFamily = verdict.includes('ironsource') || verdict.includes('levelplay');
+  const validSymbol = (fieldName === '激励视频聚合id' && first.toLowerCase() === 'video')
+    || (fieldName === '插屏聚合id' && first.toLowerCase() === 'inter');
+  return ironFamily && validSymbol ? first : '';
+}
+
+function automationDetectionIssue(data) {
+  if (!automationHasAggregationType(data)) {
+    const hasAdId = automationGetAdId(data, '插屏聚合id') || automationGetAdId(data, '激励视频聚合id');
+    const hasMediationKey = ((data || {})['SDK列表'] || []).some(sdk => {
+      const name = String(sdk['名称'] || '').replace(/\s/g, '').toLowerCase();
+      const key = automationCleanDetectedValue(sdk.key);
+      return key && ['applovin','max','ironsource','levelplay','admob','unityads'].some(token => name.includes(token));
+    });
+    if (hasAdId || hasMediationKey) {
+      return {code:'AGGREGATION_RESULT_INCOMPLETE', message:'已检测到聚合参数，但综合检测结果未完整输出，需要人工确认'};
+    }
+    return {code:'AGGREGATION_TYPE_EMPTY', message:'聚合类型识别为空'};
+  }
+  const attribution = automationCleanDetectedValue((data || {})['归因平台']).replace(/\s/g, '').toLowerCase();
+  if (!attribution.includes('adjust') && !attribution.includes('appsflyer')) {
+    const display = automationCleanDetectedValue((data || {})['归因平台']) || '未知';
+    return {code:'UNSUPPORTED_ATTRIBUTION', message:display + '归因，暂不适配'};
+  }
+  if (attribution.includes('appsflyer') && !automationGetAfKey(data)) {
+    return {code:'AF_KEY_EMPTY', message:'af_key为空，再次确认'};
+  }
+  if (!automationGetAdId(data, '插屏聚合id') && !automationGetAdId(data, '激励视频聚合id')) {
+    return {code:'AD_IDS_EMPTY', message:'插屏聚合id和激励视频聚合id均为空，再次确认'};
+  }
+  return null;
+}
+
+function renderAutomationFields(data, assessment=null) {
+  const el = $('automationFields');
+  if (!el || !data || !data.ok) return;
+  const lines = [
+    '最终判断:' + (data['最终判断'] || ''),
+    '识别方式:' + ((assessment || {}).method || '待评估'),
+    '识别置信度:' + ((assessment || {}).confidence || '待评估'),
+    '识别依据:' + (((assessment || {}).evidence || []).join('；')),
+    '自动提交策略:' + ((assessment || {}).policy || '禁止自动提交'),
+    '初始Activity:' + (data['初始Activity'] || ''),
+  ];
+  for (const sdk of (data['SDK列表'] || [])) {
+    lines.push((sdk['名称'] || '未知') + ' SDK Key:' + (sdk['key'] || ''));
+  }
+  lines.push('应用类型:' + (data['应用类型'] || ''));
+  lines.push('激励视频聚合id:' + (data['激励视频聚合id'] || ''));
+  lines.push('插屏聚合id:' + (data['插屏聚合id'] || ''));
+  lines.push('归因平台:' + (data['归因平台'] || ''));
+  el.textContent = lines.join('\n');
+  const confidence = (assessment || {}).confidence || '低';
+  const policy = (assessment || {}).policy || '禁止自动提交';
+  setAutomationStatus(confidence + '置信度 · ' + policy, (assessment || {}).auto_submit ? 'ok' : 'error');
+}
+
+function clearAutomationDetectedFields(message='尚未提取当前应用聚合参数') {
+  automationContextVersion += 1;
+  automationFieldData = null;
+  automationAssessment = null;
+  const el = $('automationFields');
+  if (el) el.textContent = message;
+}
+
+async function automationFinalizeUnsupportedAttribution(message) {
+  appendAutomationResult('[归因暂不适配 1/2] 回填 Asana 聚合参数描述');
+  const fill = await automationFillAsana({allowUnsupportedAttribution:true});
+  if (!fill.ok) return false;
+  appendAutomationResult('[归因暂不适配 2/2] 提交后台、清缓存并回读校验');
+  const submit = await automationSubmitBackend({allowUnsupportedAttribution:true});
+  if (!submit.ok) return false;
+  appendAutomationResult(message + '；参数已提交并清除缓存，按规则跳过聚合回放');
+  if (selectedPrecheckIndex >= 0) updatePrecheckTask(selectedPrecheckIndex, '归因暂不适配');
+  setAutomationStatus('归因暂不适配', 'busy');
+  return true;
+}
+
+function automationPayload({allowUnsupportedAttribution=false} = {}) {
+  if (!automationFieldData || !automationFieldData.ok) throw new Error('请先提取并校对聚合参数');
+  const detectionIssue = automationDetectionIssue(automationFieldData);
+  if (detectionIssue && !(allowUnsupportedAttribution && detectionIssue.code === 'UNSUPPORTED_ATTRIBUTION')) {
+    throw new Error(detectionIssue.message + '，自动化流程已终止');
+  }
+  const taskGid = $('automationTaskGid').value.trim();
+  const packageName = $('automationPackage').value.trim();
+  const asanaPat = $('precheckAsanaPat').value.trim();
+  if (!taskGid) throw new Error('缺少 Asana Task GID');
+  if (!packageName) throw new Error('缺少包名');
+  if (!asanaPat) throw new Error('请先在页面预检中填写 Asana PAT');
+  const timeout = Number($('automationTimeout').value);
+  if (!Number.isInteger(timeout) || timeout < 10 || timeout > 600) {
+    throw new Error('回放监听时间需为 10-600 秒');
+  }
+  return {taskGid, packageName, asanaPat, timeout};
+}
+
+async function automationFillAsana({allowUnsupportedAttribution=false} = {}) {
+  try {
+    const p = automationPayload({allowUnsupportedAttribution});
+    setAutomationStatus('正在回填 Asana...', 'busy');
+    const result = await automationRequest('automation_asana_fill', {
+      task_gid:p.taskGid, asana_pat:p.asanaPat,
+      existing_notes:automationTaskNotes, fields:automationFieldData,
+      allow_unsupported_attribution:allowUnsupportedAttribution,
+    });
+    if (!result.ok) throw new Error(result.error || result.message || 'Asana 回填失败');
+    automationTaskNotes = result.notes || automationTaskNotes;
+    appendAutomationResult(result.message || 'Asana 回填完成');
+    setAutomationStatus('Asana 回填完成', 'ok');
+    return result;
+  } catch (error) {
+    appendAutomationResult('Asana 回填失败：' + error.message);
+    setAutomationStatus('Asana 回填失败', 'error');
+    return {ok:false, error:error.message};
+  }
+}
+
+async function automationSubmitBackend({allowUnsupportedAttribution=false} = {}) {
+  try {
+    const p = automationPayload({allowUnsupportedAttribution});
+    const apiUrl = $('automationApiUrl').value.trim();
+    const xToken = $('automationXToken').value.trim();
+    const fixedToken = $('automationFixedToken').value.trim();
+    const userName = $('automationUserName').value.trim() || 'rain';
+    if (!apiUrl || !xToken || !fixedToken) throw new Error('请填写后台接口、X-Token 和固定 token');
+    setAutomationStatus('正在提交、清缓存并回读验证...', 'busy');
+    const result = await automationRequest('automation_backend_submit', {
+      task_gid:p.taskGid, asana_pat:p.asanaPat,
+      package_name:p.packageName, fields:automationFieldData,
+      api_url:apiUrl, x_token:xToken, token:fixedToken, user_name:userName,
+      allow_unsupported_attribution:allowUnsupportedAttribution,
+    });
+    appendAutomationResult(result.message || result.error || result.code || '后台步骤结束');
+    if (!result.ok) throw new Error(result.error || result.message || '后台自动提交失败');
+    setAutomationStatus('后台回读校验通过', 'ok');
+    return result;
+  } catch (error) {
+    setAutomationStatus('后台提交失败', 'error');
+    return {ok:false, error:error.message};
+  }
+}
+
+function formatAutomationReplay(result) {
+  const line = (label, state) => {
+    if (!state || !state.required) return label + '：未配置，不要求验证';
+    return label + '：' + (state.displayed ? '✅ 回放成功' : '❌ 未检测到真实展示')
+      + ((state.errors || []).length ? '；' + state.errors.join('；') : '');
+  };
+  return [
+    result.message || result.code || '',
+    line('插屏广告', result.interstitial),
+    line('激励视频', result.rewarded),
+  ].join('\n');
+}
+
+async function automationReplay() {
+  try {
+    const p = automationPayload();
+    setAutomationRunning(true);
+    setAutomationStatus('准备聚合回放检测...', 'busy');
+    const result = await automationRequest('automation_replay', {
+      task_gid:p.taskGid, asana_pat:p.asanaPat,
+      package_name:p.packageName, timeout_seconds:p.timeout,
+      interstitial_ids:automationFieldData['插屏聚合id'] || '',
+      rewarded_ids:automationFieldData['激励视频聚合id'] || '',
+      aggregation_verdict:automationFieldData['最终判断'] || '',
+    });
+    appendAutomationResult(formatAutomationReplay(result));
+    if (!result.ok) {
+      if (selectedPrecheckIndex >= 0) updatePrecheckTask(selectedPrecheckIndex, '自动化失败');
+      setAutomationStatus('自动化失败', 'error');
+      return result;
+    }
+    if (selectedPrecheckIndex >= 0) updatePrecheckTask(selectedPrecheckIndex, '聚合适配成功');
+    setAutomationStatus('聚合适配成功', 'ok');
+    return result;
+  } catch (error) {
+    appendAutomationResult('回放检测失败：' + error.message);
+    setAutomationStatus('自动化失败', 'error');
+    return {ok:false, error:error.message};
+  } finally {
+    setAutomationRunning(false);
+  }
+}
+
+async function automationExecutePostDetection() {
+  appendAutomationResult('[1/3] 回填 Asana 描述');
+  const fill = await automationFillAsana();
+  if (!fill.ok) return false;
+  appendAutomationResult('[2/3] 自动提交适配后台');
+  const submit = await automationSubmitBackend();
+  if (!submit.ok) return false;
+  appendAutomationResult('[3/3] 重启应用并检测聚合广告回放');
+  const replay = await automationReplay();
+  return !!replay.ok;
+}
+
+async function automationRunAll() {
+  if (automationRunning) return;
+  let fieldIssue = automationFieldData ? automationDetectionIssue(automationFieldData) : {code:'FIELDS_MISSING'};
+  let unsupportedAttribution = !!(fieldIssue && fieldIssue.code === 'UNSUPPORTED_ATTRIBUTION');
+  if (!automationFieldData || fieldIssue) {
+    if (automationFieldData && automationFieldData._aggregation_retry_exhausted) {
+      setAutomationStatus(fieldIssue.message || '必要参数识别为空', 'error');
+      appendAutomationResult((fieldIssue.message || '必要参数识别为空') + '，已经过两次检测，自动化流程终止');
+      return;
+    }
+    if (!unsupportedAttribution) {
+      appendAutomationResult('[0/3] 检查聚合类型，必要时重启游戏复检');
+      const detection = await automationExtractFields();
+      if (!detection) return;
+      if (detection.unsupported_finalized) return;
+      if (detection.auto_continued) return;
+      fieldIssue = automationFieldData ? automationDetectionIssue(automationFieldData) : null;
+      unsupportedAttribution = !!(fieldIssue && fieldIssue.code === 'UNSUPPORTED_ATTRIBUTION');
+      if (!detection.ok && !unsupportedAttribution) return;
+    }
+  }
+  setAutomationRunning(true);
+  $('automationResult').textContent = '';
+  try {
+    if (unsupportedAttribution) {
+      const message = fieldIssue.message || '非白名单归因，暂不适配';
+      appendAutomationResult('[归因暂不适配 1/2] 回填 Asana 聚合参数描述');
+      const fill = await automationFillAsana({allowUnsupportedAttribution:true});
+      if (!fill.ok) return;
+      appendAutomationResult('[归因暂不适配 2/2] 提交后台、清缓存并回读校验');
+      const submit = await automationSubmitBackend({allowUnsupportedAttribution:true});
+      if (!submit.ok) return;
+      appendAutomationResult(message + '；参数已提交并清除缓存，按规则跳过聚合回放');
+      if (selectedPrecheckIndex >= 0) updatePrecheckTask(selectedPrecheckIndex, '归因暂不适配');
+      setAutomationStatus('归因暂不适配', 'busy');
+      return;
+    }
+    await automationExecutePostDetection();
+  } finally {
+    setAutomationRunning(false);
+  }
+}
+
+function automationStop() {
+  if (!automationRunning) return;
+  send({type:'automation_stop'});
+  setAutomationStatus('正在停止...', 'busy');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ASANA DAILY SUMMARY
+// ═══════════════════════════════════════════════════════════════════
+
+function setDailySummaryStatus(text, kind='') {
+  const el = $('dailySummaryStatus');
+  el.textContent = text;
+  el.className = 'precheck-status' + (kind ? ' ' + kind : '');
+}
+
+async function generateDailySummary() {
+  const projectGid = $('precheckProjectGid').value.trim();
+  const asanaPat = $('precheckAsanaPat').value.trim();
+  const targetDate = $('dailySummaryDate').value;
+  if (!projectGid || !asanaPat) {
+    setDailySummaryStatus('请先在页面预检中填写项目 GID 和 Asana PAT', 'error');
+    return;
+  }
+  if (!targetDate) {
+    setDailySummaryStatus('请选择日期', 'error');
+    return;
+  }
+  const button = $('btnDailySummary');
+  button.disabled = true;
+  setDailySummaryStatus('正在读取 Asana 评论...', 'busy');
+  try {
+    const result = await precheckRequest('daily_summary_generate', {
+      project_gid:projectGid, asana_pat:asanaPat, date:targetDate,
+    });
+    $('dailySummaryText').value = result.text || '';
+    setDailySummaryStatus(
+      `${result.section_name || ''} · ${result.task_count || 0} 个任务 · ${result.comment_count || 0} 条当日评论`,
+      'ok'
+    );
+  } catch (error) {
+    setDailySummaryStatus('生成失败：' + error.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function copyDailySummary() {
+  const text = $('dailySummaryText').value.trim();
+  if (!text) {
+    setDailySummaryStatus('请先生成总结', 'error');
+    return;
+  }
+  navigator.clipboard.writeText(text).then(() => {
+    setDailySummaryStatus('总结已复制', 'ok');
+  }).catch(() => setDailySummaryStatus('复制失败', 'error'));
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════════════════════════
 
+$('precheckProjectGid').value = localStorage.getItem('apkToolPrecheckProjectGid') || '1215092379542969';
+$('automationApiUrl').value = localStorage.getItem('apkToolAutomationApiUrl') || $('automationApiUrl').value;
+$('automationUserName').value = localStorage.getItem('apkToolAutomationUserName') || 'rain';
+$('automationApiUrl').addEventListener('change', () => localStorage.setItem('apkToolAutomationApiUrl', $('automationApiUrl').value.trim()));
+$('automationUserName').addEventListener('change', () => localStorage.setItem('apkToolAutomationUserName', $('automationUserName').value.trim()));
+{
+  const now = new Date();
+  const pad = value => String(value).padStart(2, '0');
+  $('dailySummaryDate').value = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
+}
 connect();
 </script>
 
@@ -1255,10 +2532,15 @@ function openBackendUrl() {
 
   const params = { change: '1', package_name: pkg };
 
-  const firstCsvValue = value => String(value || '').split(',', 1)[0].trim();
+  const missingValues = new Set(['未找到','未提取到','未知','无','-','n/a','na','none','null','undefined','unknown']);
+  const cleanParam = value => {
+    const cleaned = String(value || '').trim();
+    return missingValues.has(cleaned.toLowerCase()) ? '' : cleaned;
+  };
+  const firstCsvValue = value => cleanParam(String(value || '').split(',', 1)[0]);
 
   // 最终判断 → 聚合平台（映射到下拉框合法值）
-  const final = _fieldData['最终判断'] || '';
+  const final = cleanParam(_fieldData['最终判断']);
   const pm = final.match(/^([A-Za-z_]+)/);
   if (pm) {
     const raw = pm[1].toLowerCase();
@@ -1273,7 +2555,8 @@ function openBackendUrl() {
     'af_key': 'af_key'
   };
   for (const [k, v] of Object.entries(map)) {
-    if (_fieldData[k]) params[v] = _fieldData[k];
+    const value = cleanParam(_fieldData[k]);
+    if (value) params[v] = value;
   }
 
   const singleValueMap = {
@@ -1281,13 +2564,15 @@ function openBackendUrl() {
     '激励视频聚合id': 'aggr_jilishipin_id'
   };
   for (const [k, v] of Object.entries(singleValueMap)) {
-    if (_fieldData[k]) params[v] = firstCsvValue(_fieldData[k]);
+    const value = firstCsvValue(_fieldData[k]);
+    if (value) params[v] = value;
   }
 
   // AppLovin SDK Key
   (sdkList = _fieldData['SDK列表'] || []).forEach(sdk => {
-    if (sdk['名称'] === 'AppLovin' && sdk['key']) {
-      params.manual_applovin_sdk_key = sdk['key'];
+    const key = cleanParam(sdk['key']);
+    if (sdk['名称'] === 'AppLovin' && key) {
+      params.manual_applovin_sdk_key = key;
     }
   });
 

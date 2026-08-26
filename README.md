@@ -2,6 +2,8 @@
 
 安卓 ADB 适配工具 Web 端 —— 零安装，浏览器即可使用。
 
+近期迭代说明：[2026-08-04 ～ 2026-08-26 更新记录](UPDATE_NOTES_2026-08-04_TO_2026-08-26.md)
+
 ## 快速开始
 
 1. 下载 [APK Tool Proxy.dmg](download/APK-Tool-Proxy.dmg)
@@ -24,6 +26,11 @@
 - Logcat 实时日志监听（按 UID / 广告平台过滤）
 - 应用缓存清除、强制停止
 - APK 本地安装、URL 跳转、APKPure 搜索
+- Google Play 页面预检、APKCombo 兜底与安装结果验收
+- Asana 今日任务读取、状态恢复和批量处理
+- 聚合参数解析、后台接口提交、缓存刷新和结果校验
+- MAX、IronSource、LevelPlay、AdMob、TradPlus 广告回放验证
+- 自动化断点、设备体检、分层重试和结构化执行报告
 
 ## 故障排除
 
