@@ -138,6 +138,43 @@ class TestDeferredAutomationFailure:
             "自动化失败", "#e53935"
         )
 
+    def test_missing_package_is_requeued_without_failure_status(self):
+        from gui import APKToolApp
+
+        app = object.__new__(APKToolApp)
+        app._automation_task_outcome = ""
+        app._automation_last_result_code = ""
+        app._automation_last_result_message = ""
+        app._automation_deferred_failure = {"code": "OLD"}
+        app._automation_precheck_item_id = "item-1"
+        app._automation_current_package_name = MagicMock(
+            return_value="com.example.missing"
+        )
+        app._automation_set_status = MagicMock()
+        app._automation_log = MagicMock()
+        app._set_precheck_task_status = MagicMock()
+        app._automation_finish_report = MagicMock()
+        app._safe_after = lambda _delay, callback, *args: callback(*args)
+
+        app._automation_requeue_missing_package(
+            "未安装: com.example.missing"
+        )
+
+        assert app._automation_task_outcome == "requeued"
+        assert app._automation_last_result_code == "TARGET_APP_NOT_INSTALLED"
+        assert app._automation_deferred_failure is None
+        app._automation_set_status.assert_called_once_with(
+            "应用未安装，已退回待处理", "#ef6c00"
+        )
+        app._set_precheck_task_status.assert_called_once_with(
+            "item-1", "待处理"
+        )
+        app._automation_finish_report.assert_called_once_with(
+            "requeued",
+            "TARGET_APP_NOT_INSTALLED",
+            "未安装: com.example.missing；已退回待处理，等待重新下载安装",
+        )
+
     def test_batch_requeues_recoverable_failure_after_other_work(self):
         from types import SimpleNamespace
         from gui import APKToolApp
@@ -739,6 +776,67 @@ class TestGooglePlayPrecheckActions:
 
 
 class TestAutomationBatchActions:
+    def test_single_extract_requeues_missing_package_and_finishes_report(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp, AutomationTaskRequeued
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.automation_package_var.set("com.example.missing")
+                with patch("gui.threading.Thread", ImmediateThread), patch.object(
+                    app,
+                    "_automation_prepare_detection_sync",
+                    side_effect=AutomationTaskRequeued(
+                        "未安装: com.example.missing"
+                    ),
+                ), patch.object(
+                    app, "_automation_cleanup_current_app_sync"
+                ), patch.object(
+                    app, "_automation_mark_failed"
+                ) as mark_failed, patch.object(
+                    app, "_automation_finish_report"
+                ) as finish_report:
+                    app._automation_extract_fields()
+
+                mark_failed.assert_not_called()
+                finish_report.assert_called_once_with(
+                    "requeued",
+                    "TARGET_APP_NOT_INSTALLED",
+                    "未安装: com.example.missing；已退回待处理，等待重新下载安装",
+                )
+                assert app._automation_status.cget("text") == "应用未安装，已退回待处理"
+        finally:
+            root.destroy()
+
+    def test_single_extract_unexpected_preparation_error_finishes_report(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.automation_package_var.set("com.example.broken")
+                with patch("gui.threading.Thread", ImmediateThread), patch.object(
+                    app,
+                    "_automation_prepare_detection_sync",
+                    side_effect=RuntimeError("构建脚本执行失败"),
+                ), patch.object(
+                    app, "_automation_cleanup_current_app_sync"
+                ), patch.object(
+                    app, "_automation_finish_report"
+                ) as finish_report:
+                    app._automation_extract_fields()
+
+                finish_report.assert_called_once_with(
+                    "failed",
+                    "AUTOMATION_PREPARE_FAILED",
+                    "聚合参数提取失败: 构建脚本执行失败",
+                )
+                assert app._automation_status.cget("text") == "自动化失败"
+        finally:
+            root.destroy()
+
     def test_selected_precheck_task_is_written_to_shared_adb_config(self, tmp_path):
         root = tk.Tk()
         try:
@@ -1564,6 +1662,39 @@ class TestAutomationBatchActions:
                 assert app._automation_fields["插屏聚合id"] == "inter-max"
                 assert "_aggregation_type_inferred" not in app._automation_fields
                 assert app._automation_fields["_aggregation_type_changed_during_replay"] is True
+        finally:
+            root.destroy()
+
+    def test_preparation_requeues_when_device_health_reports_missing_app(self):
+        root = tk.Tk()
+        try:
+            from device_health import DeviceHealthReport, HealthCheck
+            from gui import APKToolApp, AutomationTaskRequeued
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.automation_package_var.set("com.example.missing")
+                app.automation_appid_var.set("up2-appid")
+                report = DeviceHealthReport(
+                    ok=False,
+                    checks=(
+                        HealthCheck("ADB", "ok", "可用"),
+                        HealthCheck(
+                            "目标应用",
+                            "error",
+                            "未安装: com.example.missing",
+                        ),
+                    ),
+                )
+
+                with patch.object(
+                    app, "_automation_device_health_sync", return_value=report
+                ):
+                    with pytest.raises(
+                        AutomationTaskRequeued,
+                        match="未安装: com.example.missing",
+                    ):
+                        app._automation_prepare_detection_sync()
         finally:
             root.destroy()
 

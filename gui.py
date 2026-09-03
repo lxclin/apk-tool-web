@@ -165,6 +165,12 @@ AUTOMATION_INFRASTRUCTURE_FAILURE_CODES = frozenset(
 )
 
 
+class AutomationTaskRequeued(RuntimeError):
+    """A recoverable preparation result that sends the task back to precheck."""
+
+    code = "TARGET_APP_NOT_INSTALLED"
+
+
 def load_gui_settings(settings_path: str = SETTINGS_PATH) -> dict:
     try:
         with open(settings_path, "r") as f:
@@ -4141,6 +4147,8 @@ class APKToolApp:
                     if outcome == "other_attribution"
                     else "SUSPECTED_WHITE_PACKAGE"
                     if outcome == "not_adapted"
+                    else "TARGET_APP_NOT_INSTALLED"
+                    if outcome == "requeued"
                     else "AUTOMATION_TASK_HANDLED"
                 )
             ),
@@ -4606,8 +4614,19 @@ class APKToolApp:
                     self._safe_after(
                         0, self._automation_set_status, "自动化已停止", "#ef6c00"
                     )
+                    self._automation_finish_report(
+                        "interrupted",
+                        "AUTOMATION_INTERRUPTED",
+                        "聚合参数提取已由用户停止",
+                    )
+                elif isinstance(exc, AutomationTaskRequeued):
+                    self._automation_requeue_missing_package(str(exc))
                 else:
-                    self._automation_mark_failed(f"聚合参数提取失败: {exc}")
+                    message = f"聚合参数提取失败: {exc}"
+                    self._automation_mark_failed(message)
+                    self._automation_finish_report(
+                        "failed", "AUTOMATION_PREPARE_FAILED", message
+                    )
             finally:
                 self._automation_cleanup_current_app_sync("聚合参数检查结束")
                 self._safe_after(0, self._automation_set_running, False)
@@ -5060,6 +5079,35 @@ class APKToolApp:
                 self._automation_precheck_item_id,
                 failure_status,
             )
+
+    def _automation_requeue_missing_package(self, message: str) -> None:
+        """Return an uninstalled package to precheck without reporting failure."""
+        package_name = self._automation_current_package_name()
+        detail = str(message or "").strip()
+        if not detail:
+            detail = f"目标应用未安装: {package_name}"
+        requeue_message = f"{detail}；已退回待处理，等待重新下载安装"
+        self._automation_task_outcome = "requeued"
+        self._automation_last_result_code = AutomationTaskRequeued.code
+        self._automation_last_result_message = requeue_message
+        self._automation_deferred_failure = None
+        self._safe_after(
+            0,
+            self._automation_set_status,
+            "应用未安装，已退回待处理",
+            "#ef6c00",
+        )
+        self._safe_after(0, self._automation_log, requeue_message)
+        if self._automation_precheck_item_id:
+            self._safe_after(
+                0,
+                self._set_precheck_task_status,
+                self._automation_precheck_item_id,
+                "待处理",
+            )
+        self._automation_finish_report(
+            "requeued", AutomationTaskRequeued.code, requeue_message
+        )
 
     def _automation_mark_not_adapted(self, message: str):
         self._automation_task_outcome = "other_attribution"
@@ -5777,6 +5825,8 @@ class APKToolApp:
                             )
                         return
                 self._automation_execute_post_detection_sync()
+            except AutomationTaskRequeued as exc:
+                self._automation_requeue_missing_package(str(exc))
             except Exception as exc:
                 self._automation_mark_failed(f"自动化执行失败: {exc}")
                 self._automation_comment_failure("AUTOMATION_FAILED", str(exc))
@@ -6142,6 +6192,18 @@ class APKToolApp:
         self._safe_after(0, self._automation_log, "[设备体检] 检查执行环境")
         health_report = self._automation_device_health_sync()
         if not health_report.ok:
+            missing_app = next(
+                (
+                    check
+                    for check in health_report.checks
+                    if check.level == "error"
+                    and check.name == "目标应用"
+                    and str(check.message).startswith("未安装")
+                ),
+                None,
+            )
+            if missing_app is not None:
+                raise AutomationTaskRequeued(missing_app.message)
             errors = [
                 check.message
                 for check in health_report.checks
@@ -6820,6 +6882,7 @@ class APKToolApp:
             failed = 0
             other_attribution = 0
             not_adapted = 0
+            requeued = 0
             retried = 0
             interrupted = False
             pending = deque(
@@ -6938,6 +7001,8 @@ class APKToolApp:
                             task_succeeded = (
                                 self._automation_process_current_task_sync()
                             )
+                    except AutomationTaskRequeued as exc:
+                        self._automation_requeue_missing_package(str(exc))
                     except Exception as exc:
                         message = f"自动化执行失败: {exc}"
                         self._automation_mark_failed(message)
@@ -6977,6 +7042,8 @@ class APKToolApp:
                         other_attribution += 1
                     elif self._automation_task_outcome == "not_adapted":
                         not_adapted += 1
+                    elif self._automation_task_outcome == "requeued":
+                        requeued += 1
                     else:
                         failed += 1
                     if self._automation_stop_event.is_set():
@@ -6994,22 +7061,26 @@ class APKToolApp:
                                 if self._automation_task_outcome == "other_attribution"
                                 else "疑似白包，已回填并提交后台，跳过回放"
                                 if self._automation_task_outcome == "not_adapted"
+                                else "应用未安装，已退回待处理"
+                                if self._automation_task_outcome == "requeued"
                                 else "当前包体已处理"
                             )
                         ),
                     )
                 stopped = self._automation_stop_event.is_set()
                 summary = (
-                    f"批量自动适配已停止：成功 {succeeded}，其他归因 {other_attribution}，失败 {failed}，疑似白包 {not_adapted}，延迟重试 {retried} 次"
+                    f"批量自动适配已停止：成功 {succeeded}，其他归因 {other_attribution}，失败 {failed}，疑似白包 {not_adapted}，待重新安装 {requeued}，延迟重试 {retried} 次"
                     if stopped or interrupted
-                    else f"批量自动适配完成：成功 {succeeded}，其他归因 {other_attribution}，失败 {failed}，疑似白包 {not_adapted}，延迟重试 {retried} 次"
+                    else f"批量自动适配完成：成功 {succeeded}，其他归因 {other_attribution}，失败 {failed}，疑似白包 {not_adapted}，待重新安装 {requeued}，延迟重试 {retried} 次"
                 )
                 self._safe_after(0, self._automation_log, summary)
                 self._safe_after(
                     0,
                     self._automation_set_status,
                     summary,
-                    "#ef6c00" if stopped or interrupted or failed else "#2e7d32",
+                    "#ef6c00"
+                    if stopped or interrupted or failed or requeued
+                    else "#2e7d32",
                 )
             finally:
                 if interrupted and self._automation_checkpoint:
