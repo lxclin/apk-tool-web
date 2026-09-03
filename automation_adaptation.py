@@ -330,6 +330,16 @@ def has_partial_aggregation_evidence(fields: dict[str, Any] | None) -> bool:
 
 def detection_field_issue(fields: dict[str, Any] | None) -> tuple[str, str] | None:
     """Return the terminal field issue that needs one detection retry."""
+    # A positively identified attribution platform is authoritative even when
+    # AutoDetector did not find a mediation platform.  Unsupported attribution
+    # is a terminal business outcome, so do not hide Singular/Tenjin/etc.
+    # behind the less specific "aggregation type empty" result.  Keep empty
+    # attribution on the normal detection path so it can still be recovered by
+    # later Logcat or Manifest evidence.
+    if has_explicit_attribution(fields):
+        unsupported = attribution_gate_issue(fields)
+        if unsupported:
+            return unsupported
     if is_suspected_white_package(fields):
         display = str((fields or {}).get("_google_play_installs_text") or "").strip()
         return (

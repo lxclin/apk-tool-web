@@ -776,6 +776,23 @@ def test_negative_verdict_without_symbolic_ids_is_not_a_valid_aggregation_type()
     assert detection_field_issue(fields)[0] == "AGGREGATION_TYPE_EMPTY"
 
 
+def test_explicit_unsupported_attribution_precedes_empty_aggregation_type():
+    fields = {
+        "最终判断": "未检测到主要聚合平台",
+        "初始Activity": "gametester.io.MainActivity",
+        "应用类型": "ReactNative",
+        "归因平台": "Singular",
+        "激励视频聚合id": "",
+        "插屏聚合id": "",
+    }
+
+    assert has_aggregation_type(fields) is False
+    assert detection_field_issue(fields) == (
+        "UNSUPPORTED_ATTRIBUTION",
+        "Singular归因，暂不适配",
+    )
+
+
 def test_levelplay_symbolic_video_and_inter_are_valid_ad_ids():
     fields = {
         "最终判断": "LevelPlay聚合（自动化检测确认）",
@@ -864,6 +881,35 @@ def test_unsupported_attribution_stops_without_restart_or_retry():
     assert result["ok"] is False
     assert result["code"] == "UNSUPPORTED_ATTRIBUTION"
     assert result["message"] == "Singular, AppMetrica归因，暂不适配"
+    assert result["attempts"] == 1
+    restart.assert_not_called()
+    extract.assert_not_called()
+
+
+def test_unsupported_attribution_stops_even_when_aggregation_is_empty():
+    fields = {
+        "ok": True,
+        "最终判断": "未检测到主要聚合平台",
+        "初始Activity": "gametester.io.MainActivity",
+        "应用类型": "ReactNative",
+        "归因平台": "Singular",
+        "激励视频聚合id": "",
+        "插屏聚合id": "",
+    }
+    restart = MagicMock()
+    extract = MagicMock()
+
+    result = detect_aggregation_with_one_retry(
+        "gametester.io",
+        extract,
+        first_fields=fields,
+        restart_app=restart,
+        wait_seconds=0,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "UNSUPPORTED_ATTRIBUTION"
+    assert result["message"] == "Singular归因，暂不适配"
     assert result["attempts"] == 1
     restart.assert_not_called()
     extract.assert_not_called()
