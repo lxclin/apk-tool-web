@@ -27,20 +27,20 @@ from typing import Any, Optional
 import requests as http_requests
 
 # ═══════════════════════════════════════════════════════════════
-# 硬编码常量
+# 默认配置（敏感凭证仅从环境变量读取）
 # ═══════════════════════════════════════════════════════════════
 
 SHEET_ID = "11ExyD6bM_m4ECKMNTx4XqsqzA75LuFJy5y6YZz8_tYs"
 SHEET_NAME = "26年5-6月"                    # 目标工作表名称
 PROJECT_GID = "1215092379542969"            # Asana 项目 GID
 WORKSPACE_GID = "1208177697797743"          # Asana 工作区 GID
-SA_FILE = ""
-ASANA_PAT = ""
+SA_FILE = os.getenv("APK_TOOL_SA_FILE", "")
+ASANA_PAT = os.getenv("ASANA_PAT", "")
 PROXY_URL = "http://127.0.0.1:7897"         # Clash 代理地址
 PARENT_TASK_GID = "1215490559662224"         # 父任务 GID（新建任务将作为其子任务）
 GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 CP_ADAPT_LIST_URL = "http://8.131.54.114/admin/gd_web/overseas/cp_adapt/list"
-CP_ADAPT_TOKEN = ""
+CP_ADAPT_TOKEN = os.getenv("CP_ADAPT_TOKEN", "")
 
 
 # ═══════════════════════════════════════════════════════════════
