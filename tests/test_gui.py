@@ -10,6 +10,11 @@ def isolate_gui_settings(monkeypatch, tmp_path):
     """GUI tests must not touch the operator's real settings/checkpoint files."""
     import gui
 
+    # The production default is intentionally empty after removing the
+    # historical credential from source.  GUI tests use an explicit dummy
+    # credential so batch workflows can exercise their validation path.
+    monkeypatch.setattr(gui, "DEFAULT_ASANA_PAT", "test-pat")
+
     original_load = gui.load_gui_settings
     original_save = gui.save_gui_settings
 

@@ -6,6 +6,8 @@
 
 桌面标题和 `GET /api/version` 会明确显示版本及 `source/packaged` 运行方式，便于区分源码启动与旧打包应用。发布前运行 `python3 release_check.py`，确认版本清单、MAX Share 接收器和桌面/Web 打包入口完整。
 
+敏感凭证不写入源代码：Asana PAT 和后台固定 Token 可在工具界面填写，也可分别通过 `ASANA_PAT`、`CP_ADAPT_TOKEN` 环境变量提供；Google Service Account JSON 路径使用 `APK_TOOL_SA_FILE`。请勿把凭证文件或 Token 提交到 Git。
+
 ## 功能清单
 
 ### 桌面版
