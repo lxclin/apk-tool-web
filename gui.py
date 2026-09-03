@@ -922,6 +922,7 @@ class APKToolApp:
         self.precheck_task_tree = ttk.Treeview(
             task_table_frame,
             columns=("order", "package", "gp", "status"),
+            displaycolumns=("order", "package", "status"),
             show="headings",
             height=6,
             selectmode="browse",
@@ -933,7 +934,7 @@ class APKToolApp:
         self.precheck_task_tree.column(
             "order", width=48, minwidth=48, anchor=tk.CENTER, stretch=False
         )
-        self.precheck_task_tree.column("package", width=260, minwidth=220)
+        self.precheck_task_tree.column("package", width=650, minwidth=360)
         self.precheck_task_tree.column("gp", width=390, minwidth=280)
         # Statuses such as "APKCombo待确认" and "已加黑(后台)" were clipped
         # by the old fixed 80 px column. Keep enough reserved space for the
@@ -952,14 +953,10 @@ class APKToolApp:
 
         inspect_frame = ttk.LabelFrame(parent, text="页面检查", padding=10)
         inspect_frame.pack(fill=tk.X, **pad)
-        ttk.Label(inspect_frame, text="GP 链接或包名:").pack(anchor=tk.W)
-        input_row = ttk.Frame(inspect_frame)
-        input_row.pack(fill=tk.X, pady=(4, 6))
-        self.precheck_input = ttk.Entry(input_row)
-        self.precheck_input.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(
-            input_row, text="从 APK 工具带入", command=self._on_precheck_use_apk_input
-        ).pack(side=tk.LEFT, padx=(6, 0))
+        # Page actions consume the package selected by the search/list.  Keep
+        # the value as internal state instead of showing a duplicate GP URL
+        # field and an unrelated import button.
+        self.precheck_input = tk.StringVar()
 
         action_row = ttk.Frame(inspect_frame)
         action_row.pack(fill=tk.X)
@@ -1044,8 +1041,7 @@ class APKToolApp:
     def _set_precheck_input(self, value: str):
         if not value:
             return
-        self.precheck_input.delete(0, tk.END)
-        self.precheck_input.insert(0, value)
+        self.precheck_input.set(value)
 
     def _on_precheck_use_apk_input(self):
         self._set_precheck_input(self.url_entry.get().strip())
@@ -1059,7 +1055,7 @@ class APKToolApp:
         task = self._precheck_tasks.get(selected[0])
         if task is None:
             return
-        value = getattr(task, "gp_link", "") or getattr(task, "package_name", "")
+        value = getattr(task, "package_name", "")
         self._set_precheck_input(value)
 
     def _precheck_package_search_matches(self, query: str) -> list[str]:
@@ -2311,7 +2307,9 @@ class APKToolApp:
     def _on_precheck_open_page(self):
         value = self.precheck_input.get().strip()
         if not value:
-            self._precheck_status.config(text="请输入 GP 链接或包名", foreground="#ef5350")
+            self._precheck_status.config(
+                text="请先搜索并定位包名", foreground="#ef5350"
+            )
             return
         self._precheck_status.config(text="正在打开手机页面...", foreground="#ffa726")
 
@@ -2424,7 +2422,9 @@ class APKToolApp:
             return
         value = self.precheck_input.get().strip()
         if not value:
-            self._precheck_status.config(text="请输入 GP 链接或包名", foreground="#ef5350")
+            self._precheck_status.config(
+                text="请先搜索并定位包名", foreground="#ef5350"
+            )
             return
         selected_item_id, selected_task = self._selected_precheck_task()
         asana_pat = self.asana_pat_var.get().strip()

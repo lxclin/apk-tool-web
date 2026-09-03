@@ -505,6 +505,11 @@ class TestAppInit:
                 assert hasattr(app, "precheck_task_tree")
                 assert hasattr(app, "precheck_input")
                 assert hasattr(app, "precheck_output")
+                assert tuple(app.precheck_task_tree.cget("displaycolumns")) == (
+                    "order",
+                    "package",
+                    "status",
+                )
                 assert hasattr(app, "_on_load_today_asana_tasks")
                 assert hasattr(app, "_on_start_precheck")
                 assert hasattr(app, "_on_start_batch_precheck")
@@ -669,7 +674,7 @@ class TestGooglePlayPrecheckActions:
         )
         play_precheck.assert_not_called()
 
-    def test_selected_asana_task_fills_gp_link(self):
+    def test_selected_asana_task_keeps_only_package_as_internal_action_value(self):
         root = tk.Tk()
         try:
             from auto_asana.main import AsanaPrecheckTask
@@ -692,7 +697,7 @@ class TestGooglePlayPrecheckActions:
 
                 app._render_today_asana_tasks(result)
 
-                assert app.precheck_input.get().endswith("id=com.example.game")
+                assert app.precheck_input.get() == "com.example.game"
                 assert "1 个任务" in app._precheck_asana_status.cget("text")
         finally:
             root.destroy()
@@ -734,7 +739,7 @@ class TestGooglePlayPrecheckActions:
                 item_id, selected_task = app._selected_precheck_task()
                 assert selected_task.gid == "task-2"
                 assert app.precheck_task_tree.focus() == item_id
-                assert app.precheck_input.get().endswith("id=com.target.puzzle")
+                assert app.precheck_input.get() == "com.target.puzzle"
                 assert app._precheck_search_status.cget("text") == "已定位 1/1"
                 assert app._precheck_manual_selection is True
         finally:
