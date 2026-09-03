@@ -2866,6 +2866,45 @@ class TestAutomationBatchActions:
         finally:
             root.destroy()
 
+    def test_combined_precheck_ignores_search_selection_and_scans_all_pending_rows(self):
+        root = tk.Tk()
+        try:
+            from auto_asana.main import AsanaPrecheckTask
+            from gui import APKToolApp
+
+            tasks = [
+                AsanaPrecheckTask(
+                    gid=f"pending-{index}",
+                    name=f"pending-{index}",
+                    package_name=f"com.pending.{index}",
+                    up2_appid=f"appid-{index}",
+                    gp_link="",
+                )
+                for index in range(1, 4)
+            ]
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app._render_today_asana_tasks(
+                    {"section_name": "9.3执行", "tasks": tasks}
+                )
+                item_ids = list(app.precheck_task_tree.get_children())
+                # Simulate the user searching for and selecting the last row.
+                app.precheck_task_tree.selection_set(item_ids[-1])
+                app._precheck_manual_selection = True
+
+                queue, start = app._precheck_batch_queue_from_selection(
+                    ignore_selection=True
+                )
+
+                assert start == 1
+                assert [task.gid for _item, task in queue] == [
+                    "pending-1",
+                    "pending-2",
+                    "pending-3",
+                ]
+        finally:
+            root.destroy()
+
     def test_combined_entry_prechecks_pending_rows_then_adapts(self):
         root = tk.Tk()
         try:

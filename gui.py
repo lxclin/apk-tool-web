@@ -1139,7 +1139,7 @@ class APKToolApp:
         item_id = selected[0]
         return item_id, self._precheck_tasks.get(item_id)
 
-    def _precheck_batch_queue_from_selection(self):
+    def _precheck_batch_queue_from_selection(self, *, ignore_selection=False):
         """Return rows that still need page precheck.
 
         Incremental mode (the default) queues newly discovered rows plus older
@@ -1150,7 +1150,11 @@ class APKToolApp:
         everything from that position onwards.
         """
         ordered_item_ids = list(self.precheck_task_tree.get_children())
-        selected = self.precheck_task_tree.selection()
+        selected = (
+            []
+            if ignore_selection
+            else self.precheck_task_tree.selection()
+        )
         start_index = 0
         if selected and selected[0] in ordered_item_ids:
             start_index = ordered_item_ids.index(selected[0])
@@ -1667,7 +1671,12 @@ class APKToolApp:
         # visible list contains an automation-eligible installed package.
         self._refresh_completed_background_downloads()
 
-        queue, _ = self._precheck_batch_queue_from_selection()
+        # The combined action is a whole-list operation.  A row selected by
+        # package search must not turn into an implicit batch start position;
+        # otherwise pending rows above that row are silently skipped.
+        queue, _ = self._precheck_batch_queue_from_selection(
+            ignore_selection=True
+        )
         if not queue:
             # This also makes the combined entry useful after the operator has
             # already completed precheck and installation in an earlier run.
