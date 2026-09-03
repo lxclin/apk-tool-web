@@ -864,7 +864,22 @@ class TestAutomationBatchActions:
             with patch.object(root, "mainloop"):
                 app = APKToolApp(root)
                 app.config_path_var.set(str(config_path))
-                with patch.object(
+                app._safe_after = lambda _delay, callback, *args: callback(*args)
+
+                def start_monitor(pattern, **kwargs):
+                    app._logcat_proc = MagicMock()
+
+                with patch("gui.threading.Thread", ImmediateThread), patch(
+                    "gui.check_device", return_value=True
+                ), patch(
+                    "gui.build_push_config_cmd", return_value=["adb", "push", "config"]
+                ) as build_push, patch(
+                    "gui.get_app_uid", return_value=(True, "10456")
+                ) as get_uid, patch.object(
+                    app, "_automation_run_command_sync"
+                ) as run_command, patch.object(
+                    app, "_start_logcat_stream", side_effect=start_monitor
+                ) as start_logcat, patch.object(
                     app,
                     "_selected_precheck_task",
                     return_value=("item-selected", task),
@@ -879,7 +894,67 @@ class TestAutomationBatchActions:
             assert app.pkg_entry.get() == "com.selected.game"
             assert app.appid_entry.get() == "selected-appid"
             assert app.task_uuid_var.get() == "mediation_test_snow"
-            assert "写入 config" in app._automation_status.cget("text")
+            build_push.assert_called_once_with(str(config_path))
+            run_command.assert_called_once_with(
+                ["adb", "push", "config"],
+                timeout=30,
+                respect_control=False,
+            )
+            get_uid.assert_called_once_with("com.selected.game")
+            assert app.uid_var.get() == "10456"
+            start_logcat.assert_called_once_with(
+                "ZGSDK.AutoDetector", require_uid=True
+            )
+            assert "正在监控" in app._automation_status.cget("text")
+        finally:
+            root.destroy()
+
+    def test_selected_task_push_failure_does_not_reuse_uid_or_start_monitor(
+        self, tmp_path
+    ):
+        root = tk.Tk()
+        try:
+            from auto_asana.main import AsanaPrecheckTask
+            from gui import APKToolApp
+
+            config_path = tmp_path / "config.json"
+            config_path.write_text('{"data": [{}]}', encoding="utf-8")
+            task = AsanaPrecheckTask(
+                gid="task-failed-push",
+                name="failed-push",
+                package_name="com.failed.push",
+                up2_appid="failed-push-appid",
+                gp_link="",
+            )
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app.config_path_var.set(str(config_path))
+                app._cached_uid = "10001"
+                app.uid_var.set("10001")
+                app._safe_after = lambda _delay, callback, *args: callback(*args)
+                with patch("gui.threading.Thread", ImmediateThread), patch(
+                    "gui.check_device", return_value=True
+                ), patch.object(
+                    app,
+                    "_automation_run_command_sync",
+                    side_effect=RuntimeError("设备拒绝推送"),
+                ), patch(
+                    "gui.get_app_uid"
+                ) as get_uid, patch.object(
+                    app, "_start_logcat_stream"
+                ) as start_logcat, patch.object(
+                    app,
+                    "_selected_precheck_task",
+                    return_value=("item-failed", task),
+                ):
+                    app._automation_use_selected_precheck_task()
+
+                assert app._cached_uid is None
+                assert app.uid_var.get() == ""
+                get_uid.assert_not_called()
+                start_logcat.assert_not_called()
+                assert "推送/UID 获取失败" in app._automation_status.cget("text")
         finally:
             root.destroy()
 

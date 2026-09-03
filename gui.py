@@ -3840,11 +3840,12 @@ class APKToolApp:
         ttk.Entry(first, textvariable=self.automation_package_var).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 10)
         )
-        ttk.Button(
+        self._automation_use_task_btn = ttk.Button(
             first,
             text="从页面预检选中任务带入",
             command=self._automation_use_selected_precheck_task,
-        ).pack(side=tk.RIGHT)
+        )
+        self._automation_use_task_btn.pack(side=tk.RIGHT)
         second = ttk.Frame(task_frame)
         second.pack(fill=tk.X, pady=(6, 0))
         ttk.Label(second, text="UP2 appid:").pack(side=tk.LEFT)
@@ -4252,11 +4253,19 @@ class APKToolApp:
         self._automation_refresh_checkpoint_ui()
 
     def _automation_use_selected_precheck_task(self):
+        if self._automation_running:
+            self._automation_set_status("自动化正在运行，请稍后再带入任务", "#ef6c00")
+            return
         item_id, task = self._selected_precheck_task()
         if task is None:
             self._automation_set_status("请先在页面预检中选择任务", "#e53935")
             return
+        self._automation_stop_active_logcat("带入新的页面预检任务")
+        self._cached_uid = None
+        self.uid_var.set("")
+        self.uid_label.configure(foreground="gray")
         self._automation_clear_detected_fields()
+        context_version = self._automation_context_version
         self._automation_precheck_item_id = item_id or ""
         self.automation_task_gid_var.set(str(getattr(task, "gid", "") or ""))
         self.automation_package_var.set(str(getattr(task, "package_name", "") or ""))
@@ -4271,7 +4280,7 @@ class APKToolApp:
         self._automation_active_package_name = package_name
         self._automation_active_appid = appid
         try:
-            self._write_automation_task_config(package_name, appid)
+            config_path = self._write_automation_task_config(package_name, appid)
             self._sync_adb_tab_from_automation(
                 package_name,
                 appid,
@@ -4284,7 +4293,65 @@ class APKToolApp:
         self._automation_log(
             f"已带入并写入 config: {package_name} / {appid}"
         )
-        self._automation_set_status("任务已带入并写入 config", "#2e7d32")
+        self._automation_set_status("正在推送 config 并获取 UID...", "#ef6c00")
+        self._automation_use_task_btn.configure(state=tk.DISABLED)
+
+        def _finish_error(message: str) -> None:
+            if context_version != self._automation_context_version:
+                self._automation_use_task_btn.configure(state=tk.NORMAL)
+                return
+            self._automation_log(message)
+            self._automation_set_status(message, "#e53935")
+            self._automation_use_task_btn.configure(state=tk.NORMAL)
+
+        def _finish_success(uid: str) -> None:
+            if (
+                context_version != self._automation_context_version
+                or package_name != self._automation_current_package_name()
+            ):
+                self._automation_log(
+                    f"已丢弃上一任务延迟返回的 UID: {package_name} / {uid}"
+                )
+                self._automation_use_task_btn.configure(state=tk.NORMAL)
+                return
+            self._set_uid(uid)
+            self._console_line(f"[UID] {package_name}: {uid}", "done")
+            self._start_logcat_stream(
+                "ZGSDK.AutoDetector",
+                require_uid=True,
+            )
+            if self._logcat_proc is None:
+                message = f"Config 已推送，UID={uid}，但日志监听启动失败"
+                self._automation_log(message)
+                self._automation_set_status(message, "#e53935")
+            else:
+                message = f"任务已带入并推送，UID={uid}，正在监控"
+                self._automation_log(message)
+                self._automation_set_status(message, "#2e7d32")
+            self._automation_use_task_btn.configure(state=tk.NORMAL)
+
+        def _run():
+            try:
+                if not check_device():
+                    raise RuntimeError("没有已连接的设备")
+                self._automation_run_command_sync(
+                    build_push_config_cmd(config_path),
+                    timeout=30,
+                    respect_control=False,
+                )
+                ok, uid = get_app_uid(package_name)
+                if not ok:
+                    raise RuntimeError(str(uid or "无法获取应用 UID"))
+            except Exception as exc:
+                self._safe_after(
+                    0,
+                    _finish_error,
+                    f"任务已带入，但推送/UID 获取失败: {exc}",
+                )
+                return
+            self._safe_after(0, _finish_success, uid)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _automation_clear_detected_fields(self, status_text: str = "尚未提取"):
         """Drop every detected value before another package is processed."""
