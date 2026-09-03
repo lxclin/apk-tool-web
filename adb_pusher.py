@@ -1058,6 +1058,135 @@ def wait_for_package_install_confirmation(
         time.sleep(min(interval, remaining) if interval else 0)
 
 
+def parse_launcher_components_from_dumpsys(
+    output: str,
+    package_name: str,
+) -> list[str]:
+    """Extract exported launcher candidates from ``dumpsys package`` output.
+
+    Some repackaged apps declare a launcher with an unusual intent filter (for
+    example, an additional static MIME type). Android's ``resolve-activity``
+    and ``monkey`` can then report no activity even though PackageManager's
+    resolver table contains a component that can be started explicitly.
+    """
+    package_name = resolve_google_play_package(package_name)
+    if not package_name:
+        return []
+
+    candidates: list[str] = []
+    current = ""
+    component_pattern = re.compile(
+        rf"^\s*[0-9a-fA-F]+\s+({re.escape(package_name)}/[^\s]+)\s+filter\b"
+    )
+    for line in str(output or "").splitlines():
+        match = component_pattern.search(line)
+        if match:
+            current = match.group(1).strip()
+            continue
+        if not line.strip():
+            current = ""
+            continue
+        if current and 'Category: "android.intent.category.LAUNCHER"' in line:
+            if current not in candidates:
+                candidates.append(current)
+    return candidates
+
+
+def resolve_app_launcher_components(package_name: str) -> list[str]:
+    """Resolve normal and non-standard launcher components for one package."""
+    package_name = resolve_google_play_package(package_name)
+    if not package_name:
+        return []
+
+    candidates: list[str] = []
+    try:
+        resolved = _run_adb(
+            [
+                "shell", "cmd", "package", "resolve-activity", "--brief",
+                "-a", "android.intent.action.MAIN",
+                "-c", "android.intent.category.LAUNCHER", package_name,
+            ],
+            timeout=10,
+        )
+        output = ((resolved.stdout or "") + (resolved.stderr or "")).strip()
+        if resolved.returncode == 0 and "No activity found" not in output:
+            for line in output.splitlines():
+                component = line.strip()
+                if component.startswith(f"{package_name}/") and component not in candidates:
+                    candidates.append(component)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Do not stop at resolve-activity failure. It is exactly the failure mode
+    # seen in MIME-typed/repackaged launchers such as the kickoff package.
+    try:
+        dumped = _run_adb(["shell", "dumpsys", "package", package_name], timeout=12)
+        for component in parse_launcher_components_from_dumpsys(
+            (dumped.stdout or "") + (dumped.stderr or ""), package_name
+        ):
+            if component not in candidates:
+                candidates.append(component)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return candidates
+
+
+def launch_app_with_fallback(package_name: str, *, timeout: float = 20) -> dict:
+    """Launch an app with monkey, then explicit launcher candidates if needed."""
+    package_name = resolve_google_play_package(package_name)
+    if not package_name:
+        return {
+            "ok": False,
+            "method": "",
+            "component": "",
+            "output": "无效的应用包名",
+        }
+
+    monkey = _run_adb(
+        [
+            "shell", "monkey", "-p", package_name,
+            "-c", "android.intent.category.LAUNCHER", "1",
+        ],
+        timeout=timeout,
+    )
+    monkey_output = ((monkey.stdout or "") + (monkey.stderr or "")).strip()
+    if monkey.returncode == 0 and "No activities found" not in monkey_output:
+        return {
+            "ok": True,
+            "method": "monkey",
+            "component": "",
+            "output": monkey_output,
+        }
+
+    attempts = [monkey_output] if monkey_output else []
+    for component in resolve_app_launcher_components(package_name):
+        started = _run_adb(
+            ["shell", "am", "start", "-W", "-n", component],
+            timeout=timeout,
+        )
+        output = ((started.stdout or "") + (started.stderr or "")).strip()
+        attempts.append(output)
+        failed = (
+            started.returncode != 0
+            or "Error type" in output
+            or "Error:" in output
+            or "Exception occurred" in output
+        )
+        if not failed:
+            return {
+                "ok": True,
+                "method": "explicit_activity",
+                "component": component,
+                "output": output,
+            }
+    return {
+        "ok": False,
+        "method": "",
+        "component": "",
+        "output": "\n".join(part for part in attempts if part)[-3000:],
+    }
+
+
 def verify_installed_app(package_name: str, *, require_launcher: bool = True) -> dict:
     """Verify PackageManager, UID and launcher state after an installation."""
     package_name = resolve_google_play_package(package_name)
@@ -1078,21 +1207,8 @@ def verify_installed_app(package_name: str, *, require_launcher: bool = True) ->
             "message": f"应用已安装，但 UID 验收失败: {uid}",
         }
 
-    launcher = ""
-    try:
-        result = _run_adb(
-            [
-                "shell", "cmd", "package", "resolve-activity", "--brief",
-                "-a", "android.intent.action.MAIN",
-                "-c", "android.intent.category.LAUNCHER", package_name,
-            ],
-            timeout=10,
-        )
-        output = (result.stdout or "").strip()
-        if result.returncode == 0 and output and "No activity found" not in output:
-            launcher = output.splitlines()[-1].strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        launcher = ""
+    launchers = resolve_app_launcher_components(package_name)
+    launcher = launchers[0] if launchers else ""
 
     if require_launcher and not launcher:
         return {
@@ -1163,6 +1279,250 @@ def extract_package_name_from_artifact(artifact_path: str) -> str:
         if match and resolve_google_play_package(match.group(1)):
             return match.group(1)
     return ""
+
+
+_MANIFEST_ATTRIBUTION_SIGNATURES = (
+    ("AppsFlyer", ("com.appsflyer", "appsflyer")),
+    ("Adjust", ("com.adjust.sdk",)),
+    ("AppMetrica", ("io.appmetrica", "com.yandex.metrica", "appmetrica")),
+    ("SolarEngine", ("com.reyun.solar", "com.solarengine", "solarengine")),
+    ("Singular", ("com.singular.sdk",)),
+    ("Tenjin", ("com.tenjin.android",)),
+    ("ThinkingData", ("cn.thinkingdata", "thinkingdata")),
+    ("Airbridge", ("co.ab180.airbridge",)),
+    ("Kochava", ("com.kochava",)),
+    ("Branch", ("io.branch.referral",)),
+)
+
+
+def parse_pm_package_paths(output: str) -> list[str]:
+    """Return package APK paths from ``pm path`` output in device order."""
+    paths: list[str] = []
+    for line in str(output or "").splitlines():
+        line = line.strip()
+        if not line.startswith("package:"):
+            continue
+        path = line[len("package:") :].strip()
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def select_base_apk_path(paths: list[str]) -> str:
+    """Select the installed base APK and never mistake a split for the base."""
+    for path in paths or []:
+        normalized = str(path or "").strip()
+        if normalized.endswith("/base.apk"):
+            return normalized
+    return ""
+
+
+def detect_manifest_attribution_platforms(manifest_text: str) -> dict:
+    """Detect attribution SDKs from decoded AndroidManifest content.
+
+    The match list intentionally uses SDK namespaces rather than generic words
+    such as ``attribution``. Android itself exposes attribution permissions and
+    APIs that do not prove an app uses an attribution platform.
+    """
+    compact = str(manifest_text or "").casefold()
+    platforms: list[str] = []
+    evidence: list[str] = []
+    for platform, signatures in _MANIFEST_ATTRIBUTION_SIGNATURES:
+        matched = next((item for item in signatures if item in compact), "")
+        if not matched:
+            continue
+        platforms.append(platform)
+        evidence.append(f"{platform}: {matched}")
+    return {
+        "platforms": platforms,
+        "evidence": evidence,
+    }
+
+
+def _android_manifest_dump_candidates() -> list[tuple[str, str]]:
+    """Return available Android build tools as ``(kind, path)`` pairs."""
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(kind: str, path: str | None) -> None:
+        value = str(path or "").strip()
+        if not value or value in seen or not os.path.isfile(value):
+            return
+        seen.add(value)
+        candidates.append((kind, value))
+
+    _add("aapt2", shutil.which("aapt2"))
+    _add("aapt", shutil.which("aapt"))
+    sdk_roots = [
+        os.environ.get("ANDROID_SDK_ROOT"),
+        os.environ.get("ANDROID_HOME"),
+        os.path.expanduser("~/Library/Android/sdk"),
+        os.path.expanduser("~/Android/Sdk"),
+    ]
+    for root in sdk_roots:
+        if not root:
+            continue
+        build_tools = os.path.join(root, "build-tools", "*")
+        for path in sorted(glob.glob(os.path.join(build_tools, "aapt2")), reverse=True):
+            _add("aapt2", path)
+        for path in sorted(glob.glob(os.path.join(build_tools, "aapt")), reverse=True):
+            _add("aapt", path)
+    return candidates
+
+
+def dump_apk_android_manifest(apk_path: str) -> dict:
+    """Decode an APK's binary manifest with the locally installed SDK tools."""
+    apk_path = os.path.abspath(str(apk_path or ""))
+    if not os.path.isfile(apk_path):
+        return {
+            "ok": False,
+            "code": "BASE_APK_NOT_FOUND",
+            "message": "拉取后的 base.apk 不存在",
+            "text": "",
+        }
+    candidates = _android_manifest_dump_candidates()
+    if not candidates:
+        return {
+            "ok": False,
+            "code": "ANDROID_BUILD_TOOL_NOT_FOUND",
+            "message": "未找到 aapt/aapt2，无法读取 AndroidManifest.xml",
+            "text": "",
+        }
+    last_error = ""
+    for kind, executable in candidates:
+        command = (
+            [executable, "dump", "xmltree", "--file", "AndroidManifest.xml", apk_path]
+            if kind == "aapt2"
+            else [executable, "dump", "xmltree", apk_path, "AndroidManifest.xml"]
+        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_error = str(exc)
+            continue
+        text = str(result.stdout or "").strip()
+        if result.returncode == 0 and text:
+            return {
+                "ok": True,
+                "code": "ANDROID_MANIFEST_DECODED",
+                "message": "已读取 AndroidManifest.xml",
+                "text": text,
+                "tool": executable,
+            }
+        last_error = str(result.stderr or result.stdout or "").strip()
+    return {
+        "ok": False,
+        "code": "ANDROID_MANIFEST_DECODE_FAILED",
+        "message": f"AndroidManifest.xml 解析失败: {last_error or '未知错误'}",
+        "text": "",
+    }
+
+
+def inspect_installed_package_attribution(
+    package_name: str,
+    *,
+    adb_path: str | None = None,
+) -> dict:
+    """Use the installed base.apk as a fallback attribution data source.
+
+    Temporary APK and decoded data live only inside a temporary directory and
+    are removed before this function returns.
+    """
+    package_name = str(package_name or "").strip()
+    adb = str(adb_path or get_adb_path() or "").strip()
+    if not package_name:
+        return {
+            "ok": False,
+            "code": "PACKAGE_NAME_EMPTY",
+            "message": "缺少包名，无法检查 AndroidManifest.xml",
+        }
+    if not adb:
+        return {
+            "ok": False,
+            "code": "ADB_NOT_FOUND",
+            "message": "未找到 ADB 工具",
+        }
+    try:
+        path_result = subprocess.run(
+            [adb, "shell", "pm", "path", package_name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "ok": False,
+            "code": "PACKAGE_PATH_QUERY_FAILED",
+            "message": f"读取应用安装路径失败: {exc}",
+        }
+    paths = parse_pm_package_paths(path_result.stdout)
+    remote_base_apk = select_base_apk_path(paths)
+    if path_result.returncode != 0 or not remote_base_apk:
+        detail = str(path_result.stderr or path_result.stdout or "").strip()
+        return {
+            "ok": False,
+            "code": "BASE_APK_PATH_NOT_FOUND",
+            "message": f"未找到已安装应用的 base.apk 路径{f': {detail}' if detail else ''}",
+            "paths": paths,
+        }
+    with tempfile.TemporaryDirectory(prefix="apk-tool-manifest-") as temp_dir:
+        local_base_apk = os.path.join(temp_dir, "base.apk")
+        try:
+            pull_result = subprocess.run(
+                [adb, "pull", remote_base_apk, local_base_apk],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {
+                "ok": False,
+                "code": "BASE_APK_PULL_FAILED",
+                "message": f"拉取 base.apk 失败: {exc}",
+                "remote_path": remote_base_apk,
+            }
+        if pull_result.returncode != 0 or not os.path.isfile(local_base_apk):
+            detail = str(pull_result.stderr or pull_result.stdout or "").strip()
+            return {
+                "ok": False,
+                "code": "BASE_APK_PULL_FAILED",
+                "message": f"拉取 base.apk 失败{f': {detail}' if detail else ''}",
+                "remote_path": remote_base_apk,
+            }
+        decoded = dump_apk_android_manifest(local_base_apk)
+        if not decoded.get("ok"):
+            decoded["remote_path"] = remote_base_apk
+            return decoded
+        detected = detect_manifest_attribution_platforms(decoded.get("text", ""))
+        platforms = detected["platforms"]
+        return {
+            "ok": True,
+            "code": (
+                "MANIFEST_ATTRIBUTION_FOUND"
+                if platforms
+                else "MANIFEST_ATTRIBUTION_NOT_FOUND"
+            ),
+            "message": (
+                f"AndroidManifest.xml 检测到归因平台: {', '.join(platforms)}"
+                if platforms
+                else "AndroidManifest.xml 未检测到已知归因平台"
+            ),
+            "package_name": package_name,
+            "remote_path": remote_base_apk,
+            "platforms": platforms,
+            "evidence": detected["evidence"],
+        }
 
 
 def push_apk_with_acceptance(
@@ -1246,6 +1606,98 @@ NOTIFICATION_PERMISSION_DENY_LABELS = {
     "不允许",
     "拒绝",
 }
+
+SAFE_FIRST_RUN_BLOCKED_PHRASES = (
+    "purchase",
+    "subscribe",
+    "subscription",
+    "payment",
+    "buy now",
+    "delete account",
+    "restore purchase",
+    "购买",
+    "订阅",
+    "付款",
+    "删除账号",
+)
+SAFE_FIRST_RUN_CONTEXT_PHRASES = (
+    "privacy policy",
+    "terms of service",
+    "terms & conditions",
+    "data collection",
+    "consent",
+    "welcome",
+    "tutorial",
+    "select language",
+    "choose language",
+    "sign in",
+    "log in",
+    "create account",
+    "隐私政策",
+    "服务条款",
+    "用户协议",
+    "欢迎",
+    "教程",
+    "选择语言",
+    "登录",
+    "注册",
+)
+SAFE_FIRST_RUN_ACTION_LABELS = {
+    "continue",
+    "continue as guest",
+    "accept",
+    "agree",
+    "i agree",
+    "next",
+    "skip",
+    "not now",
+    "later",
+    "got it",
+    "get started",
+    "start",
+    "继续",
+    "游客继续",
+    "接受",
+    "同意",
+    "下一步",
+    "跳过",
+    "暂不",
+    "稍后",
+    "知道了",
+    "开始",
+}
+GOOGLE_SIGN_IN_REQUIRED_PHRASES = (
+    "sign in with google",
+    "continue with google",
+    "使用 google 登录",
+    "使用google登录",
+    "通过 google 登录",
+    "通过google登录",
+)
+LOGIN_BYPASS_LABELS = {
+    "continue as guest",
+    "continue without signing in",
+    "continue without login",
+    "use without an account",
+    "skip",
+    "not now",
+    "maybe later",
+    "guest",
+    "游客继续",
+    "游客登录",
+    "游客模式",
+    "无需登录",
+    "跳过",
+    "暂不登录",
+    "暂不",
+    "稍后",
+}
+LANGUAGE_CONTEXT_PHRASES = (
+    "select language",
+    "choose language",
+    "选择语言",
+)
+ENGLISH_LANGUAGE_LABELS = {"english", "english (us)", "英语"}
 
 ANR_WAIT_LABELS = {"wait", "等待", "继续等待"}
 ANR_REPEAT_THRESHOLD = 3
@@ -1392,6 +1844,141 @@ def dismiss_notification_permission_dialog() -> dict:
         "code": "NOTIFICATION_PERMISSION_DISMISSED",
         "message": "已自动点击通知权限“不允许”，继续聚合适配",
     }
+
+
+def dismiss_safe_first_run_dialog() -> dict:
+    """Advance only low-risk first-run screens using exact UI evidence.
+
+    Purchase, subscription and account-deletion screens are explicitly never
+    touched. Generic action labels are clicked only when a known onboarding,
+    privacy or language context is visible; this avoids blind coordinate taps.
+    """
+    try:
+        nodes = collect_device_ui_nodes()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return {
+            "dismissed": False,
+            "code": "UI_READ_FAILED",
+            "message": str(exc) or "无法读取设备界面",
+        }
+    visible = "\n".join(
+        str(value or "").casefold()
+        for node in nodes
+        for value in (node.get("text"), node.get("content_desc"))
+        if value
+    )
+    if any(phrase.casefold() in visible for phrase in SAFE_FIRST_RUN_BLOCKED_PHRASES):
+        return {
+            "dismissed": False,
+            "code": "SENSITIVE_DIALOG_SKIPPED",
+            "message": "发现购买、订阅或账号敏感页面，自动化未点击",
+        }
+
+    if any(phrase.casefold() in visible for phrase in LANGUAGE_CONTEXT_PHRASES):
+        language_node = _find_action_node(nodes, ENGLISH_LANGUAGE_LABELS)
+        if language_node is not None and _tap_ui_node(language_node):
+            return {
+                "dismissed": True,
+                "code": "FIRST_RUN_LANGUAGE_SELECTED",
+                "message": "已在首启语言页选择 English",
+            }
+
+    if not any(
+        phrase.casefold() in visible for phrase in SAFE_FIRST_RUN_CONTEXT_PHRASES
+    ):
+        # Only explicit guest actions are safe without contextual evidence.
+        # A generic "Skip" may belong to a rewarded ad and must not be tapped.
+        guest_labels = {
+            "continue as guest", "guest", "游客继续", "游客",
+        }
+        action_node = _find_action_node(nodes, guest_labels)
+    else:
+        action_node = _find_action_node(nodes, SAFE_FIRST_RUN_ACTION_LABELS)
+    if action_node is None:
+        return {
+            "dismissed": False,
+            "code": "NO_SAFE_FIRST_RUN_DIALOG",
+            "message": "未发现可安全自动处理的首启弹窗",
+        }
+    if not _tap_ui_node(action_node):
+        return {
+            "dismissed": False,
+            "code": "FIRST_RUN_ACTION_TAP_FAILED",
+            "message": "发现安全首启按钮，但点击失败",
+        }
+    label = str(action_node.get("text") or action_node.get("content_desc") or "")
+    return {
+        "dismissed": True,
+        "code": "SAFE_FIRST_RUN_DIALOG_DISMISSED",
+        "message": f"已自动处理首启弹窗：{label or '继续'}",
+    }
+
+
+def detect_mandatory_google_login_screen() -> dict:
+    """Detect an app gate that cannot be passed without Google sign-in.
+
+    A Google sign-in button alone is not sufficient: many apps also expose a
+    guest/skip path.  Such a path keeps the app adaptable and is deliberately
+    reported as non-terminal here so ``dismiss_safe_first_run_dialog`` can
+    select it.
+    """
+    try:
+        nodes = collect_device_ui_nodes()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return {
+            "required": False,
+            "code": "UI_READ_FAILED",
+            "message": str(exc) or "无法读取设备界面",
+        }
+
+    labels = [
+        str(value or "").strip().casefold()
+        for node in nodes
+        for value in (node.get("text"), node.get("content_desc"))
+        if str(value or "").strip()
+    ]
+    visible = "\n".join(labels)
+    has_google_sign_in = any(
+        phrase.casefold() in visible for phrase in GOOGLE_SIGN_IN_REQUIRED_PHRASES
+    )
+    if not has_google_sign_in:
+        return {
+            "required": False,
+            "code": "NO_MANDATORY_GOOGLE_LOGIN",
+            "message": "未发现强制 Google 登录页面",
+        }
+
+    bypass_node = _find_action_node(nodes, LOGIN_BYPASS_LABELS)
+    if bypass_node is not None:
+        return {
+            "required": False,
+            "code": "GOOGLE_LOGIN_HAS_BYPASS",
+            "message": "页面提供免登录入口，继续自动化适配",
+        }
+    return {
+        "required": True,
+        "code": "GOOGLE_LOGIN_REQUIRED",
+        "message": "应用只能通过 Google 登录进入，未发现游客、跳过或稍后入口",
+        "evidence": next(
+            (
+                label
+                for label in labels
+                if any(
+                    phrase.casefold() in label
+                    for phrase in GOOGLE_SIGN_IN_REQUIRED_PHRASES
+                )
+            ),
+            "Sign in with Google",
+        ),
+    }
+
+
+def dismiss_safe_interrupting_dialog() -> dict:
+    """Handle notification permission first, then safe app onboarding UI."""
+    notification = dismiss_notification_permission_dialog()
+    if notification.get("dismissed"):
+        return notification
+    return dismiss_safe_first_run_dialog()
 
 
 def install_google_play_app(
@@ -1760,7 +2347,13 @@ def run_app_launch_precheck(
     poll_interval_seconds: float = 2,
     on_progress=None,
 ) -> dict:
-    """Launch an installed app, detect explicit crashes, then force-stop it."""
+    """Launch an installed app and perform the install-time UI precheck.
+
+    Besides explicit crashes, this is the only stage that classifies a
+    mandatory Google sign-in gate.  Aggregation detection and replay run only
+    after this precheck has passed, so backend parameters are never submitted
+    before a login-only app is blacklisted.
+    """
     package_name = resolve_google_play_package(package_name)
     if not package_name:
         return {
@@ -1778,15 +2371,9 @@ def run_app_launch_precheck(
     try:
         _run_adb(["shell", "am", "force-stop", package_name], timeout=8)
         _run_adb(["logcat", "-c"], timeout=8)
-        launch = _run_adb(
-            [
-                "shell", "monkey", "-p", package_name,
-                "-c", "android.intent.category.LAUNCHER", "1",
-            ],
-            timeout=15,
-        )
-        launch_output = ((launch.stdout or "") + (launch.stderr or "")).strip()
-        if launch.returncode != 0 or "No activities found" in launch_output:
+        launch = launch_app_with_fallback(package_name, timeout=15)
+        launch_output = str(launch.get("output") or "").strip()
+        if not launch.get("ok"):
             return {
                 "ok": False,
                 "code": "LAUNCH_FAILED",
@@ -1794,12 +2381,19 @@ def run_app_launch_precheck(
                 "summary": launch_output[-1500:],
             }
 
+        if on_progress and launch.get("method") == "explicit_activity":
+            on_progress(
+                "通用启动入口不可用，已通过真实 Activity 启动："
+                f"{launch.get('component')}"
+            )
+
         if on_progress:
             on_progress(f"应用已启动，观察 {int(observation_seconds)} 秒是否闪退...")
 
         deadline = time.monotonic() + max(1, observation_seconds)
         seen_running = False
         consecutive_missing = 0
+        mandatory_google_login_hits = 0
         while time.monotonic() < deadline:
             running = _is_app_process_running(package_name)
             if running:
@@ -1823,6 +2417,34 @@ def run_app_launch_precheck(
                         "message": "应用启动后进程退出，但没有取得明确崩溃堆栈",
                         "summary": evidence.get("summary", ""),
                     }
+
+            # Deal with notification/onboarding UI before evaluating the
+            # login gate.  In particular, a visible guest/skip action is a
+            # valid bypass and must never be classified as mandatory login.
+            dialog_result = dismiss_safe_interrupting_dialog()
+            if dialog_result.get("dismissed"):
+                mandatory_google_login_hits = 0
+                if on_progress:
+                    on_progress(str(dialog_result.get("message") or "已处理首启弹窗"))
+            else:
+                login_gate = detect_mandatory_google_login_screen()
+                if login_gate.get("required"):
+                    mandatory_google_login_hits += 1
+                    if mandatory_google_login_hits >= 2:
+                        return {
+                            "ok": False,
+                            "code": "GOOGLE_LOGIN_REQUIRED",
+                            "message": str(
+                                login_gate.get("message")
+                                or "应用只能通过 Google 登录进入"
+                            ),
+                            "summary": str(
+                                login_gate.get("evidence")
+                                or "Sign in with Google"
+                            ),
+                        }
+                else:
+                    mandatory_google_login_hits = 0
 
             if on_progress:
                 remaining = max(0, int(deadline - time.monotonic()))
@@ -2018,6 +2640,78 @@ def run_google_play_precheck(
         last_result["package_name"] = package_name
         last_result["source"] = ""
     return last_result
+
+
+def run_apkcombo_only_precheck(
+    value: str,
+    *,
+    device_profile: dict | None = None,
+) -> dict:
+    """Precheck a package through the G99 APKCombo-only route."""
+    package_name = resolve_google_play_package(value)
+    profile = device_profile or get_connected_device_profile()
+    if not profile.get("connected"):
+        return {
+            "code": "NO_DEVICE",
+            "title": "没有已连接的设备",
+            "detail": "请连接并授权 Android 设备后重试。",
+            "continue_adaptation": None,
+            "page_ready": False,
+            "evidence": [],
+            "visible_texts": [],
+            "package_name": package_name,
+            "source": "ADB 设备识别",
+        }
+
+    apkcombo = inspect_apkcombo_package(package_name)
+    device_label = str(profile.get("model") or "G99")
+    gms_note = (
+        "G99 定制 ROM 按专属规则跳过手机 Google Play 页面"
+        if profile.get("has_google_play_services")
+        else "设备缺少 Google Play Services，已跳过手机 Google Play 页面"
+    )
+    evidence = [
+        f"已识别设备：{device_label}",
+        gms_note,
+        str(apkcombo.get("message") or "已检查 APKCombo"),
+    ]
+    base = {
+        "continue_adaptation": False,
+        "page_ready": True,
+        "evidence": evidence,
+        "visible_texts": [],
+        "package_name": package_name,
+        "source": "G99 专属流程 + APKCombo",
+        "apkcombo_result": apkcombo,
+        "device_route": "g99_apkcombo",
+    }
+    if apkcombo.get("available") is True:
+        return {
+            **base,
+            "code": "APKCOMBO_AVAILABLE",
+            "title": "G99 专属流程：APKCombo 有包",
+            "detail": (
+                "当前 G99 无法使用 Google 服务，已直接找到完全一致包名的 "
+                "APKCombo 下载版本；将由电脑下载、通过 ADB 安装并继续启动检查。"
+            ),
+        }
+    if apkcombo.get("available") is False:
+        return {
+            **base,
+            "code": "ALL_NETWORK_NO_PACKAGE",
+            "title": "全网无包",
+            "detail": (
+                "当前 G99 无法使用 Google 服务，APKCombo 也未找到完全一致包名的"
+                "可下载版本；按当前规则判定全网无包，暂不适配。"
+            ),
+        }
+    return {
+        **base,
+        "code": "APKCOMBO_CHECK_FAILED",
+        "title": "APKCombo 自动核验未完成",
+        "detail": "G99 专属下载检查未取得明确结果，需要人工确认。",
+        "continue_adaptation": None,
+    }
 
 
 def is_apk_download_url(url: str) -> bool:
@@ -2383,6 +3077,74 @@ def check_device() -> bool:
         return False
 
 
+def get_connected_device_profile() -> dict:
+    """Return the one connected Android device's routing capabilities.
+
+    G99 test ROMs cannot reliably use Google services even when a GMS package
+    is present. The precheck workflow uses this profile to avoid opening an
+    unusable Play Store page and to route the package through APKCombo.
+    """
+    profile = {
+        "connected": False,
+        "serial": "",
+        "model": "",
+        "product": "",
+        "device": "",
+        "has_play_store": False,
+        "has_google_play_services": False,
+        "is_g99": False,
+        "use_apkcombo_only": False,
+    }
+    try:
+        devices = _run_adb(["devices", "-l"], timeout=3)
+        active = []
+        for raw_line in devices.stdout.splitlines()[1:]:
+            parts = raw_line.strip().split()
+            if len(parts) < 2 or parts[1] != "device":
+                continue
+            properties = {}
+            for value in parts[2:]:
+                if ":" in value:
+                    key, item = value.split(":", 1)
+                    properties[key] = item
+            active.append((parts[0], properties))
+        if len(active) != 1:
+            return profile
+
+        serial, properties = active[0]
+        profile.update({
+            "connected": True,
+            "serial": serial,
+            "model": properties.get("model", ""),
+            "product": properties.get("product", ""),
+            "device": properties.get("device", ""),
+        })
+
+        def _has_package(package_name: str) -> bool:
+            result = _run_adb(
+                ["-s", serial, "shell", "pm", "path", package_name],
+                timeout=5,
+            )
+            return result.returncode == 0 and "package:" in result.stdout
+
+        profile["has_play_store"] = _has_package("com.android.vending")
+        profile["has_google_play_services"] = _has_package(
+            "com.google.android.gms"
+        )
+        identity = {
+            str(profile.get(key) or "").strip().casefold()
+            for key in ("model", "product", "device")
+        }
+        profile["is_g99"] = "g99" in identity
+        # G99 is a customized test ROM. Some builds expose the GMS package
+        # but still cannot complete Play certification/login/network calls.
+        # Package presence is diagnostic only and must not disable routing.
+        profile["use_apkcombo_only"] = bool(profile["is_g99"])
+        return profile
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return profile
+
+
 def get_adb_connection_state() -> str:
     """Return a stable ADB connection state for user-facing diagnostics."""
     if not get_adb_path():
@@ -2504,7 +3266,13 @@ def push_apk(apk_path: str) -> tuple[bool, str]:
             return _install_apks(apks)
 
         # 单文件 → 先尝试直接安装，失败则检查同目录是否有拆分 APK
-        result = _run_adb(["install", "-r", apk_path])
+        # Installing a real game APK routinely takes longer than the generic
+        # eight-second ADB command timeout.  Use the dedicated installation
+        # timeout here just like the split-APK path below.
+        result = _run_adb(
+            ["install", "-r", apk_path],
+            timeout=APK_INSTALL_TIMEOUT_SECONDS,
+        )
         if result.returncode == 0:
             return True, "安装成功"
 
@@ -2535,6 +3303,8 @@ def push_apk(apk_path: str) -> tuple[bool, str]:
 
         return False, f"安装失败: {stderr or stdout}"
 
+    except subprocess.TimeoutExpired:
+        return False, f"安装超时：已等待 {APK_INSTALL_TIMEOUT_SECONDS} 秒"
     except FileNotFoundError:
         return False, "未找到 ADB 工具，请确认已安装 Android SDK"
 
@@ -2549,7 +3319,11 @@ def _sort_apks_for_install(apk_list: list[str]) -> list[str]:
     return sorted(apk_list, key=key)
 
 
-def _zip_contains_apks(zip_path: str) -> bool:
+def zip_contains_apks(zip_path: str) -> bool:
+    """Return True when a zip/XAPK file contains at least one APK entry.
+
+    Public so adb_proxy and the desktop app can share one implementation.
+    """
     import zipfile
 
     try:
@@ -2557,6 +3331,10 @@ def _zip_contains_apks(zip_path: str) -> bool:
             return any(name.lower().endswith(".apk") for name in z.namelist())
     except (OSError, zipfile.BadZipFile):
         return False
+
+
+# 旧内部名保留兼容
+_zip_contains_apks = zip_contains_apks
 
 
 def _collect_apks(root_dir: str, recursive: bool = True) -> list[str]:
@@ -3240,7 +4018,6 @@ def start_logcat_stream(pattern: str, uid: str | None = None):
         text=True,
         bufsize=1,
     )
-    proc._filter_pattern = pattern  # type: ignore[attr-defined]
     return proc
 
 
@@ -3272,11 +4049,18 @@ def run_stream(cmd: list[str], on_line, on_done, cwd=None, timeout=None, on_proc
                 on_proc(proc)
 
             if timeout:
-                # 看门狗：超时后强制杀进程
+                # 看门狗：超时后强制杀进程（杀进程必须先于日志回调，
+                # 且回调抛异常也不能阻止 kill）
                 def _kill():
                     if proc and proc.poll() is None:
-                        on_line(f"[超时] 命令超过 {timeout} 秒未结束，已终止")
-                        proc.kill()
+                        try:
+                            on_line(f"[超时] 命令超过 {timeout} 秒未结束，已终止")
+                        except Exception:
+                            pass
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
                 timer = threading.Timer(timeout, _kill)
                 timer.start()
 
@@ -3298,15 +4082,32 @@ def run_stream(cmd: list[str], on_line, on_done, cwd=None, timeout=None, on_proc
                 pass  # 非零退出码，由调用方处理
 
         except FileNotFoundError:
-            on_line(f"[错误] 命令未找到: {cmd[0]}")
+            try:
+                on_line(f"[错误] 命令未找到: {cmd[0]}")
+            except Exception:
+                pass
         except Exception as e:
-            on_line(f"[错误] {e}")
+            try:
+                on_line(f"[错误] {e}")
+            except Exception:
+                pass
         finally:
             # 确保看门狗被取消
             if timeout:
                 try:
                     timer.cancel()
                 except (NameError, AttributeError):
+                    pass
+            # on_line 回调抛异常时进程可能仍在运行，
+            # 必须收尾，否则会留下孤儿 adb 进程占住 stdout 管道
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
                     pass
         on_done(returncode)
 

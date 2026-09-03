@@ -20,6 +20,16 @@ ACTION_SUCCESS_RE = re.compile(
     r"动作适配(?:验证)?(?:已)?(?:成功|通过|完成)|动作适配脚本.{0,12}(?:完成|上线)",
     re.I,
 )
+ACTION_ISSUE_RE = re.compile(
+    r"动作适配.{0,80}(?:异常|失败|不成功|未成功|无反应|无法|不能|未通过|不通过|"
+    r"暂不适配|不做适配|停止适配|疑似)|"
+    r"(?:异常|失败|不成功|未成功|无反应|无法|不能|未通过|不通过|暂不适配).{0,80}动作适配",
+    re.I | re.S,
+)
+ACTION_PACKAGE_PREFIX_RE = re.compile(
+    r"^\s*([A-Za-z0-9_]+(?:\\?\.[A-Za-z0-9_]+)+)(?=动作适配)",
+    re.I,
+)
 BLACKLIST_RE = re.compile(r"加黑|黑名单")
 BLACKLIST_NEGATION_RE = re.compile(
     r"不加黑|未加黑|无需加黑|不要加黑|避免加黑|不能据此加黑|"
@@ -32,7 +42,19 @@ AGGREGATION_CONTEXT_RE = re.compile(
     re.I,
 )
 AUTOMATION_MARKER_RE = re.compile(r"^【APK Tool[^】]*】\s*")
+AUTOMATION_CODE_RE = re.compile(
+    r"^【APK Tool\s*自动化适配：([A-Z0-9_]+)】", re.I
+)
 URL_RE = re.compile(r"https?://\S+")
+
+# These codes are already terminal after the automation retry policy has been
+# exhausted.  They must appear in the daily issue total even when an older
+# comment did not explicitly include the words "暂不适配".
+STRUCTURED_AUTOMATION_ISSUES = {
+    "AF_KEY_EMPTY": "af_key为空，暂不适配",
+    "LOGCAT_ENDED": "聚合回放失败（Logcat监听提前结束），暂不适配",
+    "AUTOMATION_FAILED": "自动化适配失败，暂不适配",
+}
 
 # Ordered from the most specific outcome to broader symptoms so every task is
 # counted once even when a comment contains several related phrases.
@@ -70,6 +92,16 @@ ISSUE_REASON_RULES = (
         "white_package",
         "疑似白包",
         re.compile(r"白包", re.I),
+    ),
+    (
+        "both_ad_ids_empty",
+        "插屏聚合id和激励视频聚合id均为空",
+        re.compile(
+            r"(?:插屏(?:广告)?(?:聚合)?\s*(?:id|ID).{0,16}激励(?:视频)?(?:广告)?(?:聚合)?\s*(?:id|ID)|"
+            r"激励(?:视频)?(?:广告)?(?:聚合)?\s*(?:id|ID).{0,16}插屏(?:广告)?(?:聚合)?\s*(?:id|ID))"
+            r".{0,12}(?:均为空|都为空|全部为空|同时为空|均未找到|都未找到)",
+            re.I,
+        ),
     ),
     (
         "aggregation_missing",
@@ -118,9 +150,17 @@ ISSUE_REASON_RULES = (
         re.compile(r"日本包体|日文包体", re.I),
     ),
     (
+        "af_key_missing",
+        "af_key为空缺失",
+        re.compile(
+            r"(?:af_key|AppsFlyer SDK Key).{0,8}(?:为空|未找到|缺失|暂未找到)",
+            re.I,
+        ),
+    ),
+    (
         "missing_parameter",
         "关键参数缺失",
-        re.compile(r"af_key|AppsFlyer SDK Key|关键参数.{0,8}(?:为空|未找到|缺失)", re.I),
+        re.compile(r"关键参数.{0,8}(?:为空|未找到|缺失)", re.I),
     ),
     (
         "monetization_unmarked",
@@ -229,6 +269,41 @@ def concise_issue_reason(text: str, package_name: str = "") -> str:
     return reason.rstrip("。 ")
 
 
+def concise_action_issue_reason(text: str, package_name: str = "") -> str:
+    """Keep the operator's action-adaptation diagnosis for the daily report."""
+    value = URL_RE.sub("", str(text or "")).strip()
+    value = AUTOMATION_MARKER_RE.sub("", value)
+    candidates: list[str] = []
+    for raw_line in value.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip(" -")
+        if not line or line.startswith(("包名：", "包名:")):
+            continue
+        candidates.append(line)
+    reason = next(
+        (line for line in candidates if ACTION_ISSUE_RE.search(line)),
+        candidates[0] if candidates else "动作适配异常，需要人工确认",
+    )
+    package_name = str(package_name or "").strip()
+    if package_name and reason.startswith(package_name):
+        reason = reason[len(package_name):].lstrip(" ：:")
+    else:
+        # Operators occasionally write a shorter/legacy package identifier in
+        # the action comment. Keep it as the display package, but do not repeat
+        # it inside the reason text.
+        reason = ACTION_PACKAGE_PREFIX_RE.sub("", reason, count=1)
+    return reason.replace("跳过适配", "暂不适配").rstrip("。 ")
+
+
+def action_issue_package_name(text: str, fallback: str) -> str:
+    """Prefer an explicit package prefix from the action issue comment."""
+    value = AUTOMATION_MARKER_RE.sub("", str(text or "").strip())
+    for raw_line in value.splitlines():
+        match = ACTION_PACKAGE_PREFIX_RE.match(raw_line.strip())
+        if match:
+            return match.group(1)
+    return str(fallback or "").strip()
+
+
 def classify_issue_reason(reason: str) -> str:
     """Return one exclusive reason category for a terminal issue comment."""
     value = str(reason or "")
@@ -288,11 +363,22 @@ def classify_task_comments(
     """Use the last relevant comment as the task's terminal daily state."""
     aggregation_state = ""
     aggregation_reason = ""
-    action_success = False
+    action_state = ""
+    action_reason = ""
+    action_package_name = ""
     for comment in comments:
         text = comment.text
-        if ACTION_SUCCESS_RE.search(text):
-            action_success = True
+        # The last action-specific conclusion of the day wins. This lets a
+        # later successful manual retry supersede an earlier automation error,
+        # and vice versa.
+        if ACTION_ISSUE_RE.search(text):
+            action_state = "issue"
+            action_reason = concise_action_issue_reason(text, package_name)
+            action_package_name = action_issue_package_name(text, package_name)
+        elif ACTION_SUCCESS_RE.search(text):
+            action_state = "success"
+            action_reason = ""
+            action_package_name = ""
         if (
             "NO_ADS_OR_IAP" in text
             and ("不加黑" in text or "不能据此加黑" in text)
@@ -301,6 +387,14 @@ def classify_task_comments(
             aggregation_state = ""
             aggregation_reason = ""
             continue
+        automation_match = AUTOMATION_CODE_RE.match(text.strip())
+        if automation_match:
+            structured_reason = STRUCTURED_AUTOMATION_ISSUES.get(
+                automation_match.group(1).upper()
+            )
+            if structured_reason:
+                aggregation_state = "not_adapted"
+                aggregation_reason = structured_reason
         if AGGREGATION_SUCCESS_RE.search(text):
             aggregation_state = "success"
             aggregation_reason = ""
@@ -314,7 +408,11 @@ def classify_task_comments(
     return {
         "aggregation_state": aggregation_state,
         "aggregation_reason": aggregation_reason,
-        "action_success": "1" if action_success else "",
+        "action_success": "1" if action_state == "success" else "",
+        "action_issue": action_reason if action_state == "issue" else "",
+        "action_package_name": (
+            action_package_name if action_state == "issue" else ""
+        ),
     }
 
 
@@ -323,7 +421,9 @@ def render_daily_summary(
     aggregation_success: list[str],
     issues: list[dict[str, str]],
     action_success: list[str],
+    action_issues: list[dict[str, str]] | None = None,
 ) -> str:
+    action_issues = action_issues or []
     not_adapted_summary = _format_issue_state_summary(
         issues, "not_adapted", "暂不适配"
     )
@@ -350,6 +450,18 @@ def render_daily_summary(
             *action_success,
         ]
     )
+    if action_issues:
+        lines.extend(
+            [
+                "",
+                "",
+                f"{len(action_issues)}个动作适配问题",
+                *(
+                    f"{item['package_name']}{item['reason']}"
+                    for item in action_issues
+                ),
+            ]
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -374,6 +486,7 @@ def generate_daily_asana_summary(client, project_gid: str, target_date: date) ->
     )
     aggregation_success: list[str] = []
     action_success: list[str] = []
+    action_issues: list[dict[str, str]] = []
     issues: list[dict[str, str]] = []
     scanned_comments = 0
     for raw_task in tasks:
@@ -397,6 +510,15 @@ def generate_daily_asana_summary(client, project_gid: str, target_date: date) ->
             )
         if result["action_success"]:
             action_success.append(task.package_name)
+        elif result["action_issue"]:
+            action_issues.append(
+                {
+                    "package_name": (
+                        result["action_package_name"] or task.package_name
+                    ),
+                    "reason": result["action_issue"],
+                }
+            )
 
     return {
         "ok": True,
@@ -412,7 +534,12 @@ def generate_daily_asana_summary(client, project_gid: str, target_date: date) ->
         ),
         "blacklist_categories": summarize_issue_reasons(issues, "blacklist"),
         "action_success_count": len(action_success),
+        "action_issue_count": len(action_issues),
         "text": render_daily_summary(
-            target_date, aggregation_success, issues, action_success
+            target_date,
+            aggregation_success,
+            issues,
+            action_success,
+            action_issues,
         ),
     }

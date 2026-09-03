@@ -9,7 +9,12 @@ from __future__ import annotations
 
 
 BACKEND_TERMINAL_PRECHECK_CODES = frozenset(
-    {"IAP_ONLY", "JAPANESE_PACKAGE", "ALL_NETWORK_NO_PACKAGE"}
+    {
+        "IAP_ONLY",
+        "JAPANESE_PACKAGE",
+        "ALL_NETWORK_NO_PACKAGE",
+        "GOOGLE_LOGIN_REQUIRED",
+    }
 )
 INSTALLABLE_PRECHECK_CODES = frozenset(
     {"HAS_ADS", "NO_ADS_OR_IAP", "APKCOMBO_AVAILABLE"}
@@ -63,7 +68,7 @@ def precheck_task_status(result: dict) -> str:
     backend = result.get("backend_blacklist") or {}
     if code == "ALL_NETWORK_NO_PACKAGE" and backend:
         return "全网无包(后台)" if backend.get("ok") else "全网无包提交失败"
-    if code in {"IAP_ONLY", "JAPANESE_PACKAGE"} and backend:
+    if code in {"IAP_ONLY", "JAPANESE_PACKAGE", "GOOGLE_LOGIN_REQUIRED"} and backend:
         return "已加黑(后台)" if backend.get("ok") else "加黑提交失败"
 
     review_monetization = code == "NO_ADS_OR_IAP"
@@ -72,7 +77,11 @@ def precheck_task_status(result: dict) -> str:
         status = {
             "LAUNCH_OK": "启动正常",
             "APP_CRASHED": "包体闪退",
-            "APP_EXITED": "启动异常",
+            # A process can exit cleanly after a Play/PAIRIP licence Activity
+            # or a first-run hand-off.  With no Java/native crash evidence this
+            # is reviewable by the longer automation pipeline, not a terminal
+            # package failure.
+            "APP_EXITED": "启动待复检",
             "LAUNCH_FAILED": "启动失败",
         }.get(launch_result.get("code"), "启动异常")
         return "待人工检查" if review_monetization and launch_result.get("ok") else status
@@ -97,6 +106,7 @@ def precheck_task_status(result: dict) -> str:
         "ALL_NETWORK_NO_PACKAGE": "全网无包", "APKCOMBO_AVAILABLE": "APKCombo有包",
         "APKCOMBO_CHECK_FAILED": "APKCombo待确认", "IAP_ONLY": "已加黑",
         "JAPANESE_PACKAGE": "已加黑", "NO_ADS_OR_IAP": "待人工检查",
+        "GOOGLE_LOGIN_REQUIRED": "已加黑",
         "DEVICE_UNSUPPORTED": "设备不支持", "COUNTRY_UNSUPPORTED": "地区不支持",
         "UNKNOWN": "待人工", "NO_DEVICE": "未执行",
     }.get(code, "失败")

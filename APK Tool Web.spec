@@ -12,6 +12,7 @@ a = Analysis(
     datas=[
         (os.path.join(SPECPATH, 'static', 'index.html'), 'static'),
         (os.path.join(SPECPATH, 'ip_whitelist.json'), '.'),
+        (os.path.join(SPECPATH, 'permission_public_key.pem'), '.'),
     ],
     hiddenimports=[
         # FastAPI 依赖
@@ -59,6 +60,8 @@ a = Analysis(
         'tempfile',
         'shutil',
         'pathlib',
+        'cryptography',
+        'cryptography.hazmat.primitives.asymmetric.ed25519',
     ],
     hookspath=[],
     hooksconfig={},

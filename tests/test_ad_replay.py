@@ -247,6 +247,21 @@ def test_in_flight_attempt_tracks_matching_session_until_terminal_status():
     assert evaluator.has_in_flight_attempt is False
 
 
+def test_ad_load_timeout_is_recorded_as_transient_error():
+    evaluator = AdReplayEvaluator(
+        ReplayExpectation.from_values("", "reward-1")
+    )
+    evaluator.feed(
+        'ZGSDK.mediationEvent: {"status":"load_failed",'
+        '"adUnitId":"reward-1","adType":"reward",'
+        '"errorMessage":"Rewarded ad load timed out"}'
+    )
+
+    assert "广告加载超时：本次请求未在时限内完成" in (
+        evaluator.states["rewarded"].errors
+    )
+
+
 @patch("ad_replay.stop_logcat_stream")
 @patch("ad_replay.subprocess.run")
 @patch("ad_replay.force_stop_app", return_value=(True, "ok"))

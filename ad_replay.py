@@ -200,6 +200,10 @@ class AdReplayEvaluator:
         (re.compile(r"(?:error\s*508|errorCode[\"'=:\s]+508|init\(\) must be called before)", re.I), "Error 508：SDK 未正确初始化"),
         (re.compile(r"\bno[ _-]?fill\b", re.I), "No Fill：本次请求无广告填充"),
         (re.compile(r"\bnot[ _-]?ready\b", re.I), "Not Ready：广告尚未准备完成"),
+        (
+            re.compile(r"(?:ad\s+load\s+timed?\s*out|广告(?:加载)?超时)", re.I),
+            "广告加载超时：本次请求未在时限内完成",
+        ),
         (re.compile(r'"status"\s*:\s*"(?:display_failed|load_failed)"', re.I), "广告加载或展示失败"),
     )
 

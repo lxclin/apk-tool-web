@@ -86,6 +86,28 @@ def test_formats_fields_like_manual_copy():
     ]
 
 
+def test_formats_manifest_attribution_source_and_evidence():
+    fields = dict(FIELDS)
+    fields["归因平台"] = "Adjust, AppMetrica"
+    fields["_attribution_source"] = "AndroidManifest.xml 兜底"
+    fields["_attribution_evidence"] = [
+        "Adjust: com.adjust.sdk",
+        "AppMetrica: io.appmetrica",
+    ]
+
+    text = format_aggregation_fields(fields)
+
+    assert "归因平台:Adjust, AppMetrica" in text
+    assert "归因识别方式:AndroidManifest.xml 兜底" in text
+    assert (
+        "归因识别依据:Adjust: com.adjust.sdk；AppMetrica: io.appmetrica"
+        in text
+    )
+    assessment = build_aggregation_assessment(fields)
+    assert "Manifest归因兜底" in assessment["method"]
+    assert any("Manifest证据" in item for item in assessment["evidence"])
+
+
 def test_merges_below_gp_link_and_replaces_old_result():
     existing = (
         "包名：com.demo\nUP2 appid：app-1\n"
@@ -726,6 +748,34 @@ def test_incomplete_or_mismatched_symbolic_ids_do_not_infer_ironsource(
     assert fields["最终判断"] == ""
 
 
+def test_negative_verdict_allows_exact_video_inter_ironsource_fallback():
+    fields = {
+        "最终判断": "未检测到主要聚合平台",
+        "归因平台": "Adjust",
+        "激励视频聚合id": "video",
+        "插屏聚合id": "inter",
+    }
+
+    apply_aggregation_type_fallback(fields)
+
+    assert fields["最终判断"] == "IronSource聚合（根据 video/inter 自动推断）"
+    assert fields["_aggregation_type_inferred"] is True
+    assert fields["_raw_aggregation_verdict"] == "未检测到主要聚合平台"
+    assert detection_field_issue(fields) is None
+
+
+def test_negative_verdict_without_symbolic_ids_is_not_a_valid_aggregation_type():
+    fields = {
+        "最终判断": "未发现聚合平台",
+        "归因平台": "AppsFlyer",
+        "激励视频聚合id": "",
+        "插屏聚合id": "",
+    }
+
+    assert has_aggregation_type(fields) is False
+    assert detection_field_issue(fields)[0] == "AGGREGATION_TYPE_EMPTY"
+
+
 def test_levelplay_symbolic_video_and_inter_are_valid_ad_ids():
     fields = {
         "最终判断": "LevelPlay聚合（自动化检测确认）",
@@ -1113,6 +1163,11 @@ def test_inferred_replay_failure_clears_all_backend_fields_and_keeps_note():
     [
         ("IAP_ONLY", "com.iap.game", "应用内购，无广告，加黑"),
         (
+            "GOOGLE_LOGIN_REQUIRED",
+            "com.google.login.game",
+            "需要 Google 登录且无免登录入口，加黑",
+        ),
+        (
             "ALL_NETWORK_NO_PACKAGE",
             "com.no.package.game",
             "全网无包，暂不适配",
@@ -1348,3 +1403,123 @@ def test_auto_submit_can_be_stopped(mock_run, mock_popen):
 
     assert result["code"] == "USER_STOPPED"
     process.terminate.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("page_text", "expected"),
+    [
+        ("Rated 3+ 50,000+ downloads", (50000, "50,000+")),
+        (
+            '<div class="ClM7O">1K+</div><div class="g1rdde">Downloads</div>',
+            (1000, "1K+"),
+        ),
+        (
+            '<div class="ClM7O">0+</div><div class="g1rdde">Downloads</div>',
+            (0, "0+"),
+        ),
+        ("1.5M+ installs", (1500000, "1.5M+")),
+    ],
+)
+def test_parses_google_play_download_bucket(page_text, expected):
+    from automation_adaptation import parse_google_play_install_count
+
+    assert parse_google_play_install_count(page_text) == expected
+
+
+def test_fetches_google_play_download_bucket_from_official_page():
+    from automation_adaptation import fetch_google_play_install_count
+
+    response = MagicMock(text="App details 10,000+ Downloads")
+    response.raise_for_status.return_value = None
+    session = MagicMock()
+    session.get.return_value = response
+
+    result = fetch_google_play_install_count(
+        "com.example.game", session=session
+    )
+
+    assert result["ok"] is True
+    assert result["installs"] == 10000
+    assert result["display"] == "10,000+"
+    assert "play.google.com/store/apps/details?id=com.example.game" in result["url"]
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected_code"),
+    [
+        (
+            {
+                "最终判断": "",
+                "归因平台": "AppsFlyer",
+                "_google_play_installs": 50000,
+                "_google_play_installs_text": "50,000+",
+            },
+            "SUSPECTED_WHITE_PACKAGE",
+        ),
+        (
+            {
+                "最终判断": "MAX聚合",
+                "归因平台": "Adjust",
+                "插屏聚合id": "",
+                "激励视频聚合id": "",
+                "_google_play_installs": 99999,
+                "_google_play_installs_text": "50,000+",
+            },
+            "SUSPECTED_WHITE_PACKAGE",
+        ),
+        (
+            {
+                "最终判断": "MAX聚合",
+                "归因平台": "Adjust",
+                "插屏聚合id": "",
+                "激励视频聚合id": "",
+                "_google_play_installs": 100000,
+                "_google_play_installs_text": "100,000+",
+            },
+            "AD_IDS_EMPTY",
+        ),
+    ],
+)
+def test_low_download_white_package_rule(fields, expected_code):
+    assert detection_field_issue(fields)[0] == expected_code
+
+
+def test_white_package_assessment_is_note_only_terminal_outcome():
+    fields = {
+        "最终判断": "MAX聚合",
+        "归因平台": "Adjust",
+        "插屏聚合id": "",
+        "激励视频聚合id": "",
+        "_google_play_installs": 10000,
+        "_google_play_installs_text": "10,000+",
+    }
+
+    assessment = build_aggregation_assessment(fields)
+
+    assert assessment["terminal_outcome"] == "suspected_white_package"
+    assert assessment["submit_mode"] == "note_only"
+    assert assessment["auto_submit"] is True
+    assert "Google Play下载量:10,000+" in format_aggregation_fields(fields)
+
+
+def test_asana_update_allows_missing_aggregation_for_white_package_terminal():
+    client = MagicMock()
+    fields = {
+        "最终判断": "",
+        "归因平台": "AppsFlyer",
+        "_google_play_installs": 10000,
+        "_google_play_installs_text": "10,000+",
+    }
+
+    merged = update_asana_aggregation_notes(
+        client,
+        "task-1",
+        "包名：com.example.game\nGP链接： https://play.google.com/test",
+        fields,
+        allow_unsupported_attribution=True,
+        allow_missing_aggregation=True,
+        terminal_note="疑似白包，暂不适配",
+    )
+
+    assert "适配结论:疑似白包，暂不适配" in merged
+    client.tasks.update_task.assert_called_once()

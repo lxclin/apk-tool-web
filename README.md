@@ -2,7 +2,7 @@
 
 面向安卓适配流程的 ADB 工具箱，包含桌面 GUI、FastAPI Web 控制台、本地 ADB WebSocket 代理，以及 Google Sheets / Asana 同步脚本。
 
-近期迭代说明：[2026-08-04 ～ 2026-08-26 更新记录](UPDATE_NOTES_2026-08-04_TO_2026-08-26.md)
+近期迭代说明：[2026-08-04 ～ 2026-08-31 更新记录](UPDATE_NOTES_2026-08-04_TO_2026-08-31.md)
 
 桌面标题和 `GET /api/version` 会明确显示版本及 `source/packaged` 运行方式，便于区分源码启动与旧打包应用。发布前运行 `python3 release_check.py`，确认版本清单、MAX Share 接收器和桌面/Web 打包入口完整。
 

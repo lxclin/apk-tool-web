@@ -21,7 +21,7 @@ import time
 import re
 import urllib.parse
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Optional
 
 import requests as http_requests
@@ -102,6 +102,28 @@ class AsanaPrecheckTask:
     permalink_url: str = ""
     workflow_status: str = ""
     workflow_terminal: bool = False
+    precheck_status: str = ""
+    aggregation_detection_status: str = ""
+    backend_submission_status: str = ""
+    interstitial_replay_status: str = ""
+    rewarded_replay_status: str = ""
+    action_adaptation_status: str = ""
+    final_business_status: str = ""
+
+
+@dataclass(frozen=True)
+class WorkflowStageStatuses:
+    """Independent workflow stages reconstructed from Asana comments."""
+
+    workflow_status: str = ""
+    terminal: bool = False
+    precheck_status: str = ""
+    aggregation_detection_status: str = ""
+    backend_submission_status: str = ""
+    interstitial_replay_status: str = ""
+    rewarded_replay_status: str = ""
+    action_adaptation_status: str = ""
+    final_business_status: str = ""
 
 
 _PRECHECK_COMMENT_CODE_RE = re.compile(
@@ -118,6 +140,7 @@ _PRECHECK_CODE_STATUSES = {
     "APKCOMBO_CHECK_FAILED": "APKCombo待确认",
     "IAP_ONLY": "已加黑",
     "JAPANESE_PACKAGE": "已加黑",
+    "GOOGLE_LOGIN_REQUIRED": "已加黑",
     "NO_ADS_OR_IAP": "待人工检查",
     "DEVICE_UNSUPPORTED": "设备不支持",
     "COUNTRY_UNSUPPORTED": "地区不支持",
@@ -125,7 +148,7 @@ _PRECHECK_CODE_STATUSES = {
     # APKCombo browser-download path instead of becoming permanent terminal rows.
     "INSTALL_FAILED": "APKCombo有包",
     "APP_CRASHED": "包体闪退",
-    "APP_EXITED": "启动异常",
+    "APP_EXITED": "启动待复检",
     "LAUNCH_FAILED": "启动失败",
     "UNKNOWN": "待人工检查",
 }
@@ -133,9 +156,10 @@ _PRECHECK_CODE_STATUSES = {
 _AUTOMATION_CODE_STATUSES = {
     "AGGREGATION_REPLAY_SUCCESS": "聚合适配成功",
     "UNSUPPORTED_ATTRIBUTION": "其他归因",
+    "SUSPECTED_WHITE_PACKAGE": "疑似白包",
     "AGGREGATION_TYPE_EMPTY": "参数待确认",
     "AGGREGATION_RESULT_INCOMPLETE": "参数待确认",
-    "AF_KEY_EMPTY": "参数待确认",
+    "AF_KEY_EMPTY": "af_key为空",
     "AD_IDS_EMPTY": "参数待确认",
     "BACKEND_VALIDATION_FAILED": "参数待确认",
     "BACKEND_SUBMIT_FAILED": "后台提交失败",
@@ -163,7 +187,9 @@ _AUTOMATION_CODE_STATUSES = {
 }
 
 
-def classify_precheck_workflow_status(stories: list[dict[str, Any]]) -> tuple[str, bool]:
+def _classify_precheck_workflow_status_compact(
+    stories: list[dict[str, Any]],
+) -> tuple[str, bool]:
     """Return the latest business status recorded in Asana comments.
 
     All recognized decisions are terminal for automatic precheck: an operator
@@ -175,6 +201,8 @@ def classify_precheck_workflow_status(stories: list[dict[str, Any]]) -> tuple[st
         key=lambda item: (str(item[1].get("created_at") or ""), item[0]),
     )
     latest_status = ""
+    latest_automation_status = ""
+    latest_status_source = ""
     for _index, story in ordered:
         subtype = str(story.get("resource_subtype") or "")
         story_type = str(story.get("type") or "")
@@ -192,6 +220,7 @@ def classify_precheck_workflow_status(stories: list[dict[str, Any]]) -> tuple[st
             status = _PRECHECK_CODE_STATUSES.get(code)
             if status:
                 latest_status = status
+                latest_status_source = "precheck"
                 continue
 
         automation_match = _AUTOMATION_COMMENT_CODE_RE.search(text)
@@ -200,41 +229,201 @@ def classify_precheck_workflow_status(stories: list[dict[str, Any]]) -> tuple[st
             status = _AUTOMATION_CODE_STATUSES.get(code)
             if status:
                 latest_status = status
+                latest_automation_status = status
+                latest_status_source = "automation"
                 continue
 
         # Manual comments used before the structured APK Tool markers existed.
         normalized = re.sub(r"\s+", "", text)
+        # Action adaptation is a separate downstream stage.  Its success or
+        # failure must not overwrite a completed aggregation result.
+        if "动作适配" in normalized and "聚合" not in normalized:
+            continue
         if re.search(r"聚合(?:适配|测试)?(?:验证)?(?:已)?(?:成功|通过|完成)", normalized):
             latest_status = "聚合适配成功"
+            latest_status_source = "manual"
         elif ("加黑" in normalized or "黑名单" in normalized) and not re.search(
             r"(?:不|未|无需|不能|不要|避免).{0,6}加黑", normalized
         ):
             latest_status = "已加黑"
+            latest_status_source = "manual"
         elif "google无包" in normalized.lower() or "谷歌无包" in normalized:
             latest_status = "google无包"
+            latest_status_source = "manual"
         elif "包体闪退" in normalized or ("闪退" in normalized and "暂不适配" in normalized):
             latest_status = "包体闪退"
+            latest_status_source = "manual"
         elif "归因" in normalized and ("暂不适配" in normalized or "不适配" in normalized):
             latest_status = "其他归因"
+            latest_status_source = "manual"
         elif "暂不适配" in normalized or "跳过适配" in normalized:
             latest_status = "暂不适配"
+            latest_status_source = "manual"
         elif "回放" in normalized and ("失败" in normalized or "未确认" in normalized):
             latest_status = "回放失败"
+            latest_status_source = "manual"
         elif "后台" in normalized and "提交" in normalized and "失败" in normalized:
             latest_status = "后台提交失败"
+            latest_status_source = "manual"
         elif "聚合类型" in normalized and ("为空" in normalized or "未识别" in normalized):
             latest_status = "参数待确认"
+            latest_status_source = "manual"
         elif "af_key" in text.lower() and ("为空" in normalized or "未找到" in normalized):
-            latest_status = "参数待确认"
+            latest_status = "af_key为空"
+            latest_status_source = "manual"
         elif "设备" in normalized and ("不支持" in normalized or "不兼容" in normalized):
             latest_status = "设备不支持"
+            latest_status_source = "manual"
         elif ("国家" in normalized or "地区" in normalized) and "不支持" in normalized:
             latest_status = "地区不支持"
+            latest_status_source = "manual"
+    # A structured automation outcome is the terminal state of this workflow.
+    # A later page-precheck comment is only an intermediate observation and
+    # must never turn an adapted/failed package back into a download candidate.
+    if (
+        latest_automation_status
+        and latest_status_source == "precheck"
+        and latest_status in {"APKCombo有包", "APKCombo待确认", "待人工检查", "启动待复检"}
+    ):
+        latest_status = latest_automation_status
+
     # APKCombo availability used to be a terminal manual-handoff result.  It
     # is now an actionable intermediate state because the tool can download
     # and install that package automatically.
-    terminal = bool(latest_status) and latest_status != "APKCombo有包"
+    terminal = bool(latest_status) and latest_status not in {
+        "APKCombo有包",
+        "启动待复检",
+    }
     return latest_status, terminal
+
+
+def classify_precheck_workflow_stages(
+    stories: list[dict[str, Any]],
+) -> WorkflowStageStatuses:
+    """Reconstruct every workflow stage without allowing cross-stage overwrite."""
+    workflow_status, terminal = _classify_precheck_workflow_status_compact(stories)
+    precheck_status = ""
+    aggregation_detection_status = ""
+    backend_submission_status = ""
+    interstitial_replay_status = ""
+    rewarded_replay_status = ""
+    action_adaptation_status = ""
+    final_business_status = ""
+
+    ordered = sorted(
+        enumerate(stories or []),
+        key=lambda item: (str(item[1].get("created_at") or ""), item[0]),
+    )
+    for _index, story in ordered:
+        subtype = str(story.get("resource_subtype") or "")
+        story_type = str(story.get("type") or "")
+        if subtype and subtype != "comment_added":
+            continue
+        if story_type and story_type not in {"comment", "system"}:
+            continue
+        text = str(story.get("text") or "").strip()
+        if not text:
+            continue
+        normalized = re.sub(r"\s+", "", text)
+
+        precheck_match = _PRECHECK_COMMENT_CODE_RE.search(text)
+        if precheck_match:
+            code = precheck_match.group(1).upper()
+            status = _PRECHECK_CODE_STATUSES.get(code)
+            if status:
+                precheck_status = status
+                if status not in {"APKCombo有包", "APKCombo待确认", "待人工检查", "启动待复检"}:
+                    final_business_status = status
+            continue
+
+        automation_match = _AUTOMATION_COMMENT_CODE_RE.search(text)
+        if automation_match:
+            code = automation_match.group(1).upper()
+            if code == "AGGREGATION_REPLAY_SUCCESS":
+                aggregation_detection_status = "参数已确认"
+                backend_submission_status = "提交成功"
+                interstitial_replay_status = "回放成功"
+                rewarded_replay_status = "回放成功"
+                final_business_status = "聚合适配成功"
+            elif code == "UNSUPPORTED_ATTRIBUTION":
+                aggregation_detection_status = "参数已识别"
+                backend_submission_status = "提交成功"
+                final_business_status = "其他归因"
+            elif code == "SUSPECTED_WHITE_PACKAGE":
+                aggregation_detection_status = "疑似白包"
+                backend_submission_status = "提交成功"
+                final_business_status = "疑似白包"
+            elif code in {
+                "AGGREGATION_TYPE_EMPTY",
+                "AGGREGATION_RESULT_INCOMPLETE",
+                "AF_KEY_EMPTY",
+                "AD_IDS_EMPTY",
+                "BACKEND_VALIDATION_FAILED",
+            }:
+                aggregation_detection_status = _AUTOMATION_CODE_STATUSES.get(
+                    code, "参数待确认"
+                )
+            elif code.startswith("BACKEND_"):
+                backend_submission_status = _AUTOMATION_CODE_STATUSES.get(
+                    code, "后台提交失败"
+                )
+            elif code in {"AD_REPLAY_FAILED", "REPLAY_TIMEOUT"}:
+                interstitial_replay_status = "回放失败"
+                rewarded_replay_status = "回放失败"
+            elif code in {
+                "APP_CRASHED",
+                "APP_EXITED_DURING_AUTOMATION",
+                "APP_LAUNCH_NOT_CONFIRMED",
+                "AUTOMATION_FAILED",
+            }:
+                final_business_status = _AUTOMATION_CODE_STATUSES.get(
+                    code, "自动化失败"
+                )
+            continue
+
+        if "动作适配" in normalized and "聚合" not in normalized:
+            if re.search(r"动作适配(?:已)?(?:成功|通过|完成)", normalized):
+                action_adaptation_status = "动作适配成功"
+            elif any(word in normalized for word in ("失败", "暂不适配", "无法", "不能")):
+                action_adaptation_status = "动作适配失败"
+            continue
+
+        if re.search(r"聚合(?:适配|测试)?(?:验证)?(?:已)?(?:成功|通过|完成)", normalized):
+            aggregation_detection_status = "参数已确认"
+            interstitial_replay_status = "回放成功"
+            rewarded_replay_status = "回放成功"
+            final_business_status = "聚合适配成功"
+        elif ("加黑" in normalized or "黑名单" in normalized) and not re.search(
+            r"(?:不|未|无需|不能|不要|避免).{0,6}加黑", normalized
+        ):
+            final_business_status = "已加黑"
+        elif "包体闪退" in normalized or ("闪退" in normalized and "暂不适配" in normalized):
+            final_business_status = "包体闪退"
+        elif "归因" in normalized and ("暂不适配" in normalized or "不适配" in normalized):
+            final_business_status = "其他归因"
+        elif "暂不适配" in normalized or "跳过适配" in normalized:
+            final_business_status = "暂不适配"
+        elif "回放" in normalized and ("失败" in normalized or "未确认" in normalized):
+            interstitial_replay_status = "回放失败"
+            rewarded_replay_status = "回放失败"
+
+    return WorkflowStageStatuses(
+        workflow_status=workflow_status,
+        terminal=terminal,
+        precheck_status=precheck_status,
+        aggregation_detection_status=aggregation_detection_status,
+        backend_submission_status=backend_submission_status,
+        interstitial_replay_status=interstitial_replay_status,
+        rewarded_replay_status=rewarded_replay_status,
+        action_adaptation_status=action_adaptation_status,
+        final_business_status=final_business_status,
+    )
+
+
+def classify_precheck_workflow_status(stories: list[dict[str, Any]]) -> tuple[str, bool]:
+    """Backward-compatible compact status used by the existing task list."""
+    stages = classify_precheck_workflow_stages(stories)
+    return stages.workflow_status, stages.terminal
 
 
 def build_task_name(package_name: str) -> str:
@@ -857,6 +1046,156 @@ def apply_sheet_row_updates(
     return [result]
 
 
+def _aggregation_platform_from_fields(fields: dict[str, Any]) -> str:
+    verdict = str((fields or {}).get("最终判断") or "").casefold()
+    for marker, value in (
+        ("tradplus", "tradplus"),
+        ("levelplay", "level_play"),
+        ("ironsource", "iron_source"),
+        ("admob", "admob"),
+        ("max", "max"),
+    ):
+        if marker in verdict:
+            return value
+    return ""
+
+
+def plan_automation_outcome_sheet_updates(
+    sheet_data: list[list[Any]],
+    *,
+    sheet_name: str,
+    package_name: str,
+    outcome: str,
+    fields: dict[str, Any] | None = None,
+    message: str = "",
+    today: date | None = None,
+    allowed_assignee: str = "rain",
+) -> list[SheetCellUpdate]:
+    """Plan targeted Sheet feedback without touching action-adaptation cells.
+
+    ``success`` and explicit ``not_adapted`` business outcomes are written.
+    Transient automation errors are intentionally rejected by this function so
+    they cannot become training labels or overwrite a later manual recovery.
+    """
+    if outcome not in {"success", "not_adapted"}:
+        return []
+    if not sheet_data or not str(package_name or "").strip():
+        return []
+    header_row = _find_header_row(sheet_data)
+    headers = [re.sub(r"\s+", "", str(value or "")) for value in sheet_data[header_row]]
+    try:
+        package_col = headers.index("包名")
+        aggregation_owner_col = headers.index("聚合适配")
+    except ValueError:
+        return []
+    aggregation_status_col = next(
+        (
+            index
+            for index in range(aggregation_owner_col + 1, len(headers))
+            if headers[index] == "适配进度"
+        ),
+        None,
+    )
+    if aggregation_status_col is None:
+        return []
+    matched_row = next(
+        (
+            (index + 1, row)
+            for index, row in enumerate(sheet_data)
+            if index > header_row
+            and str(row[package_col] if package_col < len(row) else "").strip()
+            == str(package_name).strip()
+        ),
+        None,
+    )
+    if matched_row is None:
+        return []
+    row_number, row = matched_row
+    owner = str(
+        row[aggregation_owner_col] if aggregation_owner_col < len(row) else ""
+    ).strip().casefold()
+    if owner != str(allowed_assignee or "rain").strip().casefold():
+        return []
+
+    def first_column(label: str, *, start: int = 0) -> int | None:
+        return next(
+            (index for index in range(start, len(headers)) if headers[index] == label),
+            None,
+        )
+
+    values: dict[int, str] = {
+        aggregation_status_col: "已适配" if outcome == "success" else "暂不适配",
+    }
+    completed_col = first_column("完成时间", start=aggregation_status_col + 1)
+    if completed_col is not None:
+        values[completed_col] = generate_target_dates(today)[0]
+    platform_col = first_column("聚合")
+    attribution_col = first_column("归因")
+    ad_status_col = first_column("广告是否正常")
+    issue_col = first_column("适配所遇问题")
+    fields = fields or {}
+    if platform_col is not None and outcome == "success":
+        values[platform_col] = _aggregation_platform_from_fields(fields)
+    if attribution_col is not None and outcome == "success":
+        values[attribution_col] = str(fields.get("归因平台") or "").strip()
+    if ad_status_col is not None:
+        values[ad_status_col] = "广告正常" if outcome == "success" else "暂不适配"
+    if issue_col is not None and outcome == "not_adapted" and str(message or "").strip():
+        values[issue_col] = str(message).strip()
+
+    return [
+        SheetCellUpdate(
+            row_number=row_number,
+            column_index=column_index,
+            range_name=build_cell_range(sheet_name, row_number, column_index),
+            value=value,
+        )
+        for column_index, value in sorted(values.items())
+    ]
+
+
+def write_automation_outcome_to_sheet(
+    service,
+    sheet_id: str,
+    sheet_name: str,
+    *,
+    package_name: str,
+    outcome: str,
+    fields: dict[str, Any] | None = None,
+    message: str = "",
+    today: date | None = None,
+    allowed_assignee: str = "rain",
+) -> dict[str, Any]:
+    """Read, plan and batch-write one terminal automation outcome."""
+    range_name = f"{quote_sheet_name(sheet_name)}!A:AZ" if sheet_name else "A:AZ"
+    sheet_data = get_sheet_data(service, sheet_id, range_name)
+    updates = plan_automation_outcome_sheet_updates(
+        sheet_data,
+        sheet_name=sheet_name,
+        package_name=package_name,
+        outcome=outcome,
+        fields=fields,
+        message=message,
+        today=today,
+        allowed_assignee=allowed_assignee,
+    )
+    if not updates:
+        return {"ok": False, "updated_cells": 0, "message": "Sheet 中未找到可回写的包名行"}
+    result = batch_update_sheet_values(
+        service,
+        sheet_id,
+        [
+            {"range": update.range_name, "values": [[update.value]]}
+            for update in updates
+        ],
+    )
+    return {
+        "ok": True,
+        "updated_cells": int(result.get("totalUpdatedCells") or len(updates)),
+        "message": f"适配结果已回写 Sheet（{len(updates)} 个字段）",
+    }
+
+
 def build_cp_adapt_request_payload(
     assign: str = "rain",
     hide_adapted: bool = True,
@@ -1180,6 +1519,13 @@ class _SectionsFacade:
         )
         return result
 
+    def add_task_for_section(self, section_gid, task_gid):
+        """Move an existing project task into ``section_gid``."""
+        return self._api.add_task_for_section(
+            section_gid,
+            {"body": {"data": {"task": task_gid}}},
+        )
+
 
 class _TasksFacade:
     """将 SDK 5.x TasksApi 适配为旧版链式调用风格。"""
@@ -1376,13 +1722,26 @@ def get_asana_tasks_for_date(
                     task.gid,
                     opt_fields=["text", "resource_subtype", "type", "created_at"],
                 )
-                workflow_status, workflow_terminal = classify_precheck_workflow_status(
+                stage_statuses = classify_precheck_workflow_stages(
                     list(stories or [])
                 )
                 task = replace(
                     task,
-                    workflow_status=workflow_status,
-                    workflow_terminal=workflow_terminal,
+                    workflow_status=stage_statuses.workflow_status,
+                    workflow_terminal=stage_statuses.terminal,
+                    precheck_status=stage_statuses.precheck_status,
+                    aggregation_detection_status=(
+                        stage_statuses.aggregation_detection_status
+                    ),
+                    backend_submission_status=(
+                        stage_statuses.backend_submission_status
+                    ),
+                    interstitial_replay_status=(
+                        stage_statuses.interstitial_replay_status
+                    ),
+                    rewarded_replay_status=stage_statuses.rewarded_replay_status,
+                    action_adaptation_status=stage_statuses.action_adaptation_status,
+                    final_business_status=stage_statuses.final_business_status,
                 )
             except Exception as exc:
                 comment_status_errors.append(
@@ -1415,7 +1774,10 @@ def build_precheck_asana_comment(result: dict) -> str:
         "UNKNOWN": "Google Play 页面预检暂时无法判断，需要人工确认",
         "INSTALL_FAILED": "检测到包含广告，但 Google Play 自动下载安装失败，需要人工确认",
         "APP_CRASHED": "包体闪退，暂不适配",
-        "APP_EXITED": "应用启动后进程退出，但没有取得明确崩溃堆栈，需要人工确认",
+        "APP_EXITED": (
+            "应用启动后进程正常退出，未发现明确崩溃堆栈；"
+            "保留为启动待复检并继续完整自动适配"
+        ),
         "LAUNCH_FAILED": "应用无法正常启动，需要人工确认",
     }
     message = messages.get(code)
@@ -1522,6 +1884,70 @@ def get_existing_tasks_by_name(
         link = task.get("permalink_url") or build_asana_task_link(project_gid, gid)
         result[name] = AsanaTaskInfo(name, gid, link, task.get("notes") or "")
     return result
+
+
+def get_unfinished_tasks_by_name_from_section(
+    client,
+    section_gid: str,
+    project_gid: str,
+) -> dict[str, AsanaTaskInfo]:
+    """Return unfinished tasks in a section, keyed by task name."""
+    tasks = client.tasks.get_tasks_for_section(
+        section_gid,
+        opt_fields=["gid", "name", "permalink_url", "notes", "completed"],
+    )
+    result: dict[str, AsanaTaskInfo] = {}
+    for task in tasks:
+        if bool(task.get("completed")):
+            continue
+        gid = str(task.get("gid") or "").strip()
+        name = str(task.get("name") or "").strip()
+        if not gid or not name:
+            continue
+        link = task.get("permalink_url") or build_asana_task_link(project_gid, gid)
+        result[name] = AsanaTaskInfo(name, gid, link, task.get("notes") or "")
+    return result
+
+
+def migrate_previous_day_tasks(
+    client,
+    project_gid: str,
+    target_section_gid: str,
+    wanted_task_names: list[str],
+    today: Optional[date] = None,
+) -> dict[str, AsanaTaskInfo]:
+    """Reuse unfinished tasks from yesterday instead of creating duplicates.
+
+    Asana's immutable ``created_at`` cannot be rewritten. Moving the existing
+    task to today's section preserves its GID, description, comments and other
+    history while making it part of today's execution queue.
+    """
+    current_day = today or date.today()
+    _, previous_section_name = generate_target_dates(current_day - timedelta(days=1))
+    sections = client.sections.get_sections_for_project(project_gid)
+    previous_section = next(
+        (
+            section for section in sections
+            if str(section.get("name") or "").strip() == previous_section_name
+        ),
+        None,
+    )
+    if not previous_section:
+        return {}
+
+    previous_tasks = get_unfinished_tasks_by_name_from_section(
+        client,
+        str(previous_section.get("gid") or ""),
+        project_gid,
+    )
+    wanted = set(wanted_task_names)
+    migrated: dict[str, AsanaTaskInfo] = {}
+    for task_name, task_info in previous_tasks.items():
+        if task_name not in wanted:
+            continue
+        client.sections.add_task_for_section(target_section_gid, task_info.gid)
+        migrated[task_name] = task_info
+    return migrated
 
 
 def create_tasks_for_packages(
@@ -1642,25 +2068,38 @@ def sync_packages(
     existing_tasks = get_existing_tasks_by_name(asana_client, section_gid, project_gid)
     existing_names = set(existing_tasks.keys())
 
-    # 7. 差集
+    # 7. 先复用昨日仍未完成的同名任务，避免每天重复创建。CP 后台写入
+    # Sheet 时已经把既有行的“完成时间”更新为今天；这里同步迁移 Asana 分组。
+    missing_today_names = compute_diff(task_names, existing_names)
+    migrated_tasks = migrate_previous_day_tasks(
+        asana_client,
+        project_gid,
+        section_gid,
+        missing_today_names,
+        today=today,
+    )
+    existing_tasks.update(migrated_tasks)
+    existing_names.update(migrated_tasks.keys())
+
+    # 8. 只有今天与昨日均不存在的任务才新建
     new_task_names = compute_diff(task_names, existing_names)
 
-    # 8. 创建任务
+    # 9. 创建任务
     created_tasks = create_tasks_for_packages(
         asana_client, project_gid, section_gid, new_task_names,
         parent_task_gid=parent_task_gid or PARENT_TASK_GID,
         notes_by_name=task_notes_by_name,
     )
 
-    # 9. 合并已有和新创建的任务链接映射
+    # 10. 合并已有和新创建的任务链接映射
     task_links_by_name = {**existing_tasks, **created_tasks}
 
-    # 9.5 写入/补齐 Asana 任务描述
+    # 10.5 写入/补齐 Asana 任务描述
     notes_updated_count = update_task_notes_for_packages(
         asana_client, task_links_by_name, task_notes_by_name
     )
 
-    # 10. 回填任务链接
+    # 11. 回填任务链接
     if task_link_col is None:
         updates = []
         backfill_skipped = "missing_task_link_column"
@@ -1677,6 +2116,8 @@ def sync_packages(
         "section_gid": section_gid,
         "total_packages": len(packages),
         "existing_count": len(existing_names),
+        "migrated_count": len(migrated_tasks),
+        "migrated_gids": [task.gid for task in migrated_tasks.values()],
         "new_count": len(new_task_names),
         "created_gids": [task.gid for task in created_tasks.values()],
         "notes_updated_count": notes_updated_count,

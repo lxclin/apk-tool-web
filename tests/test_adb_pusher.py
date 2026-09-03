@@ -28,6 +28,145 @@ class TestCheckDevice:
             assert check_device() is False
 
 
+class TestConnectedDeviceRouting:
+    def test_g99_uses_apkcombo_even_when_gms_package_exists(self):
+        from adb_pusher import get_connected_device_profile
+
+        responses = [
+            MagicMock(
+                returncode=0,
+                stdout=(
+                    "List of devices attached\n"
+                    "SERIAL\tdevice product:G99 model:G99 device:G99 usb:1-1\n"
+                ),
+            ),
+            MagicMock(returncode=0, stdout="package:/system/app/Phonesky.apk\n"),
+            MagicMock(returncode=0, stdout="package:/system/priv-app/GmsCore.apk\n"),
+        ]
+        with patch("adb_pusher._run_adb", side_effect=responses):
+            profile = get_connected_device_profile()
+
+        assert profile["connected"] is True
+        assert profile["is_g99"] is True
+        assert profile["has_play_store"] is True
+        assert profile["has_google_play_services"] is True
+        assert profile["use_apkcombo_only"] is True
+
+    def test_regular_google_device_keeps_google_play_route(self):
+        from adb_pusher import get_connected_device_profile
+
+        responses = [
+            MagicMock(
+                returncode=0,
+                stdout=(
+                    "List of devices attached\n"
+                    "SERIAL\tdevice product:panther model:Pixel_7 device:panther\n"
+                ),
+            ),
+            MagicMock(returncode=0, stdout="package:/data/app/vending/base.apk\n"),
+            MagicMock(returncode=0, stdout="package:/data/app/gms/base.apk\n"),
+        ]
+        with patch("adb_pusher._run_adb", side_effect=responses):
+            profile = get_connected_device_profile()
+
+        assert profile["is_g99"] is False
+        assert profile["has_google_play_services"] is True
+        assert profile["use_apkcombo_only"] is False
+
+
+class TestMandatoryGoogleLoginDetection:
+    @staticmethod
+    def _node(text, *, clickable=True):
+        return {
+            "text": text,
+            "content_desc": "",
+            "resource_id": "",
+            "enabled": True,
+            "clickable": clickable,
+            "bounds": "[10,10][300,80]",
+        }
+
+    def test_google_sign_in_without_bypass_is_terminal(self):
+        from adb_pusher import detect_mandatory_google_login_screen
+
+        nodes = [
+            self._node("Hi there,"),
+            self._node("Sign in with Google"),
+            self._node("Already have an account? Log in"),
+        ]
+        with patch("adb_pusher.collect_device_ui_nodes", return_value=nodes):
+            result = detect_mandatory_google_login_screen()
+
+        assert result["required"] is True
+        assert result["code"] == "GOOGLE_LOGIN_REQUIRED"
+
+    @pytest.mark.parametrize("bypass", ["Continue as guest", "Skip", "稍后"])
+    def test_google_sign_in_with_bypass_remains_adaptable(self, bypass):
+        from adb_pusher import detect_mandatory_google_login_screen
+
+        nodes = [
+            self._node("Sign in with Google"),
+            self._node(bypass),
+        ]
+        with patch("adb_pusher.collect_device_ui_nodes", return_value=nodes):
+            result = detect_mandatory_google_login_screen()
+
+        assert result["required"] is False
+        assert result["code"] == "GOOGLE_LOGIN_HAS_BYPASS"
+
+    def test_generic_login_is_not_mistaken_for_google_only_gate(self):
+        from adb_pusher import detect_mandatory_google_login_screen
+
+        with patch(
+            "adb_pusher.collect_device_ui_nodes",
+            return_value=[self._node("Log in"), self._node("Create account")],
+        ):
+            result = detect_mandatory_google_login_screen()
+
+        assert result["required"] is False
+
+    def test_g99_apkcombo_precheck_returns_installable_result(self):
+        from adb_pusher import run_apkcombo_only_precheck
+
+        apkcombo = {
+            "available": True,
+            "code": "APKCOMBO_AVAILABLE",
+            "message": "APKCombo 已找到完全一致的包名和可下载版本",
+        }
+        profile = {
+            "connected": True,
+            "model": "G99",
+            "use_apkcombo_only": True,
+        }
+        with patch("adb_pusher.inspect_apkcombo_package", return_value=apkcombo):
+            result = run_apkcombo_only_precheck(
+                "https://play.google.com/store/apps/details?id=com.example.game",
+                device_profile=profile,
+            )
+
+        assert result["code"] == "APKCOMBO_AVAILABLE"
+        assert result["package_name"] == "com.example.game"
+        assert result["device_route"] == "g99_apkcombo"
+        assert "跳过手机 Google Play" in "；".join(result["evidence"])
+
+    def test_g99_apkcombo_missing_package_is_terminal(self):
+        from adb_pusher import run_apkcombo_only_precheck
+
+        apkcombo = {
+            "available": False,
+            "code": "APKCOMBO_NOT_FOUND",
+            "message": "APKCombo 搜索未找到完全一致的包名",
+        }
+        with patch("adb_pusher.inspect_apkcombo_package", return_value=apkcombo):
+            result = run_apkcombo_only_precheck(
+                "com.example.missing",
+                device_profile={"connected": True, "model": "G99"},
+            )
+
+        assert result["code"] == "ALL_NETWORK_NO_PACKAGE"
+        assert result["continue_adaptation"] is False
+
+
 class TestAdbConnectionState:
     def test_distinguishes_unauthorized_device(self):
         from adb_pusher import get_adb_connection_state
@@ -165,6 +304,30 @@ class TestPushApk:
             assert ok is True
             assert "成功" in msg
 
+    def test_single_apk_install_uses_install_timeout(self):
+        from adb_pusher import APK_INSTALL_TIMEOUT_SECONDS, push_apk
+
+        with patch(
+            "adb_pusher._run_adb",
+            return_value=MagicMock(returncode=0, stdout="Success", stderr=""),
+        ) as run_adb:
+            ok, _message = push_apk("/path/to/app.apk")
+
+        assert ok is True
+        assert run_adb.call_args.kwargs["timeout"] == APK_INSTALL_TIMEOUT_SECONDS
+
+    def test_single_apk_install_timeout_returns_reconcilable_message(self):
+        from adb_pusher import APK_INSTALL_TIMEOUT_SECONDS, push_apk
+
+        with patch(
+            "adb_pusher._run_adb",
+            side_effect=subprocess.TimeoutExpired("adb install", 90),
+        ):
+            ok, message = push_apk("/path/to/app.apk")
+
+        assert ok is False
+        assert message == f"安装超时：已等待 {APK_INSTALL_TIMEOUT_SECONDS} 秒"
+
     def test_failed_install(self):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stderr="INSTALL_FAILED\n")
@@ -243,7 +406,6 @@ class TestInstallAcceptance:
             archive.writestr("base.apk", b"fake")
 
         assert extract_package_name_from_artifact(str(artifact)) == "com.example.game"
-
     def test_verifies_uid_and_launcher(self):
         from adb_pusher import verify_installed_app
 
@@ -260,6 +422,37 @@ class TestInstallAcceptance:
         assert result["ok"] is True
         assert result["uid"] == "10123"
         assert result["launcher"].endswith(".MainActivity")
+
+    def test_verifies_nonstandard_launcher_from_package_resolver_table(self):
+        from adb_pusher import verify_installed_app
+
+        unresolved = MagicMock(
+            returncode=0,
+            stdout="No activity found\n",
+            stderr="",
+        )
+        dumped = MagicMock(
+            returncode=0,
+            stdout="""
+            Activity Resolver Table:
+              MIME Typed Actions:
+                android.intent.action.MAIN:
+                  433c346 com.example.game/com.vendor.feature.LaunchActivity filter edb4a34
+                    Action: "android.intent.action.MAIN"
+                    Category: "android.intent.category.LAUNCHER"
+                    StaticType: "application/paths"
+            """,
+            stderr="",
+        )
+        with patch("adb_pusher.is_package_installed", return_value=True), \
+             patch("adb_pusher.get_app_uid", return_value=(True, "10123")), \
+             patch("adb_pusher._run_adb", side_effect=[unresolved, dumped]):
+            result = verify_installed_app("com.example.game")
+
+        assert result["ok"] is True
+        assert result["launcher"] == (
+            "com.example.game/com.vendor.feature.LaunchActivity"
+        )
 
     def test_ambiguous_install_is_reconciled_with_phone(self):
         from adb_pusher import push_apk_with_acceptance
@@ -846,6 +1039,105 @@ class TestGooglePlayPrecheck:
         assert result["code"] == "NO_NOTIFICATION_PERMISSION_DIALOG"
         mock_tap.assert_not_called()
 
+    def test_safe_first_run_accepts_privacy_screen(self):
+        from adb_pusher import dismiss_safe_first_run_dialog
+
+        privacy = {
+            "text": "Privacy Policy and Terms of Service",
+            "content_desc": "",
+            "enabled": True,
+            "bounds": "[20,100][450,200]",
+        }
+        accept = {
+            "text": "I agree",
+            "content_desc": "",
+            "enabled": True,
+            "bounds": "[80,300][420,380]",
+        }
+        with patch(
+            "adb_pusher.collect_device_ui_nodes", return_value=[privacy, accept]
+        ), patch("adb_pusher._tap_ui_node", return_value=True) as mock_tap:
+            result = dismiss_safe_first_run_dialog()
+
+        assert result["dismissed"] is True
+        assert result["code"] == "SAFE_FIRST_RUN_DIALOG_DISMISSED"
+        mock_tap.assert_called_once_with(accept)
+
+    def test_safe_first_run_never_touches_subscription_screen(self):
+        from adb_pusher import dismiss_safe_first_run_dialog
+
+        nodes = [
+            {
+                "text": "Start your subscription",
+                "content_desc": "",
+                "enabled": True,
+                "bounds": "[20,100][450,200]",
+            },
+            {
+                "text": "Continue",
+                "content_desc": "",
+                "enabled": True,
+                "bounds": "[80,300][420,380]",
+            },
+        ]
+        with patch(
+            "adb_pusher.collect_device_ui_nodes", return_value=nodes
+        ), patch("adb_pusher._tap_ui_node", return_value=True) as mock_tap:
+            result = dismiss_safe_first_run_dialog()
+
+        assert result["dismissed"] is False
+        assert result["code"] == "SENSITIVE_DIALOG_SKIPPED"
+        mock_tap.assert_not_called()
+
+    def test_safe_first_run_does_not_click_generic_ad_skip_without_context(self):
+        from adb_pusher import dismiss_safe_first_run_dialog
+
+        nodes = [
+            {
+                "text": "Rewarded video",
+                "content_desc": "",
+                "enabled": True,
+                "bounds": "[20,100][450,200]",
+            },
+            {
+                "text": "Skip",
+                "content_desc": "",
+                "enabled": True,
+                "bounds": "[350,20][450,80]",
+            },
+        ]
+        with patch(
+            "adb_pusher.collect_device_ui_nodes", return_value=nodes
+        ), patch("adb_pusher._tap_ui_node", return_value=True) as mock_tap:
+            result = dismiss_safe_first_run_dialog()
+
+        assert result["dismissed"] is False
+        assert result["code"] == "NO_SAFE_FIRST_RUN_DIALOG"
+        mock_tap.assert_not_called()
+
+    def test_safe_first_run_selects_english_before_continue(self):
+        from adb_pusher import dismiss_safe_first_run_dialog
+
+        language = {
+            "text": "Select language",
+            "content_desc": "",
+            "enabled": True,
+            "bounds": "[20,100][450,200]",
+        }
+        english = {
+            "text": "English",
+            "content_desc": "",
+            "enabled": True,
+            "bounds": "[80,220][420,280]",
+        }
+        with patch(
+            "adb_pusher.collect_device_ui_nodes", return_value=[language, english]
+        ), patch("adb_pusher._tap_ui_node", return_value=True) as mock_tap:
+            result = dismiss_safe_first_run_dialog()
+
+        assert result["code"] == "FIRST_RUN_LANGUAGE_SELECTED"
+        mock_tap.assert_called_once_with(english)
+
     def test_auto_install_clicks_install_and_waits_for_package(self):
         from adb_pusher import install_google_play_app
 
@@ -941,6 +1233,53 @@ class TestGooglePlayPrecheck:
 
 
 class TestAppLaunchPrecheck:
+    def test_launch_falls_back_to_explicit_activity_when_monkey_cannot_resolve(self):
+        from adb_pusher import launch_app_with_fallback
+
+        monkey_failed = MagicMock(
+            returncode=0,
+            stdout="** No activities found to run, monkey aborted.",
+            stderr="",
+        )
+        unresolved = MagicMock(
+            returncode=0,
+            stdout="No activity found\n",
+            stderr="",
+        )
+        dumped = MagicMock(
+            returncode=0,
+            stdout="""
+            Activity Resolver Table:
+              Non-Data Actions:
+                android.intent.action.MAIN:
+                  c32a05d com.example.game/com.vendor.Launch filter 358cdd2
+                    Action: "android.intent.action.MAIN"
+                    Category: "android.intent.category.LAUNCHER"
+            """,
+            stderr="",
+        )
+        explicit_started = MagicMock(
+            returncode=0,
+            stdout="Status: ok\nActivity: com.example.game/com.vendor.Launch\n",
+            stderr="",
+        )
+        with patch(
+            "adb_pusher._run_adb",
+            side_effect=[monkey_failed, unresolved, dumped, explicit_started],
+        ) as mock_run:
+            result = launch_app_with_fallback("com.example.game")
+
+        assert result["ok"] is True
+        assert result["method"] == "explicit_activity"
+        assert result["component"] == "com.example.game/com.vendor.Launch"
+        assert mock_run.call_args_list[-1] == call(
+            [
+                "shell", "am", "start", "-W", "-n",
+                "com.example.game/com.vendor.Launch",
+            ],
+            timeout=20,
+        )
+
     def test_extracts_java_crash_for_target_package(self):
         from adb_pusher import extract_package_crash_evidence
 
@@ -1015,6 +1354,70 @@ class TestAppLaunchPrecheck:
         assert result["ok"] is False
         assert result["code"] == "APP_CRASHED"
         assert result["message"] == "包体闪退，暂不适配"
+
+    def test_launch_precheck_detects_stable_mandatory_google_login(self):
+        from adb_pusher import run_app_launch_precheck
+
+        command_result = MagicMock(returncode=0, stdout="Events injected: 1", stderr="")
+        login_gate = {
+            "required": True,
+            "code": "GOOGLE_LOGIN_REQUIRED",
+            "message": "应用只能通过 Google 登录进入，未发现游客入口",
+            "evidence": "sign in with google",
+        }
+        with patch("adb_pusher.is_package_installed", return_value=True), \
+             patch("adb_pusher._run_adb", return_value=command_result), \
+             patch("adb_pusher._is_app_process_running", return_value=True), \
+             patch(
+                 "adb_pusher.dismiss_safe_interrupting_dialog",
+                 return_value={"dismissed": False},
+             ), \
+             patch(
+                 "adb_pusher.detect_mandatory_google_login_screen",
+                 return_value=login_gate,
+             ) as detect, \
+             patch("adb_pusher.time.monotonic", side_effect=[0, 0.1, 0.2]):
+            result = run_app_launch_precheck(
+                "com.google.login.game",
+                observation_seconds=20,
+                poll_interval_seconds=0,
+            )
+
+        assert detect.call_count == 2
+        assert result["ok"] is False
+        assert result["code"] == "GOOGLE_LOGIN_REQUIRED"
+        assert result["summary"] == "sign in with google"
+
+    def test_launch_precheck_keeps_optional_google_login_adaptable(self):
+        from adb_pusher import run_app_launch_precheck
+
+        command_result = MagicMock(returncode=0, stdout="Events injected: 1", stderr="")
+        optional_login = {
+            "required": False,
+            "code": "GOOGLE_LOGIN_HAS_BYPASS",
+            "message": "页面提供免登录入口",
+        }
+        with patch("adb_pusher.is_package_installed", return_value=True), \
+             patch("adb_pusher._run_adb", return_value=command_result), \
+             patch("adb_pusher._is_app_process_running", return_value=True), \
+             patch(
+                 "adb_pusher.dismiss_safe_interrupting_dialog",
+                 return_value={"dismissed": False},
+             ), \
+             patch(
+                 "adb_pusher.detect_mandatory_google_login_screen",
+                 return_value=optional_login,
+             ), \
+             patch("adb_pusher._read_crash_logcat", return_value=""), \
+             patch("adb_pusher.time.monotonic", side_effect=[0, 0.1, 1.1]):
+            result = run_app_launch_precheck(
+                "com.optional.login.game",
+                observation_seconds=1,
+                poll_interval_seconds=0,
+            )
+
+        assert result["ok"] is True
+        assert result["code"] == "LAUNCH_OK"
 
 
 class TestPackageRuntimeMonitor:
@@ -1840,3 +2243,111 @@ class TestExtractLogcatFields:
         assert fields["_runtime_code"] == "ADB_UNAUTHORIZED"
         assert fields["_transient"] is False
         assert fields["_logcat_attempts"] == 1
+
+
+class TestRunStreamProcessCleanup:
+    """run_stream 的 on_line 回调抛异常时，子进程必须被回收。"""
+
+    def _run_with_raising_callback(self, cmd):
+        import threading
+        import time as _time
+
+        from adb_pusher import run_stream
+
+        procs = []
+        produced_line = threading.Event()
+        done = threading.Event()
+        results = {}
+
+        def on_proc(proc):
+            procs.append(proc)
+
+        def on_line(line):
+            produced_line.set()
+            raise RuntimeError("回调故意抛异常")
+
+        def on_done(rc):
+            results["rc"] = rc
+            done.set()
+
+        run_stream(cmd, on_line, on_done, on_proc=on_proc)
+
+        assert produced_line.wait(10), "命令未产生任何输出"
+        assert done.wait(10), "on_done 未被调用"
+        return procs[0]
+
+    def test_process_is_killed_when_on_line_raises(self):
+        # 先输出一行再挂 30 秒，保证 on_line 被调用且进程仍在运行
+        proc = self._run_with_raising_callback(
+            ["sh", "-c", "echo line1; sleep 30"]
+        )
+
+        # 回调抛异常后进程必须被杀掉，不能残留 30 秒
+        import time as _time
+
+        deadline = _time.monotonic() + 5
+        while _time.monotonic() < deadline and proc.poll() is None:
+            _time.sleep(0.05)
+        assert proc.poll() is not None, "子进程未被回收，发生泄漏"
+
+    def test_on_done_still_fires_when_command_not_found(self):
+        # 命令不存在时线程必须正常走完 on_done，不能因回调抛异常而丢失
+        import threading
+
+        from adb_pusher import run_stream
+
+        done = threading.Event()
+        return_codes = []
+
+        def on_line(line):
+            raise RuntimeError("回调故意抛异常")
+
+        def on_done(rc):
+            return_codes.append(rc)
+            done.set()
+
+        run_stream(["apk_tool_no_such_cmd_xyz"], on_line, on_done)
+
+        assert done.wait(10), "on_done 未被调用"
+        assert return_codes == [-1]
+
+
+class TestManifestAttributionFallback:
+    def test_selects_base_apk_from_split_package_paths(self):
+        from adb_pusher import parse_pm_package_paths, select_base_apk_path
+
+        output = (
+            "package:/data/app/~~token/com.example/base.apk\n"
+            "package:/data/app/~~token/com.example/split_config.arm64_v8a.apk\n"
+            "package:/data/app/~~token/com.example/split_config.en.apk\n"
+        )
+
+        paths = parse_pm_package_paths(output)
+
+        assert len(paths) == 3
+        assert select_base_apk_path(paths).endswith("/base.apk")
+
+    def test_detects_known_attribution_sdks_without_android_false_positive(self):
+        from adb_pusher import detect_manifest_attribution_platforms
+
+        manifest = """
+        A: android:name="com.google.android.gms.permission.AD_ID"
+        A: android:name="android.permission.ACCESS_ADSERVICES_ATTRIBUTION"
+        A: android:name="com.appsflyer.SingleInstallBroadcastReceiver"
+        A: android:name="com.adjust.sdk.AdjustReferrerReceiver"
+        A: android:name="io.appmetrica.analytics.push.provider.FirebasePushServiceControllerProvider"
+        """
+
+        result = detect_manifest_attribution_platforms(manifest)
+
+        assert result["platforms"] == ["AppsFlyer", "Adjust", "AppMetrica"]
+        assert not any("Firebase" in item for item in result["platforms"])
+
+    def test_empty_manifest_is_unknown_instead_of_guessing(self):
+        from adb_pusher import detect_manifest_attribution_platforms
+
+        result = detect_manifest_attribution_platforms(
+            'A: android:name="com.google.firebase.provider.FirebaseInitProvider"'
+        )
+
+        assert result == {"platforms": [], "evidence": []}

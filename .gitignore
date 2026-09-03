@@ -30,6 +30,12 @@ android/share-receiver/debug.keystore
 gui_settings.json
 automation_checkpoint.json
 automation_reports/
+.apk-tool-owner/
+apk-tool-license*.json
+ed25519-private.pem
+.apk-tool-owner/
+apk-tool-license*.json
+ed25519-private.pem
 
 # Local Claude settings
 .claude/

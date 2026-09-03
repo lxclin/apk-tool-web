@@ -111,7 +111,7 @@ async def api_version():
 # ── 配置 REST ─────────────────────────────────────────────────────
 
 @app.get("/api/config")
-async def read_config(path: str = ""):
+def read_config(path: str = ""):
     cfg_path = path or CONFIG_DEFAULT
     if not os.path.isfile(cfg_path):
         return {"ok": False, "error": f"文件不存在: {cfg_path}"}
@@ -130,7 +130,7 @@ async def read_config(path: str = ""):
 
 
 @app.post("/api/config")
-async def write_config(data: dict):
+def write_config(data: dict):
     pkg = data.get("packageName", "").strip()
     appid = data.get("appId", "").strip()
     if not pkg:
@@ -160,12 +160,13 @@ async def write_config(data: dict):
 
 
 @app.get("/api/device")
-async def device_status():
+def device_status():
+    # 同步端点：FastAPI 会在线程池执行，避免 subprocess 阻塞事件循环
     return {"ok": True, "connected": check_device()}
 
 
 @app.post("/api/get-uid")
-async def get_uid_api(data: dict):
+def get_uid_api(data: dict):
     pkg = data.get("packageName", "").strip()
     if not pkg:
         return {"ok": False, "error": "请输入包名"}
@@ -178,7 +179,7 @@ async def get_uid_api(data: dict):
 
 
 @app.post("/api/adb-path")
-async def set_adb(data: dict):
+def set_adb(data: dict):
     path = data.get("path", "")
     if path and os.path.isfile(path):
         set_adb_path(path)
@@ -192,7 +193,7 @@ async def get_whitelist():
 
 
 @app.post("/api/whitelist")
-async def update_whitelist(data: dict):
+def update_whitelist(data: dict):
     global ALLOWED_IPS
     ips = data.get("ips", [])
     if not isinstance(ips, list):
@@ -248,7 +249,9 @@ async def _run_cmd_stream(ws: WebSocket, cmd: list[str], cwd=None,
     exit_code = -1
     while True:
         try:
-            kind, val = q.get(timeout=0.1)
+            # q.get 是同步阻塞调用，必须移出事件循环，
+            # 否则每次迭代会卡住整个服务 100ms
+            kind, val = await asyncio.to_thread(q.get, timeout=0.1)
         except queue.Empty:
             await asyncio.sleep(0.05)
             continue
@@ -271,8 +274,9 @@ async def _run_cmd_stream(ws: WebSocket, cmd: list[str], cwd=None,
 async def _stop_logcat():
     global _logcat_proc, _logcat_task
     if _logcat_proc:
-        stop_logcat_stream(_logcat_proc)
-        _logcat_proc = None
+        proc, _logcat_proc = _logcat_proc, None
+        # terminate/wait 最多阻塞 3 秒，移到线程池执行
+        await asyncio.to_thread(stop_logcat_stream, proc)
     if _logcat_task and not _logcat_task.done():
         _logcat_task.cancel()
         _logcat_task = None
@@ -330,7 +334,7 @@ async def _logcat_reader(ws: WebSocket, pattern: str):
 
 
 @app.post("/api/upload-apk")
-async def upload_apk(file: UploadFile = File(...)):
+def upload_apk(file: UploadFile = File(...)):
     """上传 APK/XAPK 文件到服务器临时目录"""
     try:
         suffix = Path(file.filename).suffix
@@ -349,7 +353,7 @@ async def ws_endpoint(ws: WebSocket):
     # 连接后立刻推送设备状态
     try:
         adb_path = get_adb_path()
-        connected = check_device()
+        connected = await asyncio.to_thread(check_device)
         await ws.send_json({
             "type": "device_status",
             "connected": connected,
@@ -468,10 +472,13 @@ async def ws_endpoint(ws: WebSocket):
                 pattern = msg.get("pattern", "")
                 uid = msg.get("uid", "").strip() or None
                 await _stop_logcat()
-                if not check_device():
+                if not await asyncio.to_thread(check_device):
                     await ws.send_json({"type": "error", "text": "没有已连接的设备"})
                     continue
-                _logcat_proc = start_logcat_stream(pattern, uid)
+                # logcat -c + Popen 都可能阻塞数秒，移到线程池
+                _logcat_proc = await asyncio.to_thread(
+                    start_logcat_stream, pattern, uid
+                )
                 uid_display = f" --uid={uid}" if uid else ""
                 await ws.send_json({"type": "cmd_display", "text": f"adb logcat{uid_display} | grep {pattern}"})
                 _logcat_task = asyncio.create_task(_logcat_reader(ws, pattern))
@@ -481,9 +488,10 @@ async def ws_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "logcat_stopped"})
 
             elif msg_type == "device_check":
+                connected = await asyncio.to_thread(check_device)
                 await ws.send_json({
                     "type": "device_status",
-                    "connected": check_device(),
+                    "connected": connected,
                     "adb_path": get_adb_path() or "未找到",
                 })
 

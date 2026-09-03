@@ -8,6 +8,7 @@ backend URL without changing the established manual workflow.
 from __future__ import annotations
 
 import json
+import html
 import os
 import re
 import ssl
@@ -18,7 +19,12 @@ from typing import Any
 
 import requests
 
-from adb_pusher import build_backend_url, get_adb_path, normalize_optional_parameter
+from adb_pusher import (
+    build_backend_url,
+    get_adb_path,
+    launch_app_with_fallback,
+    normalize_optional_parameter,
+)
 
 
 AUTOMATION_COMMENT_PREFIX = "【APK Tool 自动化适配："
@@ -33,6 +39,30 @@ SYMBOLIC_AD_IDS_BY_FIELD = {
     "插屏聚合id": frozenset({"inter"}),
 }
 INFERRED_IRONSOURCE_VERDICT = "IronSource聚合（根据 video/inter 自动推断）"
+GOOGLE_PLAY_LOW_INSTALL_THRESHOLD = 100_000
+
+
+def is_negative_aggregation_verdict(value: Any) -> bool:
+    """Return whether *value* explicitly says that no mediation was found.
+
+    AutoDetector sometimes writes a human-readable negative conclusion into
+    ``最终判断`` instead of leaving it empty.  Such text is not a real
+    aggregation type and must not block the exact ``video``/``inter``
+    IronSource fallback.
+    """
+    compact = re.sub(r"\s+", "", normalize_optional_parameter(value)).casefold()
+    if not compact:
+        return False
+    negative_markers = (
+        "未检测到主要聚合平台",
+        "未检测到聚合平台",
+        "未发现主要聚合平台",
+        "未发现聚合平台",
+        "未识别出聚合类型",
+        "未识别聚合类型",
+        "无聚合平台",
+    )
+    return any(marker.casefold() in compact for marker in negative_markers)
 INFERRED_AGGREGATION_FAILURE_NOTE = "未识别出聚合类型，暂不适配"
 BACKEND_CACHE_CLEAR_URL = (
     "https://a2-2.hilong.vip/a2/delete_a2_package_cache"
@@ -43,6 +73,7 @@ PRECHECK_BLACKLIST_REASONS = {
     "IAP_ONLY": "应用内购，无广告，加黑",
     "JAPANESE_PACKAGE": "日本包体，加黑",
     "ALL_NETWORK_NO_PACKAGE": "全网无包，暂不适配",
+    "GOOGLE_LOGIN_REQUIRED": "需要 Google 登录且无免登录入口，加黑",
 }
 
 
@@ -92,6 +123,11 @@ def apply_aggregation_type_fallback(
     if not isinstance(fields, dict):
         return fields
     verdict = normalize_optional_parameter(fields.get("最终判断"))
+    if is_negative_aggregation_verdict(verdict):
+        fields.setdefault("_raw_aggregation_verdict", verdict)
+        fields["最终判断"] = ""
+        fields.pop("_aggregation_type_inferred", None)
+        verdict = ""
     if verdict:
         # A later AutoDetector pass can replace an earlier provisional
         # video/inter inference with an explicit verdict. Do not leave the
@@ -179,6 +215,102 @@ def has_any_ad_unit_id(fields: dict[str, Any] | None) -> bool:
     )
 
 
+def parse_google_play_install_count(page_text: str) -> tuple[int, str] | None:
+    """Extract the official Play Store install bucket from an English page."""
+    # Play currently renders the count and the "Downloads" label in adjacent
+    # divs (for example ``1K+</div><div>Downloads``).  Convert markup to visible
+    # text first so both that layout and plain-text fixtures share one parser.
+    text = html.unescape(re.sub(r"<[^>]+>", " ", str(page_text or "")))
+    match = re.search(
+        r"(?<![\d,])([0-9][0-9,]*(?:\.[0-9]+)?\s*[KMB]?)\+\s+"
+        r"(?:downloads|installs)\b",
+        text,
+        re.I,
+    )
+    if not match:
+        return None
+    raw_value = re.sub(r"\s+", "", match.group(1)).upper()
+    display = f"{raw_value}+"
+    try:
+        suffix = raw_value[-1:] if raw_value[-1:] in {"K", "M", "B"} else ""
+        number_text = raw_value[:-1] if suffix else raw_value
+        multiplier = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}[suffix]
+        count = int(float(number_text.replace(",", "")) * multiplier)
+    except ValueError:
+        return None
+    return count, display
+
+
+def fetch_google_play_install_count(
+    package_name: str,
+    *,
+    session: Any = None,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    """Read one app's public install bucket from its official Play page."""
+    package_name = str(package_name or "").strip()
+    if not package_name:
+        return {
+            "ok": False,
+            "code": "GOOGLE_PLAY_PACKAGE_EMPTY",
+            "message": "缺少包名，无法读取 Google Play 下载量",
+        }
+    url = (
+        "https://play.google.com/store/apps/details?id="
+        + urllib.parse.quote(package_name, safe=".")
+        + "&hl=en&gl=US"
+    )
+    http = session or requests
+    try:
+        response = http.get(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 Chrome/126 Safari/537.36"
+                )
+            },
+            timeout=max(1, int(timeout)),
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "code": "GOOGLE_PLAY_INSTALLS_QUERY_FAILED",
+            "message": f"Google Play 下载量读取失败: {exc}",
+            "url": url,
+        }
+    parsed = parse_google_play_install_count(response.text)
+    if parsed is None:
+        return {
+            "ok": False,
+            "code": "GOOGLE_PLAY_INSTALLS_NOT_FOUND",
+            "message": "Google Play 页面未解析到下载量，不执行白包判定",
+            "url": url,
+        }
+    installs, display = parsed
+    return {
+        "ok": True,
+        "code": "GOOGLE_PLAY_INSTALLS_FOUND",
+        "message": f"Google Play 下载量: {display}",
+        "installs": installs,
+        "display": display,
+        "url": url,
+    }
+
+
+def is_suspected_white_package(fields: dict[str, Any] | None) -> bool:
+    """Return whether low installs and missing mediation evidence meet the rule."""
+    fields = fields or {}
+    try:
+        installs = int(fields.get("_google_play_installs"))
+    except (TypeError, ValueError):
+        return False
+    if installs >= GOOGLE_PLAY_LOW_INSTALL_THRESHOLD:
+        return False
+    return not has_aggregation_type(fields) or not has_any_ad_unit_id(fields)
+
+
 def has_partial_aggregation_evidence(fields: dict[str, Any] | None) -> bool:
     """Return whether progressive logs already contain mediation evidence."""
     fields = fields or {}
@@ -198,6 +330,12 @@ def has_partial_aggregation_evidence(fields: dict[str, Any] | None) -> bool:
 
 def detection_field_issue(fields: dict[str, Any] | None) -> tuple[str, str] | None:
     """Return the terminal field issue that needs one detection retry."""
+    if is_suspected_white_package(fields):
+        display = str((fields or {}).get("_google_play_installs_text") or "").strip()
+        return (
+            "SUSPECTED_WHITE_PACKAGE",
+            f"Google Play 下载量{display or '少于10万'}，且聚合类型或广告 ID 缺失，疑似白包，暂不适配",
+        )
     if not has_aggregation_type(fields):
         if has_partial_aggregation_evidence(fields):
             return (
@@ -291,7 +429,16 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
         evidence.append(f"检测到激励视频聚合id：{rewarded}")
     attribution = normalize_optional_parameter(fields.get("归因平台"))
     if attribution:
-        evidence.append(f"检测到归因平台：{attribution}")
+        attribution_source = str(fields.get("_attribution_source") or "").strip()
+        if attribution_source:
+            evidence.append(f"{attribution_source}检测到归因平台：{attribution}")
+            method = f"{method} + Manifest归因兜底"
+        else:
+            evidence.append(f"检测到归因平台：{attribution}")
+    for item in fields.get("_attribution_evidence", []) or []:
+        detail = str(item or "").strip()
+        if detail:
+            evidence.append(f"Manifest证据：{detail}")
 
     log_text = str(fields.get("完整日志") or "")
     platform_token = ""
@@ -320,7 +467,15 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
     unsupported_attribution = bool(
         issue and issue[0] == "UNSUPPORTED_ATTRIBUTION"
     )
-    if unsupported_attribution:
+    suspected_white_package = bool(
+        issue and issue[0] == "SUSPECTED_WHITE_PACKAGE"
+    )
+    terminal_note_only = unsupported_attribution or suspected_white_package
+    if suspected_white_package:
+        method = "低下载量疑似白包规则"
+        confidence = "不评级"
+        auto_submit = True
+    elif unsupported_attribution:
         # A clear mediation verdict does not make a non-whitelisted
         # attribution an adaptable/high-confidence task. This is a terminal
         # business outcome whose only backend write is a note-only payload.
@@ -329,11 +484,11 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
         auto_submit = True
     else:
         auto_submit = issue is None and bool(activity)
-    if not activity and not unsupported_attribution:
+    if not activity and not terminal_note_only:
         evidence.append("缺少初始 Activity，禁止自动提交")
-    if issue and not unsupported_attribution:
+    if issue and not terminal_note_only:
         evidence.append(f"阻断原因：{issue[1]}")
-    elif unsupported_attribution:
+    elif terminal_note_only:
         evidence.append(f"终态规则：{issue[1]}，仅提交备注字段并跳过回放")
     return {
         "method": method,
@@ -342,13 +497,17 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
         "auto_submit": auto_submit,
         "policy": (
             "仅提交备注并跳过回放"
-            if auto_submit and unsupported_attribution
+            if auto_submit and terminal_note_only
             else ("允许自动提交" if auto_submit else "禁止自动提交")
         ),
         "terminal_outcome": (
-            "unsupported_attribution" if unsupported_attribution else ""
+            "suspected_white_package"
+            if suspected_white_package
+            else "unsupported_attribution"
+            if unsupported_attribution
+            else ""
         ),
-        "submit_mode": "note_only" if unsupported_attribution else "full",
+        "submit_mode": "note_only" if terminal_note_only else "full",
     }
 
 
@@ -372,24 +531,15 @@ def restart_app_for_aggregation_detection(package_name: str) -> tuple[bool, str]
         subprocess.run(
             [adb, "logcat", "-c"], capture_output=True, text=True, timeout=8
         )
-        launched = subprocess.run(
-            [
-                adb,
-                "shell",
-                "monkey",
-                "-p",
-                package_name,
-                "-c",
-                "android.intent.category.LAUNCHER",
-                "1",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        output = ((launched.stdout or "") + (launched.stderr or "")).strip()
-        if launched.returncode != 0 or "No activities found" in output:
+        launched = launch_app_with_fallback(package_name, timeout=20)
+        output = str(launched.get("output") or "").strip()
+        if not launched.get("ok"):
             return False, f"重新启动应用失败：{output or '未知错误'}"
+        if launched.get("method") == "explicit_activity":
+            return True, (
+                "应用已通过真实 Activity 重新启动（"
+                f"{launched.get('component')}）"
+            )
         launch_summary = ""
         for line in reversed(output.splitlines()):
             clean = line.strip()
@@ -761,6 +911,19 @@ def format_aggregation_fields(data: dict[str, Any]) -> str:
             f"归因平台:{data.get('归因平台', '')}",
         ]
     )
+    install_count_text = str(data.get("_google_play_installs_text") or "").strip()
+    if install_count_text:
+        lines.append(f"Google Play下载量:{install_count_text}")
+    attribution_source = str(data.get("_attribution_source") or "").strip()
+    if attribution_source:
+        lines.append(f"归因识别方式:{attribution_source}")
+        attribution_evidence = "；".join(
+            str(item or "").strip()
+            for item in data.get("_attribution_evidence", []) or []
+            if str(item or "").strip()
+        )
+        if attribution_evidence:
+            lines.append(f"归因识别依据:{attribution_evidence}")
     return "\n".join(lines)
 
 
@@ -800,13 +963,14 @@ def update_asana_aggregation_notes(
     fields: dict[str, Any],
     *,
     allow_unsupported_attribution: bool = False,
+    allow_missing_aggregation: bool = False,
     terminal_note: str = "",
 ) -> str:
     """Write the formatted aggregation block to one known Asana task."""
     task_gid = str(task_gid or "").strip()
     if not task_gid:
         raise ValueError("当前自动化任务缺少 Asana task GID")
-    if not has_aggregation_type(fields):
+    if not has_aggregation_type(fields) and not allow_missing_aggregation:
         raise ValueError("聚合类型识别为空，不能回填 Asana 描述")
     unsupported = attribution_gate_issue(fields)
     if unsupported and not allow_unsupported_attribution:

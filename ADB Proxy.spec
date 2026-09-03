@@ -11,6 +11,7 @@ a = Analysis(
     datas=[
         # 用 datas 而非 binaries，避免 PyInstaller 裁剪架构为 arm64-only
         (ADB_SRC, 'adb'),
+        ('permission_public_key.pem', '.'),
     ],
     hiddenimports=[
         'websockets',
@@ -30,6 +31,8 @@ a = Analysis(
         'asana.api.sections_api',
         'asana.api.stories_api',
         'asana.api.tasks_api',
+        'cryptography',
+        'cryptography.hazmat.primitives.asymmetric.ed25519',
     ],
     hookspath=[],
     hooksconfig={},

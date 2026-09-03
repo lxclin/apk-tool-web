@@ -35,6 +35,8 @@ from auto_asana.main import (
     update_sheet_value,
     update_sheet_row,
     batch_update_sheet_values,
+    plan_automation_outcome_sheet_updates,
+    write_automation_outcome_to_sheet,
     backfill_task_links,
     apply_sheet_row_updates,
     GS_SCOPES,
@@ -45,10 +47,12 @@ from auto_asana.main import (
     find_or_create_section,
     get_existing_task_names,
     get_existing_tasks_by_name,
+    migrate_previous_day_tasks,
     get_asana_tasks_for_date,
     parse_asana_precheck_task,
     build_precheck_asana_comment,
     add_precheck_comment_once,
+    classify_precheck_workflow_stages,
     classify_precheck_workflow_status,
     create_tasks_for_packages,
     update_task_notes_for_packages,
@@ -58,6 +62,83 @@ from auto_asana.main import (
     _build_gs_service,
     sync_packages,
 )
+
+
+class TestAutomationOutcomeSheetFeedback:
+    def _sheet_data(self):
+        return [
+            [
+                "包名", "任务链接", "聚合适配", "适配进度", "完成时间",
+                "动作适配", "适配进度", "聚合", "归因", "广告是否正常",
+                "适配所遇问题",
+            ],
+            [
+                "com.example.keep", "", "snow", "适配中", "", "snow", "A2关闭",
+                "", "", "", "",
+            ],
+            [
+                "com.example.target", "", "rain", "适配中", "", "snow", "A2关闭",
+                "", "", "", "",
+            ],
+        ]
+
+    def test_success_updates_only_aggregation_result_fields(self):
+        updates = plan_automation_outcome_sheet_updates(
+            self._sheet_data(), sheet_name="26年7-8月",
+            package_name="com.example.target", outcome="success",
+            fields={"最终判断": "MAX聚合（强关系证据确认）", "归因平台": "AppsFlyer"},
+            today=date(2026, 8, 28),
+        )
+        values = {update.range_name: update.value for update in updates}
+        assert values["'26年7-8月'!D3"] == "已适配"
+        assert values["'26年7-8月'!E3"] == "26.8.28"
+        assert values["'26年7-8月'!H3"] == "max"
+        assert values["'26年7-8月'!I3"] == "AppsFlyer"
+        assert values["'26年7-8月'!J3"] == "广告正常"
+        assert "'26年7-8月'!G3" not in values
+
+    def test_not_adapted_writes_business_reason_without_platform(self):
+        updates = plan_automation_outcome_sheet_updates(
+            self._sheet_data(), sheet_name="26年7-8月",
+            package_name="com.example.target", outcome="not_adapted",
+            message="归因为SolarEngine，暂不适配", today=date(2026, 8, 28),
+        )
+        values = {update.range_name: update.value for update in updates}
+        assert values["'26年7-8月'!D3"] == "暂不适配"
+        assert values["'26年7-8月'!K3"] == "归因为SolarEngine，暂不适配"
+        assert "'26年7-8月'!H3" not in values
+        assert "'26年7-8月'!I3" not in values
+
+    def test_transient_failure_is_not_written_as_training_label(self):
+        assert plan_automation_outcome_sheet_updates(
+            self._sheet_data(), sheet_name="26年7-8月",
+            package_name="com.example.target", outcome="failed",
+            message="ADB timeout",
+        ) == []
+
+    def test_other_assignees_are_read_only(self):
+        sheet = self._sheet_data()
+        sheet[2][2] = "snow"
+        assert plan_automation_outcome_sheet_updates(
+            sheet, sheet_name="26年7-8月",
+            package_name="com.example.target", outcome="success",
+            fields={"最终判断": "MAX聚合"},
+        ) == []
+
+    @patch("auto_asana.main.batch_update_sheet_values")
+    @patch("auto_asana.main.get_sheet_data")
+    def test_writer_batches_planned_cells(self, mock_get, mock_batch):
+        mock_get.return_value = self._sheet_data()
+        mock_batch.return_value = {"totalUpdatedCells": 5}
+        result = write_automation_outcome_to_sheet(
+            MagicMock(), "sheet-123", "26年7-8月",
+            package_name="com.example.target", outcome="success",
+            fields={"最终判断": "MAX聚合", "归因平台": "Adjust"},
+            today=date(2026, 8, 28),
+        )
+        assert result["ok"] is True
+        assert result["updated_cells"] == 5
+        mock_batch.assert_called_once()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -102,6 +183,59 @@ class TestGenerateTargetDates:
 
 
 class TestAsanaPrecheckTasks:
+    def test_action_failure_does_not_overwrite_aggregation_success(self):
+        stories = [
+            {
+                "text": "【APK Tool 自动化适配：AGGREGATION_REPLAY_SUCCESS】\n聚合适配完成",
+                "resource_subtype": "comment_added",
+                "created_at": "2026-08-31T01:00:00Z",
+            },
+            {
+                "text": "动作适配失败，暂不适配",
+                "resource_subtype": "comment_added",
+                "created_at": "2026-08-31T02:00:00Z",
+            },
+        ]
+
+        stages = classify_precheck_workflow_stages(stories)
+        assert (stages.workflow_status, stages.terminal) == (
+            "聚合适配成功",
+            True,
+        )
+        assert stages.aggregation_detection_status == "参数已确认"
+        assert stages.backend_submission_status == "提交成功"
+        assert stages.interstitial_replay_status == "回放成功"
+        assert stages.rewarded_replay_status == "回放成功"
+        assert stages.action_adaptation_status == "动作适配失败"
+
+    def test_workflow_stages_preserve_backend_failure_separately(self):
+        stories = [
+            {
+                "text": "【APK Tool 页面预检：APKCOMBO_AVAILABLE】\nAPKCombo 存在包体",
+                "created_at": "2026-08-31T01:00:00Z",
+            },
+            {
+                "text": "【APK Tool 自动化适配：BACKEND_SUBMIT_FAILED】\n后台提交失败",
+                "created_at": "2026-08-31T02:00:00Z",
+            },
+        ]
+
+        stages = classify_precheck_workflow_stages(stories)
+        assert stages.precheck_status == "APKCombo有包"
+        assert stages.backend_submission_status == "后台提交失败"
+        assert stages.workflow_status == "后台提交失败"
+
+    def test_clean_exit_comment_remains_actionable(self):
+        comment = (
+            "【APK Tool 页面预检：APP_EXITED】\n"
+            "应用启动后进程正常退出，未发现明确崩溃堆栈"
+        )
+
+        assert classify_precheck_workflow_status([{"text": comment}]) == (
+            "启动待复检",
+            False,
+        )
+
     def test_apkcombo_available_comment_is_actionable_not_terminal(self):
         comment = (
             "【APK Tool 页面预检：APKCOMBO_AVAILABLE】\n"
@@ -143,12 +277,55 @@ class TestAsanaPrecheckTasks:
             True,
         )
 
+    def test_later_intermediate_precheck_does_not_override_automation_result(self):
+        stories = [
+            {
+                "text": "【APK Tool 自动化适配：AGGREGATION_REPLAY_SUCCESS】\n聚合适配完成",
+                "resource_subtype": "comment_added",
+                "created_at": "2026-08-28T01:00:00Z",
+            },
+            {
+                "text": "【APK Tool 页面预检：APKCOMBO_AVAILABLE】\nAPKCombo 存在包体",
+                "resource_subtype": "comment_added",
+                "created_at": "2026-08-28T02:00:00Z",
+            },
+        ]
+
+        assert classify_precheck_workflow_status(stories) == (
+            "聚合适配成功",
+            True,
+        )
+
+    def test_later_manual_business_correction_can_override_automation_result(self):
+        stories = [
+            {
+                "text": "【APK Tool 自动化适配：AGGREGATION_REPLAY_SUCCESS】\n聚合适配完成",
+                "resource_subtype": "comment_added",
+                "created_at": "2026-08-28T01:00:00Z",
+            },
+            {
+                "text": "人工复核：包体闪退，暂不适配",
+                "resource_subtype": "comment_added",
+                "created_at": "2026-08-28T02:00:00Z",
+            },
+        ]
+
+        assert classify_precheck_workflow_status(stories) == (
+            "包体闪退",
+            True,
+        )
+
     @pytest.mark.parametrize(
         ("comment", "expected"),
         [
             ("【APK Tool 页面预检：APP_CRASHED】\n包体闪退，暂不适配", "包体闪退"),
             ("Singular归因，暂不适配", "其他归因"),
-            ("【APK Tool 自动化适配：AF_KEY_EMPTY】\naf_key为空", "参数待确认"),
+            (
+                "【APK Tool 自动化适配：SUSPECTED_WHITE_PACKAGE】\n疑似白包，暂不适配",
+                "疑似白包",
+            ),
+            ("【APK Tool 自动化适配：AF_KEY_EMPTY】\naf_key为空", "af_key为空"),
+            ("人工检查：af_key未找到", "af_key为空"),
             ("【APK Tool 自动化适配：AD_REPLAY_FAILED】\n未确认广告展示", "回放失败"),
             (
                 "【APK Tool 自动化适配：PRECHECK_BLACKLIST_CACHE_FAILED】\n刷新缓存失败",
@@ -1185,6 +1362,19 @@ class TestAsanaSdkFacades:
             "proj-123", {"body": {"data": {"name": "6.9执行"}}}
         )
 
+    def test_add_task_for_section_passes_task_gid(self):
+        api = MagicMock()
+        api.add_task_for_section.return_value = {}
+        facade = _SectionsFacade(api)
+
+        result = facade.add_task_for_section("section-today", "task-old")
+
+        assert result == {}
+        api.add_task_for_section.assert_called_once_with(
+            "section-today",
+            {"body": {"data": {"task": "task-old"}}},
+        )
+
     def test_create_task_passes_one_sdk_arg(self):
         api = MagicMock()
         api.create_task.return_value = {"gid": "task-new"}
@@ -1576,6 +1766,70 @@ class TestAsanaSyncIdempotency:
         assert len(created) == 1
         mock_client.sections.create_section_for_project.assert_called_once()
         mock_client.tasks.create_task.assert_called_once()
+
+    def test_migrates_unfinished_task_from_yesterday(self):
+        """昨日未完成的同名任务移动到今日分组，不重复创建。"""
+        mock_gs = MagicMock()
+        mock_asana = MagicMock()
+        mock_gs.spreadsheets().values().get().execute.return_value = {
+            "values": [
+                ["包名", "聚合适配", "完成时间", "Asana任务链接"],
+                ["com.app.carryover", "rain", "26.8.27", ""],
+            ]
+        }
+        mock_asana.sections.get_sections_for_project.return_value = [
+            {"gid": "section-yesterday", "name": "8.26执行"},
+            {"gid": "section-today", "name": "8.27执行"},
+        ]
+        mock_asana.tasks.get_tasks_for_section.side_effect = [
+            [],
+            [{
+                "gid": "task-carryover",
+                "name": "聚合/动作适配com.app.carryover",
+                "permalink_url": "https://app.asana.com/0/proj/task-carryover",
+                "notes": "旧描述与评论对应任务",
+                "completed": False,
+            }],
+        ]
+
+        result = sync_packages(
+            gs_service=mock_gs,
+            asana_client=mock_asana,
+            sheet_id="sheet-123",
+            project_gid="proj-123",
+            today=date(2026, 8, 27),
+        )
+
+        assert result["migrated_count"] == 1
+        assert result["migrated_gids"] == ["task-carryover"]
+        assert result["new_count"] == 0
+        mock_asana.sections.add_task_for_section.assert_called_once_with(
+            "section-today", "task-carryover"
+        )
+        mock_asana.tasks.create_task.assert_not_called()
+
+    def test_completed_task_from_yesterday_is_not_migrated(self):
+        """昨日已完成任务不属于残留项，不迁移。"""
+        mock_client = MagicMock()
+        mock_client.sections.get_sections_for_project.return_value = [
+            {"gid": "section-yesterday", "name": "8.26执行"},
+        ]
+        mock_client.tasks.get_tasks_for_section.return_value = [{
+            "gid": "task-done",
+            "name": "聚合/动作适配com.app.done",
+            "completed": True,
+        }]
+
+        migrated = migrate_previous_day_tasks(
+            mock_client,
+            "proj-123",
+            "section-today",
+            ["聚合/动作适配com.app.done"],
+            today=date(2026, 8, 27),
+        )
+
+        assert migrated == {}
+        mock_client.sections.add_task_for_section.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════

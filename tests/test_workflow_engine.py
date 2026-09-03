@@ -38,3 +38,19 @@ def test_launch_failure_has_same_terminal_shape():
     assert terminal["package_name"] == "com.example.game"
     assert "fatal exception" in terminal["detail"]
     assert precheck_task_status(result) == "包体闪退"
+
+
+def test_clean_process_exit_is_pending_recheck_not_terminal_crash():
+    result = {
+        "package_name": "com.example.game",
+        "launch_result": {
+            "ok": False,
+            "code": "APP_EXITED",
+            "message": "进程退出，但没有崩溃证据",
+            "summary": "VM exiting with result code 0",
+        },
+    }
+
+    review = precheck_comment_result(result)
+    assert review["code"] == "APP_EXITED"
+    assert precheck_task_status(result) == "启动待复检"

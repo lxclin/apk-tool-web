@@ -7,3 +7,5 @@ websockets
 python-multipart
 requests>=2.31.0
 asana>=5.0.0
+cryptography>=41.0.0
+cryptography>=41.0.0

@@ -1,6 +1,8 @@
 from datetime import date
 from unittest.mock import MagicMock
 
+import pytest
+
 from daily_summary import (
     DailyComment,
     classify_task_comments,
@@ -48,6 +50,8 @@ def test_last_terminal_aggregation_comment_wins():
         "aggregation_state": "not_adapted",
         "aggregation_reason": "包体闪退，暂不适配",
         "action_success": "1",
+        "action_issue": "",
+        "action_package_name": "",
     }
 
 
@@ -67,6 +71,61 @@ def test_action_success_wording_is_counted():
     )
 
     assert result["action_success"] == "1"
+
+
+def test_action_issue_wording_is_counted_and_keeps_full_reason():
+    result = classify_task_comments(
+        "com.colorwater.sort",
+        [
+            DailyComment(
+                "com.colorwater.sort动作适配失败，动作适配度动作已录制，"
+                "但是回放不成功，且不产生任何日志"
+            )
+        ],
+    )
+
+    assert result["action_success"] == ""
+    assert result["action_issue"] == (
+        "动作适配失败，动作适配度动作已录制，但是回放不成功，且不产生任何日志"
+    )
+    assert result["action_package_name"] == "com.colorwater.sort"
+
+
+def test_latest_action_conclusion_wins():
+    recovered = classify_task_comments(
+        "com.demo",
+        [
+            DailyComment("动作适配异常，点击无反应", "2026-08-31T01:00:00Z"),
+            DailyComment("动作适配成功", "2026-08-31T02:00:00Z"),
+        ],
+    )
+    regressed = classify_task_comments(
+        "com.demo",
+        [
+            DailyComment("动作适配成功", "2026-08-31T01:00:00Z"),
+            DailyComment("动作适配回放失败", "2026-08-31T02:00:00Z"),
+        ],
+    )
+
+    assert recovered["action_success"] == "1"
+    assert recovered["action_issue"] == ""
+    assert regressed["action_success"] == ""
+    assert regressed["action_issue"] == "动作适配回放失败"
+
+
+def test_action_issue_uses_explicit_legacy_package_prefix_from_comment():
+    result = classify_task_comments(
+        "com.pawdoku.puzzle.game",
+        [
+            DailyComment(
+                "com.pawdoku.p动作适配已录制，但是适配涉及快速连点的方法，"
+                "该方法疑似代码未合并，目前无法通过的动作适配"
+            )
+        ],
+    )
+
+    assert result["action_package_name"] == "com.pawdoku.p"
+    assert result["action_issue"].startswith("动作适配已录制")
 
 
 def test_aggregation_success_wording_is_counted():
@@ -101,6 +160,50 @@ def test_structured_automation_comment_extracts_terminal_reason():
     )
 
     assert concise_issue_reason(text, "com.demo") == "Singular归因，暂不适配"
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "expected_reason"),
+    [
+        ("AF_KEY_EMPTY", "af_key为空，再次确认", "af_key为空，暂不适配"),
+        (
+            "LOGCAT_ENDED",
+            "聚合广告回放失败，失败原因：Logcat 监听进程已提前结束",
+            "聚合回放失败（Logcat监听提前结束），暂不适配",
+        ),
+        (
+            "AUTOMATION_FAILED",
+            "自动化执行失败: unexpected keyword argument 'status'",
+            "自动化适配失败，暂不适配",
+        ),
+    ],
+)
+def test_structured_terminal_failures_are_counted_without_legacy_wording(
+    code, message, expected_reason
+):
+    result = classify_task_comments(
+        "com.demo",
+        [DailyComment(f"【APK Tool 自动化适配：{code}】\n{message}")],
+    )
+
+    assert result["aggregation_state"] == "not_adapted"
+    assert result["aggregation_reason"] == expected_reason
+
+
+def test_later_success_supersedes_structured_terminal_failure():
+    result = classify_task_comments(
+        "com.demo",
+        [
+            DailyComment(
+                "【APK Tool 自动化适配：LOGCAT_ENDED】\nLogcat 监听进程已提前结束",
+                "2026-09-02T01:00:00Z",
+            ),
+            DailyComment("聚合适配成功", "2026-09-02T02:00:00Z"),
+        ],
+    )
+
+    assert result["aggregation_state"] == "success"
+    assert result["aggregation_reason"] == ""
 
 
 def test_skip_adaptation_wording_is_normalized_for_daily_report():
@@ -140,6 +243,33 @@ def test_render_matches_requested_layout():
         "com.black：应用内购，无广告，加黑\n\n\n"
         "完成1个动作适配\n"
         "com.success\n"
+    )
+
+
+def test_render_includes_action_issue_section_after_action_successes():
+    text = render_daily_summary(
+        date(2026, 8, 31),
+        [],
+        [],
+        ["com.action.success"],
+        [
+            {
+                "package_name": "puzzle.meow.and.cat",
+                "reason": "动作适配异常，点击事件无反应，暂不适配，已给panda看过",
+            },
+            {
+                "package_name": "com.colorwater.sort",
+                "reason": "动作适配失败，动作已录制，但是回放不成功，且不产生任何日志",
+            },
+        ],
+    )
+
+    assert text.endswith(
+        "完成1个动作适配\n"
+        "com.action.success\n\n\n"
+        "2个动作适配问题\n"
+        "puzzle.meow.and.cat动作适配异常，点击事件无反应，暂不适配，已给panda看过\n"
+        "com.colorwater.sort动作适配失败，动作已录制，但是回放不成功，且不产生任何日志\n"
     )
 
 
@@ -185,6 +315,30 @@ def test_issue_reasons_are_exclusive_and_grouped_by_terminal_state():
     assert summarize_issue_reasons(issues, "blacklist") == [
         {"key": "google_login", "label": "需Google登录", "count": 1},
         {"key": "iap_only", "label": "应用内购无广告", "count": 1},
+    ]
+
+
+def test_empty_ad_ids_and_af_key_are_separate_summary_categories():
+    issues = [
+        {
+            "package_name": "com.empty.ids",
+            "state": "not_adapted",
+            "reason": "插屏聚合id和激励视频聚合id均为空，暂不适配",
+        },
+        {
+            "package_name": "com.empty.af",
+            "state": "not_adapted",
+            "reason": "af_key为空，暂不适配",
+        },
+    ]
+
+    assert summarize_issue_reasons(issues, "not_adapted") == [
+        {
+            "key": "both_ad_ids_empty",
+            "label": "插屏聚合id和激励视频聚合id均为空",
+            "count": 1,
+        },
+        {"key": "af_key_missing", "label": "af_key为空缺失", "count": 1},
     ]
 
 
@@ -310,4 +464,5 @@ def test_generate_reads_date_section_and_comments():
 
     assert result["aggregation_success_count"] == 1
     assert result["action_success_count"] == 1
+    assert result["action_issue_count"] == 0
     assert "com.demo" in result["text"]

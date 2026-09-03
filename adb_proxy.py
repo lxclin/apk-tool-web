@@ -4,7 +4,6 @@
 import asyncio
 import json
 import os
-import re
 import queue
 import shutil
 import signal
@@ -15,7 +14,6 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import tempfile
-import zipfile
 from datetime import date
 from pathlib import Path
 
@@ -25,10 +23,22 @@ from websockets.asyncio.server import serve as ws_serve
 from adb_pusher import (
     PackageRuntimeMonitor,
     build_apkcombo_search_url,
+    build_clear_cache_cmd as _build_clear_cache,
+    build_force_stop_cmd as _build_force_stop,
+    build_get_uid_cmd as _build_get_uid,
+    build_open_app_cmd as _build_open_app,
+    build_push_config_cmd as _build_push_config,
+    build_zygote_build_cmd as _build_zygote_build,
+    check_device as _check_device,
     download_artifact_filename,
+    extract_uid_from_dumpsys,
     get_app_uid,
     parse_autodetector_fields,
+    run_stream as _run_stream,
     set_adb_path as set_core_adb_path,
+    start_logcat_stream,
+    stop_logcat_stream,
+    zip_contains_apks,
 )
 from ad_replay import (
     DEFAULT_REPLAY_TIMEOUT_SECONDS,
@@ -146,123 +156,11 @@ def _find_adb() -> str:
     return _adb_path
 
 
-def _extract_uid_from_dumpsys_line(line: str) -> str | None:
-    match = re.search(r"\b(?:userId|appId)=(\d+)\b", line)
-    if match:
-        return match.group(1)
-    return None
-
-
-def _extract_af_key_from_content(content: str) -> str:
-    patterns = [
-        r"^af[_\s-]*key\s*[:：]\s*(.+)$",
-        r"^Apps[Ff]lyer\s+(?:SDK\s+)?Key\s*[:：]\s*(.+)$",
-        r"^Apps[Ff]lyer\s+Dev(?:eloper)?\s+Key\s*[:：]\s*(.+)$",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, content, re.I)
-        if match:
-            value = match.group(1).strip().strip("[]")
-            if value and value != "未找到":
-                return value
-    return ""
-
-
 # ── 命令构建 ─────────────────────────────────────────────────────
 
 def _cmd_display(cmd: list[str]) -> str:
     s = " ".join(cmd)
     return s.replace(_find_adb(), "adb")
-
-
-def _build_push_config(cfg_path: str) -> list[str]:
-    return [_find_adb(), "push", cfg_path, "/data/local/tmp/zygotehole/"]
-
-
-def _build_zygote_build(work_dir: str) -> list[str]:
-    return ["sh", os.path.join(work_dir, "zygote_build.sh")]
-
-
-def _build_get_uid(pkg: str) -> list[str]:
-    return [_find_adb(), "shell", "dumpsys", "package", pkg]
-
-
-def _build_clear_cache(pkg: str) -> list[str]:
-    return [_find_adb(), "shell", "pm", "clear", pkg]
-
-
-def _build_force_stop(pkg: str) -> list[str]:
-    return [_find_adb(), "shell", "am", "force-stop", pkg]
-
-
-def _build_open_app(pkg: str) -> list[str]:
-    return [_find_adb(), "shell", "monkey", "-p", pkg,
-            "-c", "android.intent.category.LAUNCHER", "1"]
-
-
-# ── 流式执行 ─────────────────────────────────────────────────────
-
-def _run_stream(cmd: list[str], on_line, on_done, cwd=None, timeout=None):
-    def _run():
-        returncode = -1
-        proc = None
-        timer = None
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                cwd=cwd,
-            )
-            if timeout:
-                def _kill():
-                    if proc and proc.poll() is None:
-                        proc.kill()
-                timer = threading.Timer(timeout, _kill)
-                timer.start()
-
-            for line in proc.stdout:
-                on_line(line.rstrip())
-
-            if timer:
-                timer.cancel()
-
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-
-            returncode = proc.returncode
-        except FileNotFoundError:
-            on_line(f"[错误] 命令未找到: {cmd[0]}")
-        except Exception as e:
-            on_line(f"[错误] {e}")
-        finally:
-            if timer:
-                try:
-                    timer.cancel()
-                except Exception:
-                    pass
-        on_done(returncode)
-
-    threading.Thread(target=_run, daemon=True).start()
-
-
-# ── 设备检测 ─────────────────────────────────────────────────────
-
-def _check_device() -> bool:
-    try:
-        result = subprocess.run(
-            [_find_adb(), "devices"],
-            capture_output=True, text=True, timeout=10
-        )
-        lines = result.stdout.strip().split("\n")[1:]
-        return any("\tdevice" in line for line in lines)
-    except Exception:
-        return False
 
 
 # ── 日志字段提取 ─────────────────────────────────────────────────
@@ -463,34 +361,17 @@ async def _http_server_main():
 
 
 def _start_logcat(pattern: str, uid: str | None = None):
+    """启动持续 logcat 流（复用 adb_pusher 核心实现，含旧日志清理）。"""
     global _logcat_proc
-    subprocess.run([_find_adb(), "logcat", "-c"], capture_output=True, timeout=5)
-    cmd = [_find_adb(), "logcat"]
-    if uid:
-        cmd.extend(["--uid", uid])
-    _logcat_proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
-    _logcat_proc._filter_pattern = pattern
+    _logcat_proc = start_logcat_stream(pattern, uid)
     return _logcat_proc
 
 
 def _stop_logcat():
     global _logcat_proc
     if _logcat_proc:
-        try:
-            _logcat_proc.terminate()
-            _logcat_proc.wait(timeout=3)
-        except Exception:
-            try:
-                _logcat_proc.kill()
-            except Exception:
-                pass
-        _logcat_proc = None
+        proc, _logcat_proc = _logcat_proc, None
+        stop_logcat_stream(proc)
 
 
 # ── WebSocket 处理 ───────────────────────────────────────────────
@@ -627,25 +508,28 @@ async def handle_connection(ws):
                 uid = msg.get("uid", "").strip() or None
                 if logcat_task and not logcat_task.done():
                     logcat_task.cancel()
-                _stop_logcat()
-                if not _check_device():
+                # terminate/wait、adb devices、logcat -c 都可能阻塞数秒，
+                # 统一移到线程池执行，避免卡住事件循环
+                await asyncio.to_thread(_stop_logcat)
+                if not await asyncio.to_thread(_check_device):
                     await ws.send(json.dumps({"type": "error", "text": "没有已连接的设备"}))
                     continue
-                proc = _start_logcat(pattern, uid)
+                proc = await asyncio.to_thread(_start_logcat, pattern, uid)
                 uid_display = f" --uid={uid}" if uid else ""
                 await ws.send(json.dumps({"type": "cmd_display", "text": f"adb logcat{uid_display} | grep {pattern}"}))
                 logcat_task = asyncio.create_task(_logcat_reader(ws, pattern, proc))
 
             elif msg_type == "logcat_stop":
-                _stop_logcat()
+                await asyncio.to_thread(_stop_logcat)
                 if logcat_task and not logcat_task.done():
                     logcat_task.cancel()
                 await ws.send(json.dumps({"type": "logcat_stopped"}))
 
             elif msg_type == "device_check":
+                connected = await asyncio.to_thread(_check_device)
                 await ws.send(json.dumps({
                     "type": "device_status",
-                    "connected": _check_device(),
+                    "connected": connected,
                     "adb_path": _find_adb(),
                 }))
 
@@ -1167,7 +1051,7 @@ async def _download_install_ws(ws, url: str):
 
         await ws.send(json.dumps({"type": "line", "text": "下载完成，正在安装..."}))
 
-        if filename.lower().endswith(".xapk") or _zip_contains_apks(tmp_path):
+        if filename.lower().endswith(".xapk") or zip_contains_apks(tmp_path):
             await _install_xapk_ws(ws, tmp_path)
         else:
             cmd = [_find_adb(), "install", "-r", tmp_path]
@@ -1188,14 +1072,6 @@ async def _download_install_ws(ws, url: str):
             pass
 
 
-def _zip_contains_apks(zip_path: str) -> bool:
-    try:
-        with zipfile.ZipFile(zip_path, "r") as z:
-            return any(name.lower().endswith(".apk") for name in z.namelist())
-    except (OSError, zipfile.BadZipFile):
-        return False
-
-
 async def _run_cmd_ws(ws, cmd: list[str], cwd=None, timeout=None):
     """执行短命令，流式推送结果"""
     q: queue.Queue = queue.Queue()
@@ -1210,7 +1086,8 @@ async def _run_cmd_ws(ws, cmd: list[str], cwd=None, timeout=None):
 
     while True:
         try:
-            kind, val = q.get(timeout=0.1)
+            # q.get 是同步阻塞调用，移到线程池避免卡住事件循环
+            kind, val = await asyncio.to_thread(q.get, timeout=0.1)
         except queue.Empty:
             await asyncio.sleep(0.05)
             continue
@@ -1242,7 +1119,8 @@ async def _run_get_uid_ws(ws, cmd: list[str]):
 
     while True:
         try:
-            kind, val = q.get(timeout=0.1)
+            # q.get 是同步阻塞调用，移到线程池避免卡住事件循环
+            kind, val = await asyncio.to_thread(q.get, timeout=0.1)
         except queue.Empty:
             await asyncio.sleep(0.05)
             continue
@@ -1252,7 +1130,7 @@ async def _run_get_uid_ws(ws, cmd: list[str]):
             except Exception:
                 break
             if uid_found is None:
-                uid_found = _extract_uid_from_dumpsys_line(val)
+                uid_found = extract_uid_from_dumpsys(val)
         elif kind == "done":
             try:
                 await ws.send(json.dumps({"type": "done", "exit": val}))
