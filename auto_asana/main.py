@@ -186,6 +186,8 @@ _AUTOMATION_CODE_STATUSES = {
     "AUTOMATION_FAILED": "自动化失败",
 }
 
+_REPROCESSABLE_PRECHECK_STATUSES = frozenset({"待人工检查"})
+
 
 def _classify_precheck_workflow_status_compact(
     stories: list[dict[str, Any]],
@@ -287,12 +289,20 @@ def _classify_precheck_workflow_status_compact(
     ):
         latest_status = latest_automation_status
 
+    # “待人工检查” is an unresolved intermediate result, not a completed
+    # business decision.  Keep the detailed precheck stage separately, but
+    # expose the compact task status as actionable so the next refresh can
+    # send it through precheck again.
+    if latest_status in _REPROCESSABLE_PRECHECK_STATUSES:
+        latest_status = "待处理"
+
     # APKCombo availability used to be a terminal manual-handoff result.  It
     # is now an actionable intermediate state because the tool can download
     # and install that package automatically.
     terminal = bool(latest_status) and latest_status not in {
         "APKCombo有包",
         "启动待复检",
+        "待处理",
     }
     return latest_status, terminal
 

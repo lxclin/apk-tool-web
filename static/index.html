@@ -1553,7 +1553,7 @@ async function loadTodayTasks() {
     const currentGids = new Set(precheckTasks.filter(task => task.gid).map(task => String(task.gid)));
     const pendingGids = loadPendingPrecheckGids(projectGid);
     precheckTasks.forEach(task => {
-      const actionableRestored = task.workflow_status === 'APKCombo有包';
+      const actionableRestored = task.workflow_status === 'APKCombo有包' || task.workflow_status === '待处理';
       const eligible = !!task.gid && !task.completed && !task.workflow_terminal && (!task.workflow_status || actionableRestored);
       task._incrementalNew = eligible && (actionableRestored || !seenGids.has(String(task.gid)) || pendingGids.has(String(task.gid)));
       if (!task.completed && !task.workflow_status && previousStatusByGid.has(task.gid)) {
@@ -1704,7 +1704,7 @@ async function startBatchPrecheck() {
     if (item.task.completed || item.task.workflow_terminal) return false;
     if (manualOldStart) return item.index >= selectedPrecheckIndex;
     return item.task._incrementalNew && (
-      item.task._status === '新增待预检' || item.task.workflow_status === 'APKCombo有包'
+      item.task._status === '新增待预检' || item.task.workflow_status === 'APKCombo有包' || item.task.workflow_status === '待处理'
     );
   });
   if (!queue.length) { setPrecheckStatus('本次读取没有新增待预检任务', 'error'); return; }

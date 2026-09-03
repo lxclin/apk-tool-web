@@ -2577,6 +2577,34 @@ class TestAutomationBatchActions:
         finally:
             root.destroy()
 
+    def test_restored_manual_review_rows_are_pending_and_queueable(self):
+        root = tk.Tk()
+        try:
+            from auto_asana.main import AsanaPrecheckTask
+            from gui import APKToolApp
+
+            task = AsanaPrecheckTask(
+                gid="manual-review-restored",
+                name="manual-review-restored",
+                package_name="com.manual.review.restored",
+                up2_appid="",
+                gp_link="https://play.google.com/store/apps/details?id=com.manual.review.restored",
+                workflow_status="待处理",
+                workflow_terminal=False,
+            )
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app._render_today_asana_tasks(
+                    {"section_name": "9.3执行", "tasks": [task]}
+                )
+                item_id = app.precheck_task_tree.get_children()[0]
+                queue, _start = app._precheck_batch_queue_from_selection()
+
+                assert app.precheck_task_tree.item(item_id, "values")[3] == "待处理"
+                assert [queued.gid for _item, queued in queue] == [task.gid]
+        finally:
+            root.destroy()
+
     def test_pending_rows_join_batch_precheck_alongside_new_tasks(self):
         root = tk.Tk()
         try:

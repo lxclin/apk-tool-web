@@ -258,6 +258,35 @@ class TestAsanaPrecheckTasks:
             False,
         )
 
+    @pytest.mark.parametrize("code", ["NO_ADS_OR_IAP", "UNKNOWN"])
+    def test_manual_precheck_review_is_restored_to_pending(self, code):
+        comment = (
+            f"【APK Tool 页面预检：{code}】\n"
+            "此前结果需要人工检查，现允许重新进入预检队列"
+        )
+
+        assert classify_precheck_workflow_status([{"text": comment}]) == (
+            "待处理",
+            False,
+        )
+
+    def test_automation_result_still_overrides_reprocessable_review(self):
+        stories = [
+            {
+                "text": "【APK Tool 页面预检：NO_ADS_OR_IAP】\n需要人工检查",
+                "created_at": "2026-09-03T01:00:00Z",
+            },
+            {
+                "text": "【APK Tool 自动化适配：AGGREGATION_TYPE_EMPTY】\n参数待确认",
+                "created_at": "2026-09-03T02:00:00Z",
+            },
+        ]
+
+        assert classify_precheck_workflow_status(stories) == (
+            "参数待确认",
+            True,
+        )
+
     def test_latest_comment_restores_business_status(self):
         stories = [
             {
