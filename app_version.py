@@ -16,10 +16,14 @@ WORKFLOW_SCHEMA_VERSION = 1
 
 def get_build_info() -> dict:
     frozen = bool(getattr(sys, "frozen", False))
+    edition = os.environ.get("APK_TOOL_BUILD_EDITION", "source").strip().lower()
+    if edition not in {"source", "standard", "internal"}:
+        edition = "source"
     return {
         "name": APP_NAME,
         "version": APP_VERSION,
         "runtime": "packaged" if frozen else "source",
+        "edition": edition,
         "channel": os.environ.get("APK_TOOL_BUILD_CHANNEL", "local"),
         "commit": os.environ.get("APK_TOOL_BUILD_COMMIT", "").strip(),
         "built_at": os.environ.get("APK_TOOL_BUILD_TIME", "").strip(),
@@ -35,6 +39,10 @@ def get_build_info() -> dict:
 def build_label() -> str:
     info = get_build_info()
     label = f"{info['name']} v{info['version']} · {info['runtime']}"
+    if info["edition"] == "standard":
+        label += " · 标准版"
+    elif info["edition"] == "internal":
+        label += " · 内部版"
     if info["commit"]:
         label += f" · {info['commit'][:8]}"
     return label

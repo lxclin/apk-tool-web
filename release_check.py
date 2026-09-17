@@ -11,7 +11,10 @@ from app_version import APP_VERSION, get_build_info
 
 REQUIRED_FILES = (
     "main.py", "main_web.py", "gui.py", "server.py", "static/index.html",
-    "APK Tool.spec", "APK Tool Web.spec", "android/share-receiver/build/apk-tool-share-receiver.apk",
+    "APK Tool.spec", "APK Tool Standard.spec", "APK Tool Internal.spec",
+    "APK Tool Web.spec", "build_editions.sh",
+    "runtime_hooks/standard_edition.py", "runtime_hooks/internal_edition.py",
+    "android/share-receiver/build/apk-tool-share-receiver.apk",
 )
 
 

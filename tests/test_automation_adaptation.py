@@ -5,6 +5,7 @@ import requests
 
 from automation_adaptation import (
     add_automation_comment_once,
+    aggregation_gate_issue,
     apply_aggregation_type_fallback,
     attribution_gate_issue,
     auto_submit_backend_url,
@@ -14,6 +15,7 @@ from automation_adaptation import (
     build_chrome_submit_script,
     detect_aggregation_with_one_retry,
     detection_field_issue,
+    format_google_play_install_count_cn,
     format_aggregation_fields,
     has_explicit_attribution,
     has_aggregation_type,
@@ -39,6 +41,19 @@ FIELDS = {
     "af_key": "af-key",
     "SDK列表": [{"名称": "AppLovin", "key": "sdk-key"}],
 }
+
+
+@pytest.mark.parametrize(
+    ("installs", "expected"),
+    [
+        (5_000, "5000+"),
+        (50_000, "5w+"),
+        (5_000_000, "500w+"),
+        (500_000_000, "50000w+"),
+    ],
+)
+def test_formats_google_play_installs_with_w_unit(installs, expected):
+    assert format_google_play_install_count_cn(installs) == expected
 
 
 def test_cache_get_retries_ssl_with_trusted_system_ca_without_disabling_verify():
@@ -561,7 +576,7 @@ def test_ironsource_symbolic_video_and_inter_are_valid_ad_ids():
     assert payload["aggr_jilishipin_id"] == "video"
 
 
-def test_tradplus_is_a_normal_high_confidence_aggregation_type():
+def test_tradplus_is_a_note_only_unsupported_aggregation():
     fields = {
         "最终判断": "TradPlus聚合（自动化检测确认）",
         "初始Activity": "com.demo.MainActivity",
@@ -573,15 +588,48 @@ def test_tradplus_is_a_normal_high_confidence_aggregation_type():
         "完整日志": "ZGSDK.AutoDetector: TradPlus: 18 次匹配",
     }
 
-    assert detection_field_issue(fields) is None
-    assert validate_backend_fields(fields, "com.demo") == []
+    assert aggregation_gate_issue(fields) == (
+        "UNSUPPORTED_AGGREGATION",
+        "TradPlus聚合，暂不适配",
+    )
+    assert detection_field_issue(fields) == (
+        "UNSUPPORTED_AGGREGATION",
+        "TradPlus聚合，暂不适配",
+    )
+    assert validate_backend_fields(fields, "com.demo") == [
+        "TradPlus聚合，暂不适配，禁止提交聚合参数"
+    ]
     assessment = build_aggregation_assessment(fields)
-    assert assessment["confidence"] == "高"
+    assert assessment["confidence"] == "不评级"
     assert assessment["auto_submit"] is True
-    assert assessment["submit_mode"] == "full"
+    assert assessment["terminal_outcome"] == "unsupported_aggregation"
+    assert assessment["submit_mode"] == "note_only"
     assert "日志分析中 TradPlus 匹配 18 次" in assessment["evidence"]
-    payload = build_backend_submission_payload(fields, "com.demo", "rain")
-    assert payload["aggr_platform"] == "tradplus"
+
+
+def test_tradplus_backend_api_submission_is_blocked_before_network_request():
+    fields = {
+        "最终判断": "TradPlus聚合（自动化检测确认）",
+        "初始Activity": "com.demo.MainActivity",
+        "归因平台": "Adjust",
+        "插屏聚合id": "tp-inter",
+    }
+    session = MagicMock()
+
+    result = submit_backend_via_api(
+        fields,
+        "com.demo",
+        api_url="https://example.test/cp_adapt/list",
+        x_token="session-token",
+        token="fixed-token",
+        session=session,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "BACKEND_VALIDATION_FAILED"
+    assert "禁止提交聚合参数" in result["message"]
+    session.post.assert_not_called()
+    session.get.assert_not_called()
 
 
 def test_empty_verdict_with_exact_video_inter_pair_is_inferred_as_ironsource():
@@ -789,7 +837,7 @@ def test_explicit_unsupported_attribution_precedes_empty_aggregation_type():
     assert has_aggregation_type(fields) is False
     assert detection_field_issue(fields) == (
         "UNSUPPORTED_ATTRIBUTION",
-        "Singular归因，暂不适配",
+        "Singular归因，且聚合类型识别为空，暂不适配",
     )
 
 
@@ -857,7 +905,48 @@ def test_attribution_gate_rejects_other_or_unknown_platforms(attribution):
     issue = attribution_gate_issue({"归因平台": attribution})
 
     assert issue[0] == "UNSUPPORTED_ATTRIBUTION"
-    assert issue[1].endswith("归因，暂不适配")
+    assert issue[1] == f"{attribution or '未知'}归因，且聚合类型识别为空，暂不适配"
+
+
+def test_reset_starts_a_new_comment_deduplication_cycle():
+    client = MagicMock()
+    failed = {"text": "【APK Tool 自动化适配：AUTOMATION_FAILED】旧失败", "created_at": "2026-09-16T01:00:00Z"}
+    reset = {"text": "【APK Tool 自动化适配：RECHECK_REQUESTED】", "created_at": "2026-09-16T02:00:00Z"}
+    client.stories.get_stories_for_task.return_value = [reset, failed]
+    assert add_automation_comment_once(client, "task", "AUTOMATION_FAILED", "重新执行仍失败") is True
+    client.stories.create_comment.assert_called_once()
+    client.stories.get_stories_for_task.return_value = [
+        reset, failed, {**failed, "created_at": "2026-09-16T03:00:00Z"},
+    ]
+    assert add_automation_comment_once(client, "task", "AUTOMATION_FAILED", "重复上报") is False
+    assert client.stories.create_comment.call_count == 1
+
+
+def test_tenjin_without_aggregation_is_a_terminal_business_outcome():
+    fields = {
+        "ok": True,
+        "最终判断": "未检测到主要聚合平台",
+        "归因平台": "Tenjin",
+        "初始Activity": "com.unity3d.player.UnityPlayerActivity",
+        "应用类型": "Unity",
+    }
+    restart = MagicMock()
+    extract = MagicMock()
+    result = detect_aggregation_with_one_retry(
+        "com.infinityfun.yatzychoochoo", extract,
+        first_fields=fields, restart_app=restart, wait_seconds=0,
+    )
+    assert result["code"] == "UNSUPPORTED_ATTRIBUTION"
+    assert result["message"] == "Tenjin归因，且聚合类型识别为空，暂不适配"
+    restart.assert_not_called()
+    extract.assert_not_called()
+
+
+@pytest.mark.parametrize("attribution", ["Adjust", "AppsFlyer"])
+def test_supported_attribution_with_empty_aggregation_still_needs_detection(attribution):
+    assert detection_field_issue({
+        "最终判断": "未检测到主要聚合平台", "归因平台": attribution,
+    }) == ("AGGREGATION_TYPE_EMPTY", "聚合类型识别为空")
 
 
 def test_unsupported_attribution_stops_without_restart_or_retry():
@@ -909,7 +998,7 @@ def test_unsupported_attribution_stops_even_when_aggregation_is_empty():
 
     assert result["ok"] is False
     assert result["code"] == "UNSUPPORTED_ATTRIBUTION"
-    assert result["message"] == "Singular归因，暂不适配"
+    assert result["message"] == "Singular归因，且聚合类型识别为空，暂不适配"
     assert result["attempts"] == 1
     restart.assert_not_called()
     extract.assert_not_called()
@@ -1522,12 +1611,21 @@ def test_fetches_google_play_download_bucket_from_official_page():
                 "_google_play_installs": 100000,
                 "_google_play_installs_text": "100,000+",
             },
-            "AD_IDS_EMPTY",
+            "SUSPECTED_WHITE_PACKAGE",
         ),
     ],
 )
 def test_low_download_white_package_rule(fields, expected_code):
     assert detection_field_issue(fields)[0] == expected_code
+
+
+@pytest.mark.parametrize("installs,expected", [(100000, True), (160000, True), (179999, True), (180000, False), (500000, False)])
+def test_white_package_180k_boundary(installs, expected):
+    fields = {"最终判断": "未检测到主要聚合平台", "归因平台": "Adjust", "_google_play_installs": installs}
+    assert (detection_field_issue(fields)[0] == "SUSPECTED_WHITE_PACKAGE") is expected
+    # Install count alone never turns a complete mediation result into white.
+    complete_fields = {"最终判断": "MAX聚合", "归因平台": "Adjust", "_google_play_installs": installs, "插屏聚合id": "inter-123"}
+    assert detection_field_issue(complete_fields) is None
 
 
 def test_white_package_assessment_is_note_only_terminal_outcome():

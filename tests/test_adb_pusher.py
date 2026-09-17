@@ -4,6 +4,101 @@ import subprocess
 import json
 
 
+class TestClashVPNPrerequisite:
+    CONNECTED = "Current Networks:\n  NetworkAgentInfo{ ni{VPN CONNECTED extra: VPN} nc{[ Transports: VPN OwnerUid: 1002 ]}}\nNetwork Requests:\n"
+
+    def test_parser_ignores_history_requests_and_disconnected_networks(self):
+        from adb_pusher import connected_vpn_owner_uids
+        assert connected_vpn_owner_uids(self.CONNECTED) == {1002}
+        assert connected_vpn_owner_uids(self.CONNECTED.replace("CONNECTED", "DISCONNECTED")) == set()
+        text = "Current Networks:\n  NetworkAgentInfo{WIFI CONNECTED OwnerUid: 1001}\nNetwork Requests:\n  NetworkAgentInfo{VPN CONNECTED OwnerUid: 1002}\n"
+        assert connected_vpn_owner_uids(text) == set()
+
+    def test_running_clash_does_not_toggle_or_open_app(self):
+        from adb_pusher import ensure_clash_vpn_connected
+        with patch("adb_pusher.get_connected_device_profile", return_value={"connected": True}), \
+             patch("adb_pusher.get_app_uid", return_value=(True, "1002")), \
+             patch("adb_pusher._run_adb", return_value=subprocess.CompletedProcess([], 0, self.CONNECTED, "")) as adb:
+            result = ensure_clash_vpn_connected()
+        assert result["ok"] is True
+        assert adb.call_args_list == [call(["shell", "dumpsys", "connectivity"], timeout=5)]
+
+    def test_stopped_clash_uses_ui_then_requires_vpn_connection(self):
+        from adb_pusher import ensure_clash_vpn_connected
+        networks = iter(["", "", self.CONNECTED])
+        def run(args, **kwargs):
+            output = ""
+            if args[-1] == "connectivity":
+                output = next(networks)
+            elif args[-1] == "window":
+                output = "mCurrentFocus=Window{com.github.kr328.clash/.MainActivity}"
+            return subprocess.CompletedProcess(args, 0, output, "")
+        node = {"text": "Stopped", "bounds": "[10,100][500,250]", "enabled": True}
+        with patch("adb_pusher.get_connected_device_profile", return_value={"connected": True}), \
+             patch("adb_pusher.get_app_uid", return_value=(True, "1002")), \
+             patch("adb_pusher._run_adb", side_effect=run) as adb, \
+             patch("adb_pusher.collect_device_ui_nodes", return_value=[node]), \
+             patch("adb_pusher._tap_ui_node", return_value=True) as tap, \
+             patch("adb_pusher.time.sleep"):
+            result = ensure_clash_vpn_connected()
+        assert result["ok"] is True
+        tap.assert_called_once_with(node)
+        assert any("monkey" in c.args[0] for c in adb.call_args_list)
+
+    @pytest.mark.parametrize("problem", ["permission", "timeout", "other_vpn"])
+    def test_vpn_not_ready_never_reports_success(self, problem):
+        from adb_pusher import ensure_clash_vpn_connected
+        def run(args, **kwargs):
+            output = ""
+            if args[-1] == "connectivity" and problem == "other_vpn":
+                output = self.CONNECTED.replace("1002", "9999")
+            elif args[-1] == "window":
+                output = "mCurrentFocus=Window{com.android.vpndialogs/.ConfirmDialog}" if problem == "permission" else "mCurrentFocus=Window{com.github.kr328.clash/.MainActivity}"
+            return subprocess.CompletedProcess(args, 0, output, "")
+        with patch("adb_pusher.get_connected_device_profile", return_value={"connected": True}), \
+             patch("adb_pusher.get_app_uid", return_value=(True, "1002")), \
+             patch("adb_pusher._run_adb", side_effect=run), \
+             patch("adb_pusher.collect_device_ui_nodes", return_value=[]), \
+             patch("adb_pusher._tap_ui_node") as tap, \
+             patch("adb_pusher.time.monotonic", side_effect=[0, 0, 2]), \
+             patch("adb_pusher.time.sleep"):
+            result = ensure_clash_vpn_connected(timeout_seconds=1)
+        expected = {"permission": "CLASH_VPN_PERMISSION_REQUIRED", "timeout": "CLASH_VPN_TIMEOUT", "other_vpn": "OTHER_VPN_CONNECTED"}
+        assert result["ok"] is False
+        assert result["code"] == expected[problem]
+        tap.assert_not_called()
+
+    @pytest.mark.parametrize("problem", ["no_device", "not_installed", "stopped"])
+    def test_missing_prerequisites_do_not_start_clash(self, problem):
+        import threading
+        from adb_pusher import ensure_clash_vpn_connected
+        stop = threading.Event()
+        if problem == "stopped":
+            stop.set()
+        with patch("adb_pusher.get_connected_device_profile", return_value={"connected": problem != "no_device"}), \
+             patch("adb_pusher.get_app_uid", return_value=(False, "未安装")), \
+             patch("adb_pusher._run_adb") as adb:
+            result = ensure_clash_vpn_connected(stop_event=stop)
+        assert result["ok"] is False
+        adb.assert_not_called()
+
+    def test_external_control_start_is_verified_not_trusted_blindly(self):
+        from adb_pusher import ensure_clash_vpn_connected
+        networks = iter(["", self.CONNECTED])
+        def run(args, **kwargs):
+            output = next(networks) if args[-1] == "connectivity" else ""
+            if "resolve-activity" in args:
+                output = "com.github.kr328.clash/com.github.kr328.clash.ExternalControlActivity"
+            return subprocess.CompletedProcess(args, 0, output, "")
+        with patch("adb_pusher.get_connected_device_profile", return_value={"connected": True}), \
+             patch("adb_pusher.get_app_uid", return_value=(True, "1002")), \
+             patch("adb_pusher._run_adb", side_effect=run) as adb:
+            result = ensure_clash_vpn_connected()
+        assert result["ok"] is True
+        assert any("am" in c.args[0] and "start" in c.args[0] for c in adb.call_args_list)
+        assert not any("monkey" in c.args[0] for c in adb.call_args_list)
+
+
 @pytest.mark.parametrize(
     "placeholder",
     ["未找到", "未提取到", "暂未找到", "暂未提取到", "暂未检测到"],
@@ -678,6 +773,27 @@ class TestGooglePlayPrecheck:
             on_progress=install.call_args.kwargs["on_progress"],
             referer=inspected["download_url"],
         )
+
+    def test_apkcombo_auto_install_can_force_reinstall_existing_package(self):
+        from adb_pusher import download_and_install_apkcombo
+
+        inspected = {
+            "available": True,
+            "code": "APKCOMBO_AVAILABLE",
+            "artifact_url": "https://apkcombo.com/d?u=signed",
+            "download_url": "https://apkcombo.com/game/com.example.game/download/xapk",
+        }
+        with patch("adb_pusher.is_package_installed", return_value=True), \
+             patch("adb_pusher.inspect_apkcombo_package", return_value=inspected), \
+             patch("adb_pusher.download_and_install", return_value=(True, "安装成功")) as install:
+            result = download_and_install_apkcombo(
+                "com.example.game",
+                force_reinstall=True,
+            )
+
+        assert result["ok"] is True
+        assert result["code"] == "APKCOMBO_INSTALLED"
+        install.assert_called_once()
 
     def test_apkcombo_auto_install_falls_back_to_browser_on_403(self):
         from adb_pusher import download_and_install_apkcombo
@@ -1520,6 +1636,35 @@ class TestPackageRuntimeMonitor:
         assert result["code"] == "APP_CRASHED"
         assert "自动化检测过程中闪退" in result["message"]
 
+    def test_keeps_target_specific_zygotehole_class_miss_as_warning(self):
+        from adb_pusher import PackageRuntimeMonitor
+
+        line = (
+            "W [ZG:W]: Caused by: java.lang.ClassNotFoundException: Didn't find "
+            'class "com.unity3d.mediation.impression.LevelPlayImpressionDataListener" '
+            "on path: /data/user/0/com.example.game/files/zygotehole"
+        )
+        monitor = PackageRuntimeMonitor("com.example.game")
+
+        result = monitor.observe_log_line(line)
+
+        assert result is None
+        assert len(monitor.injection_warnings) == 1
+        assert "LevelPlayImpressionDataListener" in monitor.injection_warnings[0]
+
+    def test_pairip_license_class_miss_does_not_terminate_replay(self):
+        from adb_pusher import PackageRuntimeMonitor
+
+        line = (
+            "E Hook: Caused by: java.lang.ClassNotFoundException: Didn't find "
+            'class "com.pairip.licensecheck.LicenseClient" on path: '
+            "DexPathList[/data/user/0/com.example.game/files/zygotehole]"
+        )
+        monitor = PackageRuntimeMonitor("com.example.game")
+
+        assert monitor.observe_log_line(line) is None
+        assert "LicenseClient" in monitor.injection_warnings[0]
+
     def test_requires_two_missing_polls_for_unexplained_exit(self):
         from adb_pusher import PackageRuntimeMonitor
 
@@ -1883,27 +2028,20 @@ class TestBuildBackendUrl:
         params = parse_qs(url.removeprefix(prefix))
         assert params["af_key"] == ["af-key-123"]
 
-    def test_tradplus_is_mapped_as_a_normal_backend_platform(self):
-        from urllib.parse import parse_qs
-
+    def test_tradplus_backend_url_is_blocked(self):
         from adb_pusher import build_backend_url
 
-        url = build_backend_url(
-            {
-                "最终判断": "TradPlus聚合（自动化检测确认）",
-                "归因平台": "Adjust",
-                "插屏聚合id": "tradplus-inter",
-                "激励视频聚合id": "tradplus-reward",
-                "初始Activity": "com.demo.MainActivity",
-            },
-            "com.demo.tradplus",
-        )
-
-        prefix = "http://data_center_web_internet.hongdinghe.cn/#/CpAdaptManage/CpAdapt?"
-        params = parse_qs(url.removeprefix(prefix))
-        assert params["aggr_platform"] == ["tradplus"]
-        assert params["aggr_chaping_id"] == ["tradplus-inter"]
-        assert params["aggr_jilishipin_id"] == ["tradplus-reward"]
+        with pytest.raises(ValueError, match="TradPlus聚合，暂不适配"):
+            build_backend_url(
+                {
+                    "最终判断": "TradPlus聚合（自动化检测确认）",
+                    "归因平台": "Adjust",
+                    "插屏聚合id": "tradplus-inter",
+                    "激励视频聚合id": "tradplus-reward",
+                    "初始Activity": "com.demo.MainActivity",
+                },
+                "com.demo.tradplus",
+            )
 
     def test_backend_url_uses_appsflyer_sdk_key_as_af_key(self):
         from urllib.parse import parse_qs

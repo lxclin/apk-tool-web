@@ -26,11 +26,13 @@ from adb_pusher import (
 )
 
 
-DEFAULT_REPLAY_TIMEOUT_SECONDS = 500
+DEFAULT_REPLAY_TIMEOUT_SECONDS = 300
 MIN_REPLAY_TIMEOUT_SECONDS = 10
 MAX_REPLAY_TIMEOUT_SECONDS = 600
 REPLAY_LOG_QUEUE_POLL_SECONDS = 0.25
 REPLAY_IN_FLIGHT_GRACE_SECONDS = 30
+REPLAY_LOG_DRAIN_BATCH_SIZE = 512
+REPLAY_PROGRESS_HEARTBEAT_SECONDS = 30
 
 INTERSTITIAL = "interstitial"
 REWARDED = "rewarded"
@@ -434,6 +436,17 @@ def _start_logcat_reader(proc: subprocess.Popen, output: queue.Queue) -> threadi
     return thread
 
 
+def _drain_logcat_queue(output: queue.Queue, limit: int = REPLAY_LOG_DRAIN_BATCH_SIZE):
+    """Drain a bounded batch so a noisy SDK cannot starve timeout checks."""
+    pending = []
+    for _ in range(max(1, int(limit))):
+        try:
+            pending.append(output.get_nowait())
+        except queue.Empty:
+            break
+    return pending
+
+
 def build_replay_failure_comment(package_name: str, result: dict) -> str:
     """Build the terminal Asana comment requested by the automation flow."""
     lines = [
@@ -447,11 +460,17 @@ def build_replay_failure_comment(package_name: str, result: dict) -> str:
         "APP_CRASHED",
         "APP_EXITED_DURING_AUTOMATION",
         "APP_LAUNCH_NOT_CONFIRMED",
+        "APP_RUNTIME_INJECTION_FAILED",
     }:
         lines[1] = result.get("message") or "应用在广告回放过程中异常退出"
         summary = str(runtime.get("summary") or "").strip()
         if summary:
-            lines.extend(["关键崩溃日志：", summary])
+            label = (
+                "关键运行时日志："
+                if result.get("code") == "APP_RUNTIME_INJECTION_FAILED"
+                else "关键崩溃日志："
+            )
+            lines.extend([label, summary])
     for label, key in (("插屏广告", "interstitial"), ("激励视频", "rewarded")):
         state = result.get(key) or {}
         if not state.get("required"):
@@ -462,6 +481,10 @@ def build_replay_failure_comment(package_name: str, result: dict) -> str:
             lines.append(f"{label}：未检测到真实展示")
             for error in state.get("errors") or []:
                 lines.append(f"- {error}")
+    if runtime.get("injection_warning"):
+        summary = str(runtime.get("summary") or "").strip()
+        if summary:
+            lines.extend(["注入兼容警告（已继续监听）：", summary])
     return "\n".join(lines)
 
 
@@ -539,6 +562,7 @@ def run_ad_replay_check(
         grace_announced = False
         autodetector_lines: list[str] = []
         deferred_success: dict | None = None
+        last_progress_at = 0.0
         aggregation_change_grace_seconds = max(
             0,
             min(int(aggregation_change_grace_seconds), timeout_seconds),
@@ -590,13 +614,9 @@ def run_ad_replay_check(
                 first_line = line_queue.get(timeout=wait) if wait > 0 else line_queue.get_nowait()
                 pending = [first_line]
                 # Drain every line already captured by the reader before doing
-                # UI work. This is the key protection against high-volume SDK
-                # logs delaying a display callback by minutes.
-                while True:
-                    try:
-                        pending.append(line_queue.get_nowait())
-                    except queue.Empty:
-                        break
+                # UI work, but cap the batch. A continuously noisy SDK must
+                # not starve the timeout and runtime checks below.
+                pending.extend(_drain_logcat_queue(line_queue))
             except queue.Empty:
                 pending = []
 
@@ -606,6 +626,29 @@ def run_ad_replay_check(
                     reader_finished = True
                     continue
                 clean = line.rstrip()
+                observe_runtime_line = getattr(runtime_monitor, "observe_log_line", None)
+                if callable(observe_runtime_line):
+                    try:
+                        runtime_failure = observe_runtime_line(clean)
+                    except Exception:
+                        runtime_failure = None
+                    if isinstance(runtime_failure, dict) and not runtime_failure.get(
+                        "ok", True
+                    ):
+                        result = evaluator.result(
+                            elapsed_seconds=time.monotonic() - started
+                        )
+                        result.update(
+                            ok=False,
+                            code=runtime_failure.get(
+                                "code", "APP_RUNTIME_INJECTION_FAILED"
+                            ),
+                            message=runtime_failure.get(
+                                "message", "应用自动化注入运行时失败"
+                            ),
+                            runtime=runtime_failure,
+                        )
+                        return result
                 if "ZGSDK.AutoDetector" in clean:
                     autodetector_lines.append(clean)
                     if len(autodetector_lines) > 1000:
@@ -645,6 +688,12 @@ def run_ad_replay_check(
 
             elapsed = time.monotonic() - started
             if (
+                on_progress
+                and elapsed - last_progress_at >= REPLAY_PROGRESS_HEARTBEAT_SECONDS
+            ):
+                last_progress_at = elapsed
+                on_progress(f"回放监听中，已等待 {int(elapsed)} 秒")
+            if (
                 deferred_success is not None
                 and elapsed >= aggregation_change_grace_seconds
             ):
@@ -664,7 +713,17 @@ def run_ad_replay_check(
                 # The reader drains independently and the queue was emptied
                 # above, so a timeout now reflects processed current logs, not
                 # stale pipe backlog.
-                return evaluator.result(timed_out=True, elapsed_seconds=elapsed)
+                result = evaluator.result(timed_out=True, elapsed_seconds=elapsed)
+                injection_warnings = getattr(
+                    runtime_monitor, "injection_warnings", None
+                )
+                if isinstance(injection_warnings, list) and injection_warnings:
+                    result["runtime"] = {
+                        "summary": "\n".join(injection_warnings[-6:]),
+                        "injection_warning": True,
+                    }
+                    result["message"] += "；期间存在注入兼容警告，但已继续监听至超时"
+                return result
             if reader_finished and proc.poll() is not None:
                 result = evaluator.result(elapsed_seconds=elapsed)
                 result.update(

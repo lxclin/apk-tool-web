@@ -717,10 +717,10 @@ def classify_google_play_page_texts(
         continue_adaptation = False
     elif page_ready:
         code = "NO_ADS_OR_IAP"
-        title = "未发现广告或应用内购标识（待人工确认）"
+        title = "未发现广告或应用内购标识（继续自动适配）"
         detail = (
             "页面已加载，但未发现包含广告或应用内购标识；该结果可能是页面信息未完整展示，"
-            "不能据此加黑。将继续下载安装，交由人工确认是否有广告。"
+            "不能据此加黑。将继续下载安装，启动检查后自动检测聚合参数并适配。"
         )
         continue_adaptation = True
     else:
@@ -2148,6 +2148,47 @@ def extract_package_crash_evidence(log_text: str, package_name: str) -> dict:
     }
 
 
+def extract_package_runtime_failure_evidence(log_text: str, package_name: str) -> dict:
+    """Detect a target-specific automation injection compatibility warning.
+
+    Missing app/SDK classes from ZygoteHole's plugin class loader are not proof
+    that ad replay is broken.  Apps protected by Pairip are a common example:
+    the plugin loader reports ``LicenseClient`` missing, while the app loader
+    starts it normally and the ad is displayed moments later.  Keep the
+    evidence for timeout diagnostics, but let an authoritative ad callback win.
+    """
+    package_name = str(package_name or "").strip()
+    if not package_name:
+        return {"failed": False, "summary": ""}
+    lines = [line.strip() for line in (log_text or "").splitlines() if line.strip()]
+    package_marker = package_name.casefold()
+    injection_markers = ("zygotehole", "[zg:w]", "appimpl", "pluginclassloader")
+    failure_markers = (
+        "classnotfoundexception",
+        "noclassdeffounderror",
+        "nosuchmethoderror",
+    )
+    matches = [
+        line
+        for line in lines
+        if package_marker in line.casefold()
+        and any(marker in line.casefold() for marker in injection_markers)
+        and any(marker in line.casefold() for marker in failure_markers)
+    ]
+    if not matches:
+        return {"failed": False, "summary": ""}
+    summary = "\n".join(matches[-6:])
+    return {
+        "failed": False,
+        "warning": True,
+        "code": "APP_RUNTIME_INJECTION_WARNING",
+        "message": "检测到注入兼容类缺失，继续监听真实广告回调",
+        "summary": summary,
+        "crashed": False,
+        "crash_type": "",
+    }
+
+
 def _is_app_process_running(package_name: str) -> bool:
     try:
         result = _run_adb(["shell", "pidof", package_name], timeout=5)
@@ -2228,6 +2269,7 @@ class PackageRuntimeMonitor:
         self.consecutive_missing = 0
         self.anr_occurrences = 0
         self.last_anr_action_at = 0.0
+        self.injection_warnings: list[str] = []
 
     def _emit_event(self, message: str) -> None:
         if self.on_event is None:
@@ -2236,6 +2278,30 @@ class PackageRuntimeMonitor:
             self.on_event(message)
         except Exception:
             pass
+
+    def observe_log_line(self, line: str) -> dict | None:
+        """Record injection warnings; return only genuinely terminal results."""
+        evidence = extract_package_runtime_failure_evidence(line, self.package_name)
+        if evidence.get("warning"):
+            summary = str(evidence.get("summary") or "").strip()
+            if summary and summary not in self.injection_warnings:
+                self.injection_warnings.append(summary)
+                self.injection_warnings = self.injection_warnings[-6:]
+                self._emit_event(
+                    evidence.get("message", "检测到注入兼容警告，继续监听")
+                )
+            return None
+        if not evidence.get("failed"):
+            return None
+        self._emit_event(evidence.get("message", "应用自动化注入运行时失败"))
+        return {
+            "ok": False,
+            "code": evidence.get("code", "APP_RUNTIME_INJECTION_FAILED"),
+            "message": evidence.get("message", "应用自动化注入运行时失败"),
+            "summary": evidence.get("summary", ""),
+            "crashed": False,
+            "crash_type": evidence.get("crash_type", "RUNTIME_INJECTION_FAILURE"),
+        }
 
     def _poll_anr(self) -> dict | None:
         if get_focused_anr_package() != self.package_name:
@@ -3077,6 +3143,110 @@ def check_device() -> bool:
         return False
 
 
+def connected_vpn_owner_uids(connectivity_text: str) -> set[int]:
+    """Read only current NetworkAgentInfo records, not requests or history."""
+    section = re.search(
+        r"(?ms)^\s*Current Networks:[ \t]*\r?\n(.*?)(?=^\S|\Z)",
+        connectivity_text or "",
+    )
+    if not section:
+        return set()
+    owners = set()
+    for record in re.split(r"(?=NetworkAgentInfo\b)", section.group(1)):
+        if not record.startswith("NetworkAgentInfo"):
+            continue
+        if not re.search(r"\bVPN\b", record) or not re.search(r"\bCONNECTED\b", record):
+            continue
+        owner = re.search(r"\bOwnerUid\s*[:=]\s*(\d+)", record)
+        if owner:
+            owners.add(int(owner.group(1)))
+    return owners
+
+
+def ensure_clash_vpn_connected(*, stop_event=None, on_progress=None, timeout_seconds=30) -> dict:
+    """Start installed Android Clash and require its actual VPN network."""
+    def emit(message):
+        if on_progress:
+            on_progress(message)
+
+    def fail(code, message):
+        return {"ok": False, "code": code, "message": message}
+
+    try:
+        if stop_event is not None and stop_event.is_set():
+            return fail("AUTOMATION_STOPPED", "用户已停止自动化")
+        profile = get_connected_device_profile()
+        if not profile.get("connected"):
+            return fail("CLASH_VPN_DEVICE_UNAVAILABLE", "Clash 检查失败：请连接且仅连接一台已授权的 ADB 设备")
+        package = ""
+        uid = None
+        for candidate in ("com.github.kr328.clash", "com.github.metacubex.clash.meta"):
+            ok, value = get_app_uid(candidate)
+            if ok and str(value).isdigit():
+                package, uid = candidate, int(value)
+                break
+        if not package:
+            return fail("CLASH_NOT_INSTALLED", "手机未安装 Clash，请先安装并配置可用节点")
+
+        def owners():
+            result = _run_adb(["shell", "dumpsys", "connectivity"], timeout=5)
+            if result.returncode != 0:
+                raise RuntimeError("无法读取手机 VPN 连接状态")
+            return connected_vpn_owner_uids(result.stdout)
+
+        active = owners()
+        if uid in active:
+            emit("Clash VPN 已连接，继续自动适配")
+            return {"ok": True, "code": "CLASH_VPN_READY", "message": "Clash VPN 已连接"}
+        if active:
+            return fail("OTHER_VPN_CONNECTED", "手机正在使用其他 VPN，请手动切换到 Clash 后重试")
+        emit("Clash VPN 未连接，正在自动启动")
+        action = f"{package}.action.START_CLASH"
+        resolved = _run_adb([
+            "shell", "cmd", "package", "resolve-activity", "--brief",
+            "-a", action, "-p", package,
+        ], timeout=5)
+        component = next((line.strip() for line in resolved.stdout.splitlines()
+                          if line.strip().startswith(package + "/")), "")
+        started = None
+        if component:
+            started = _run_adb(["shell", "am", "start", "-W", "-n", component, "-a", action], timeout=8)
+        if started is None or started.returncode != 0 or "Error:" in started.stdout:
+            started = _run_adb([
+                "shell", "monkey", "-p", package,
+                "-c", "android.intent.category.LAUNCHER", "1",
+            ], timeout=8)
+        if started.returncode != 0:
+            return fail("CLASH_START_FAILED", "无法打开手机 Clash，请手动打开后重试")
+        deadline = time.monotonic() + max(1, int(timeout_seconds))
+        tapped_start = False
+        while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return fail("AUTOMATION_STOPPED", "用户已停止自动化")
+            if uid in owners():
+                emit("Clash VPN 连接成功，继续自动适配")
+                _run_adb(["shell", "input", "keyevent", "KEYCODE_HOME"], timeout=5)
+                return {"ok": True, "code": "CLASH_VPN_READY", "message": "Clash VPN 连接成功"}
+            focus = _run_adb(["shell", "dumpsys", "window"], timeout=5).stdout
+            focus_line = next((line for line in focus.splitlines() if "mCurrentFocus=" in line), "")
+            if "com.android.vpndialogs/" in focus_line:
+                return fail("CLASH_VPN_PERMISSION_REQUIRED", "请在手机确认 Clash 首次 VPN 连接授权，然后重新执行自动适配")
+            if not tapped_start and package + "/" in focus_line:
+                node = _find_action_node(collect_device_ui_nodes(), {
+                    "stopped", "not running", "已停止", "未运行", "启动", "start", "tap to start",
+                })
+                if node and _tap_ui_node(node):
+                    tapped_start = True
+                    emit("已点击 Clash 启动，等待 VPN 连接")
+            if stop_event is not None:
+                stop_event.wait(1)
+            else:
+                time.sleep(1)
+        return fail("CLASH_VPN_TIMEOUT", "Clash VPN 启动超时，请检查配置、节点及 VPN 模式后重试")
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+        return fail("CLASH_VPN_CHECK_FAILED", f"Clash VPN 检查失败：{exc}")
+
+
 def get_connected_device_profile() -> dict:
     """Return the one connected Android device's routing capabilities.
 
@@ -3614,8 +3784,16 @@ def _download_apkcombo_via_browser(
 def download_and_install_apkcombo(
     package_name: str,
     on_progress=None,
+    *,
+    force_reinstall: bool = False,
 ) -> dict:
-    """Resolve, immediately download and install an exact APKCombo package."""
+    """Resolve, immediately download and install an exact APKCombo package.
+
+    ``force_reinstall`` is used by recovery workflows that must replace a
+    previously installed, but known-bad, package before starting detection.
+    The actual installer uses ``adb install -r`` so ordinary app data remains
+    intact unless the caller explicitly clears it elsewhere.
+    """
     package_name = resolve_google_play_package(package_name)
     if not package_name:
         return {
@@ -3623,7 +3801,7 @@ def download_and_install_apkcombo(
             "code": "APKCOMBO_INSTALL_FAILED",
             "message": "无效包名，无法从 APKCombo 自动安装",
         }
-    if is_package_installed(package_name):
+    if is_package_installed(package_name) and not force_reinstall:
         return {
             "ok": True,
             "code": "ALREADY_INSTALLED",
@@ -4214,10 +4392,10 @@ def build_backend_url(fields: dict, package_name: str) -> str:
         "fyber": "fyber",
         "levelplay": "level_play",
         "level": "level_play",
-        "tradplus": "tradplus",
-        "trad_plus": "tradplus",
     }
     final = normalize_optional_parameter(fields.get("最终判断", ""))
+    if "tradplus" in final.casefold().replace(" ", "").replace("_", ""):
+        raise ValueError("TradPlus聚合，暂不适配，禁止生成后台提交参数")
     platform_match = re.match(r"^([A-Za-z_]+)", final)
     if platform_match:
         raw = platform_match.group(1).lower()

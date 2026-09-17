@@ -14,6 +14,19 @@ def test_precheck_policies_are_shared_and_explicit():
     assert should_install_after_precheck({"continue_adaptation": True})
 
 
+def test_unlabeled_page_install_and_launch_remain_eligible_for_adaptation():
+    result = {"code": "NO_ADS_OR_IAP", "continue_adaptation": True}
+    assert should_install_after_precheck(result)
+    assert not needs_precheck_backend_submission(result)
+    assert precheck_task_status(result) == "待处理"
+    result["install_result"] = {"code": "INSTALLED", "ok": True}
+    assert precheck_task_status(result) == "安装完成"
+    result["launch_result"] = {"code": "LAUNCH_OK", "ok": True}
+    assert precheck_task_status(result) == "启动正常"
+    result["launch_result"] = {"code": "APP_CRASHED", "ok": False}
+    assert precheck_task_status(result) == "包体闪退"
+
+
 def test_deferred_download_does_not_become_install_failure_comment():
     result = {
         "code": "HAS_ADS",

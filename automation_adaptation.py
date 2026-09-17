@@ -39,7 +39,7 @@ SYMBOLIC_AD_IDS_BY_FIELD = {
     "插屏聚合id": frozenset({"inter"}),
 }
 INFERRED_IRONSOURCE_VERDICT = "IronSource聚合（根据 video/inter 自动推断）"
-GOOGLE_PLAY_LOW_INSTALL_THRESHOLD = 100_000
+GOOGLE_PLAY_LOW_INSTALL_THRESHOLD = 180_000
 
 
 def is_negative_aggregation_verdict(value: Any) -> bool:
@@ -190,7 +190,19 @@ def attribution_gate_issue(fields: dict[str, Any] | None) -> tuple[str, str] | N
     compact = attribution.casefold().replace(" ", "")
     if "adjust" in compact or "appsflyer" in compact:
         return None
-    return "UNSUPPORTED_ATTRIBUTION", f"{attribution or '未知'}归因，暂不适配"
+    message = f"{attribution or '未知'}归因"
+    if not has_aggregation_type(fields):
+        message += "，且聚合类型识别为空"
+    return "UNSUPPORTED_ATTRIBUTION", f"{message}，暂不适配"
+
+
+def aggregation_gate_issue(fields: dict[str, Any] | None) -> tuple[str, str] | None:
+    """Reject aggregation platforms excluded by the original business rule."""
+    verdict = normalize_optional_parameter((fields or {}).get("最终判断"))
+    compact = verdict.casefold().replace(" ", "").replace("_", "")
+    if "tradplus" in compact:
+        return "UNSUPPORTED_AGGREGATION", "TradPlus聚合，暂不适配"
+    return None
 
 
 def get_ad_unit_id(fields: dict[str, Any] | None, field_name: str) -> str:
@@ -299,6 +311,21 @@ def fetch_google_play_install_count(
     }
 
 
+def format_google_play_install_count_cn(value: Any) -> str:
+    """Format a Play install bucket with the locally familiar ``w`` unit."""
+    try:
+        installs = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if installs < 0:
+        return ""
+    if installs < 10_000:
+        return f"{installs}+"
+    wan = installs / 10_000
+    display = f"{wan:.1f}".rstrip("0").rstrip(".")
+    return f"{display}w+"
+
+
 def is_suspected_white_package(fields: dict[str, Any] | None) -> bool:
     """Return whether low installs and missing mediation evidence meet the rule."""
     fields = fields or {}
@@ -330,6 +357,9 @@ def has_partial_aggregation_evidence(fields: dict[str, Any] | None) -> bool:
 
 def detection_field_issue(fields: dict[str, Any] | None) -> tuple[str, str] | None:
     """Return the terminal field issue that needs one detection retry."""
+    unsupported_aggregation = aggregation_gate_issue(fields)
+    if unsupported_aggregation:
+        return unsupported_aggregation
     # A positively identified attribution platform is authoritative even when
     # AutoDetector did not find a mediation platform.  Unsupported attribution
     # is a terminal business outcome, so do not hide Singular/Tenjin/etc.
@@ -344,7 +374,7 @@ def detection_field_issue(fields: dict[str, Any] | None) -> tuple[str, str] | No
         display = str((fields or {}).get("_google_play_installs_text") or "").strip()
         return (
             "SUSPECTED_WHITE_PACKAGE",
-            f"Google Play 下载量{display or '少于10万'}，且聚合类型或广告 ID 缺失，疑似白包，暂不适配",
+            f"Google Play 下载量{display or '少于18万'}，且聚合类型或广告 ID 缺失，疑似白包，暂不适配",
         )
     if not has_aggregation_type(fields):
         if has_partial_aggregation_evidence(fields):
@@ -352,7 +382,13 @@ def detection_field_issue(fields: dict[str, Any] | None) -> tuple[str, str] | No
                 "AGGREGATION_RESULT_INCOMPLETE",
                 "已检测到聚合参数，但综合检测结果未完整输出，需要人工确认",
             )
-        return "AGGREGATION_TYPE_EMPTY", "聚合类型识别为空"
+        installs_text = format_google_play_install_count_cn(
+            (fields or {}).get("_google_play_installs")
+        )
+        message = "聚合类型识别为空"
+        if installs_text:
+            message += f"\nGoogle Play下载量：{installs_text}"
+        return "AGGREGATION_TYPE_EMPTY", message
     unsupported = attribution_gate_issue(fields)
     if unsupported:
         return unsupported
@@ -477,10 +513,17 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
     unsupported_attribution = bool(
         issue and issue[0] == "UNSUPPORTED_ATTRIBUTION"
     )
+    unsupported_aggregation = bool(
+        issue and issue[0] == "UNSUPPORTED_AGGREGATION"
+    )
     suspected_white_package = bool(
         issue and issue[0] == "SUSPECTED_WHITE_PACKAGE"
     )
-    terminal_note_only = unsupported_attribution or suspected_white_package
+    terminal_note_only = (
+        unsupported_attribution
+        or unsupported_aggregation
+        or suspected_white_package
+    )
     if suspected_white_package:
         method = "低下载量疑似白包规则"
         confidence = "不评级"
@@ -490,6 +533,10 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
         # attribution an adaptable/high-confidence task. This is a terminal
         # business outcome whose only backend write is a note-only payload.
         method = "其他归因终态规则"
+        confidence = "不评级"
+        auto_submit = True
+    elif unsupported_aggregation:
+        method = "非支持聚合终态规则"
         confidence = "不评级"
         auto_submit = True
     else:
@@ -513,6 +560,8 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
         "terminal_outcome": (
             "suspected_white_package"
             if suspected_white_package
+            else "unsupported_aggregation"
+            if unsupported_aggregation
             else "unsupported_attribution"
             if unsupported_attribution
             else ""
@@ -622,7 +671,7 @@ def detect_aggregation_with_one_retry(
         initial_poll_seconds = max(1, int(initial_poll_seconds))
         initial_elapsed = 0
         while initial_elapsed < initial_wait_seconds:
-            if (
+            if first_issue[0] == "UNSUPPORTED_AGGREGATION" or (
                 first_issue[0] == "UNSUPPORTED_ATTRIBUTION"
                 and has_explicit_attribution(fields)
             ):
@@ -699,7 +748,10 @@ def detect_aggregation_with_one_retry(
             "fields": fields,
             "attempts": 1,
         }
-    if first_issue[0] == "UNSUPPORTED_ATTRIBUTION":
+    if first_issue[0] in {
+        "UNSUPPORTED_ATTRIBUTION",
+        "UNSUPPORTED_AGGREGATION",
+    }:
         fields["_adaptation_terminal"] = True
         return {
             "ok": False,
@@ -830,7 +882,7 @@ def detect_aggregation_with_one_retry(
                 "fields": second_fields,
                 "attempts": 2,
             }
-        if (
+        if second_issue[0] == "UNSUPPORTED_AGGREGATION" or (
             second_issue[0] == "UNSUPPORTED_ATTRIBUTION"
             and has_explicit_attribution(second_fields)
         ):
@@ -1006,9 +1058,19 @@ def add_automation_comment_once(
     marker = f"{AUTOMATION_COMMENT_PREFIX}{code}】"
     stories = client.stories.get_stories_for_task(
         task_gid,
-        opt_fields=["text", "resource_subtype", "type"],
+        opt_fields=["text", "resource_subtype", "type", "created_at"],
     )
-    if any(marker in str(story.get("text") or "") for story in stories):
+    ordered = sorted(
+        enumerate(stories or []),
+        key=lambda item: (str(item[1].get("created_at") or ""), item[0]),
+    )
+    current_run = []
+    for _index, story in ordered:
+        if "【APK Tool 自动化适配：RECHECK_REQUESTED】" in str(story.get("text") or ""):
+            current_run.clear()
+        else:
+            current_run.append(story)
+    if any(marker in str(story.get("text") or "") for story in current_run):
         return False
     body = str(text or "").strip()
     client.stories.create_comment(task_gid, marker + ("\n" + body if body else ""))
@@ -1027,6 +1089,9 @@ def validate_backend_fields(
         errors.append("缺少包名")
     if not normalize_optional_parameter(fields.get("最终判断")):
         errors.append("缺少最终判断")
+    unsupported_aggregation = aggregation_gate_issue(fields)
+    if unsupported_aggregation:
+        errors.append(unsupported_aggregation[1] + "，禁止提交聚合参数")
     unsupported = attribution_gate_issue(fields)
     if unsupported and not allow_unsupported_attribution:
         errors.append(unsupported[1])

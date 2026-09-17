@@ -71,7 +71,6 @@ def precheck_task_status(result: dict) -> str:
     if code in {"IAP_ONLY", "JAPANESE_PACKAGE", "GOOGLE_LOGIN_REQUIRED"} and backend:
         return "已加黑(后台)" if backend.get("ok") else "加黑提交失败"
 
-    review_monetization = code == "NO_ADS_OR_IAP"
     launch_result = result.get("launch_result") or {}
     if launch_result:
         status = {
@@ -84,7 +83,7 @@ def precheck_task_status(result: dict) -> str:
             "APP_EXITED": "启动待复检",
             "LAUNCH_FAILED": "启动失败",
         }.get(launch_result.get("code"), "启动异常")
-        return "待人工检查" if review_monetization and launch_result.get("ok") else status
+        return status
 
     install_result = result.get("install_result") or {}
     if install_result:
@@ -96,8 +95,6 @@ def precheck_task_status(result: dict) -> str:
         if install_code == "DOWNLOAD_STARTED":
             return "后台下载中"
         if install_result.get("ok"):
-            if review_monetization:
-                return "待人工检查"
             return "已安装" if install_code == "ALREADY_INSTALLED" else "安装完成"
         return "安装失败"
 
@@ -105,7 +102,7 @@ def precheck_task_status(result: dict) -> str:
         "HAS_ADS": "有广告", "GOOGLE_NO_PACKAGE": "google无包",
         "ALL_NETWORK_NO_PACKAGE": "全网无包", "APKCOMBO_AVAILABLE": "APKCombo有包",
         "APKCOMBO_CHECK_FAILED": "APKCombo待确认", "IAP_ONLY": "已加黑",
-        "JAPANESE_PACKAGE": "已加黑", "NO_ADS_OR_IAP": "待人工检查",
+        "JAPANESE_PACKAGE": "已加黑", "NO_ADS_OR_IAP": "待处理",
         "GOOGLE_LOGIN_REQUIRED": "已加黑",
         "DEVICE_UNSUPPORTED": "设备不支持", "COUNTRY_UNSUPPORTED": "地区不支持",
         "UNKNOWN": "待人工", "NO_DEVICE": "未执行",

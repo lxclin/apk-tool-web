@@ -7,7 +7,7 @@ main.py — Google Sheets → Asana 幂等同步
 架构分层：
   1. 纯逻辑层（无 IO）：generate_target_dates / filter_packages / compute_diff
   2. API 交互层（有 IO）：get_sheet_data / find_or_create_section /
-     get_existing_task_names / create_tasks_for_packages
+     find_matching_adaptation_parent_task / create_tasks_for_packages
   3. 编排层：sync_packages（依赖注入，便于测试）
 
 运行方式：
@@ -66,6 +66,16 @@ class AsanaTaskInfo:
     gid: str
     link: str
     notes: str = ""
+
+
+@dataclass(frozen=True)
+class AsanaDateParent:
+    """A weekly CP adaptation parent task discovered from Asana."""
+
+    gid: str
+    name: str
+    start_date: date
+    end_date: date
 
 
 @dataclass(frozen=True)
@@ -141,7 +151,7 @@ _PRECHECK_CODE_STATUSES = {
     "IAP_ONLY": "已加黑",
     "JAPANESE_PACKAGE": "已加黑",
     "GOOGLE_LOGIN_REQUIRED": "已加黑",
-    "NO_ADS_OR_IAP": "待人工检查",
+    "NO_ADS_OR_IAP": "待处理",
     "DEVICE_UNSUPPORTED": "设备不支持",
     "COUNTRY_UNSUPPORTED": "地区不支持",
     # Historical automatic install failures should be retried through the new
@@ -154,8 +164,10 @@ _PRECHECK_CODE_STATUSES = {
 }
 
 _AUTOMATION_CODE_STATUSES = {
+    "RECHECK_REQUESTED": "待处理",
     "AGGREGATION_REPLAY_SUCCESS": "聚合适配成功",
     "UNSUPPORTED_ATTRIBUTION": "其他归因",
+    "UNSUPPORTED_AGGREGATION": "TradPlus暂不适配",
     "SUSPECTED_WHITE_PACKAGE": "疑似白包",
     "AGGREGATION_TYPE_EMPTY": "参数待确认",
     "AGGREGATION_RESULT_INCOMPLETE": "参数待确认",
@@ -285,7 +297,7 @@ def _classify_precheck_workflow_status_compact(
     if (
         latest_automation_status
         and latest_status_source == "precheck"
-        and latest_status in {"APKCombo有包", "APKCombo待确认", "待人工检查", "启动待复检"}
+        and latest_status in {"APKCombo有包", "APKCombo待确认", "待人工检查", "启动待复检", "待处理"}
     ):
         latest_status = latest_automation_status
 
@@ -342,13 +354,22 @@ def classify_precheck_workflow_stages(
             status = _PRECHECK_CODE_STATUSES.get(code)
             if status:
                 precheck_status = status
-                if status not in {"APKCombo有包", "APKCombo待确认", "待人工检查", "启动待复检"}:
+                if status not in {"APKCombo有包", "APKCombo待确认", "待人工检查", "启动待复检", "待处理"}:
                     final_business_status = status
             continue
 
         automation_match = _AUTOMATION_COMMENT_CODE_RE.search(text)
         if automation_match:
             code = automation_match.group(1).upper()
+            if code == "RECHECK_REQUESTED":
+                precheck_status = ""
+                aggregation_detection_status = ""
+                backend_submission_status = ""
+                interstitial_replay_status = ""
+                rewarded_replay_status = ""
+                action_adaptation_status = ""
+                final_business_status = ""
+                continue
             if code == "AGGREGATION_REPLAY_SUCCESS":
                 aggregation_detection_status = "参数已确认"
                 backend_submission_status = "提交成功"
@@ -359,6 +380,10 @@ def classify_precheck_workflow_stages(
                 aggregation_detection_status = "参数已识别"
                 backend_submission_status = "提交成功"
                 final_business_status = "其他归因"
+            elif code == "UNSUPPORTED_AGGREGATION":
+                aggregation_detection_status = "TradPlus暂不适配"
+                backend_submission_status = "参数已清空"
+                final_business_status = "TradPlus暂不适配"
             elif code == "SUSPECTED_WHITE_PACKAGE":
                 aggregation_detection_status = "疑似白包"
                 backend_submission_status = "提交成功"
@@ -798,6 +823,64 @@ def generate_target_dates(today: Optional[date] = None) -> tuple[str, str]:
     asana_name = f"{m}.{d}执行"
 
     return sheet_date, asana_name
+
+
+# Weekly CP adaptation parent tasks use names such as
+# ``【2026.9.14-9.18】聚合/动作适配``.  The end date normally omits the year,
+# so keep the parser deliberately strict about the surrounding title while
+# accepting both same-year and explicit-year end dates.
+ASANA_ADAPTATION_PARENT_RE = re.compile(
+    r"^【(?P<start_year>\d{4})\.(?P<start_month>\d{1,2})\."
+    r"(?P<start_day>\d{1,2})-"
+    r"(?:(?P<end_year>\d{4})\.)?"
+    r"(?P<end_month>\d{1,2})\.(?P<end_day>\d{1,2})】"
+    r"\s*聚合/动作适配$"
+)
+
+
+def _compact_asana_date(value: date) -> str:
+    """Format a date using the compact form used in Asana parent names."""
+    return f"{value.year}.{value.month}.{value.day}"
+
+
+def expected_adaptation_parent_name(target_date: date) -> str:
+    """Return the expected Monday-Friday CP adaptation parent name."""
+    week_start = target_date - timedelta(days=target_date.weekday())
+    week_end = week_start + timedelta(days=4)
+    return (
+        f"【{_compact_asana_date(week_start)}-"
+        f"{week_end.month}.{week_end.day}】聚合/动作适配"
+    )
+
+
+def parse_asana_adaptation_parent_task(
+    task: dict[str, Any],
+) -> Optional[AsanaDateParent]:
+    """Parse a weekly CP adaptation parent task from an Asana task record."""
+    name = str(task.get("name") or "").strip()
+    gid = str(task.get("gid") or "").strip()
+    if not name or not gid:
+        return None
+    match = ASANA_ADAPTATION_PARENT_RE.fullmatch(name)
+    if not match:
+        return None
+
+    try:
+        start_date = date(
+            int(match.group("start_year")),
+            int(match.group("start_month")),
+            int(match.group("start_day")),
+        )
+        end_date = date(
+            int(match.group("end_year") or match.group("start_year")),
+            int(match.group("end_month")),
+            int(match.group("end_day")),
+        )
+    except ValueError:
+        return None
+    if end_date < start_date:
+        return None
+    return AsanaDateParent(gid, name, start_date, end_date)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1549,6 +1632,15 @@ class _TasksFacade:
             opts["opt_fields"] = ",".join(opt_fields) if isinstance(opt_fields, list) else opt_fields
         return list(self._api.get_tasks_for_section(section_gid, opts))
 
+    def search_tasks_for_workspace(self, workspace_gid, text="", opt_fields=None):
+        """Search workspace tasks, used to discover empty date parent tasks."""
+        opts = {}
+        if text:
+            opts["text"] = text
+        if opt_fields:
+            opts["opt_fields"] = ",".join(opt_fields) if isinstance(opt_fields, list) else opt_fields
+        return list(self._api.search_tasks_for_workspace(workspace_gid, opts))
+
     def create_task(self, body):
         result = self._api.create_task({"data": body}, {})
         return result
@@ -1778,7 +1870,7 @@ def build_precheck_asana_comment(result: dict) -> str:
         "APKCOMBO_CHECK_FAILED": "APKCombo 自动核验失败，需要人工确认",
         "IAP_ONLY": "应用内购，无广告，加黑",
         "JAPANESE_PACKAGE": "日本包体，加黑",
-        "NO_ADS_OR_IAP": "未发现广告或应用内购标识，继续下载并人工确认（不加黑）",
+        "NO_ADS_OR_IAP": "未发现广告或应用内购标识，继续下载安装并自动适配（不加黑）",
         "DEVICE_UNSUPPORTED": "当前设备暂不支持此应用，跳过适配",
         "COUNTRY_UNSUPPORTED": "当前账号所在国家或地区不支持下载此应用，跳过适配",
         "UNKNOWN": "Google Play 页面预检暂时无法判断，需要人工确认",
@@ -1802,6 +1894,53 @@ def build_precheck_asana_comment(result: dict) -> str:
     if detail:
         lines.append(f"识别说明：{detail}")
     return "\n".join(lines)
+
+
+RESETTABLE_PRECHECK_STATUSES = frozenset({"自动化失败", "待人工检查", "待处理"})
+
+
+def reset_automation_failed_tasks_for_date(
+    client, project_gid: str, task_gids: set[str], today: Optional[date] = None,
+) -> dict:
+    """Reset fresh unfinished failed/review/pending tasks; retain history."""
+    result = get_asana_tasks_for_date(client, project_gid, today=today)
+    reset_gids = set()
+    errors = []
+    updated_tasks = []
+    for task in result.get("tasks", []):
+        current_status = task.workflow_status or (
+            "待处理" if not task.workflow_terminal else ""
+        )
+        if (
+            task.gid in task_gids and not task.completed
+            and current_status in RESETTABLE_PRECHECK_STATUSES
+        ):
+            try:
+                # Do not deduplicate this marker: a task can fail again after
+                # an earlier reset, and each operator request needs a new story.
+                client.stories.create_comment(
+                    task.gid,
+                    "【APK Tool 自动化适配：RECHECK_REQUESTED】\n"
+                    f"手动重置任务状态（原状态：{current_status}），重新进行页面预检和自动适配。\n"
+                    f"包名：{task.package_name or task.name}",
+                )
+            except Exception as exc:
+                errors.append({"task_gid": task.gid, "error": str(exc)})
+            else:
+                reset_gids.add(task.gid)
+                task = replace(
+                    task, workflow_status="待处理", workflow_terminal=False,
+                    precheck_status="", aggregation_detection_status="",
+                    backend_submission_status="", interstitial_replay_status="",
+                    rewarded_replay_status="", action_adaptation_status="",
+                    final_business_status="",
+                )
+        updated_tasks.append(task)
+    return {
+        **result, "tasks": updated_tasks, "reset_gids": reset_gids,
+        "reset_errors": errors,
+        "reset_skipped": len(task_gids - reset_gids - {e["task_gid"] for e in errors}),
+    }
 
 
 def add_precheck_comment_once(client, task_gid: str, result: dict) -> bool:
@@ -1858,6 +1997,66 @@ def find_or_create_section(client, project_gid: str, section_name: str) -> str:
         project_gid, {"name": section_name}
     )
     return new_section["gid"]
+
+
+def find_matching_adaptation_parent_task(
+    client,
+    target_date: date,
+    workspace_gid: str = WORKSPACE_GID,
+) -> AsanaDateParent:
+    """Find the weekly CP adaptation parent matching ``target_date``.
+
+    The old workflow relied on a manually saved parent GID.  That is unsafe
+    when a new weekly parent is created in Asana: the next sync can silently
+    keep writing under last week's parent.  Search the workspace by the
+    expected date token instead, and fail closed when the parent is missing or
+    ambiguous.  The search also finds an empty parent task, which a project
+    task listing cannot reliably do because the parent itself is not a project
+    member.
+    """
+    expected_name = expected_adaptation_parent_name(target_date)
+    week_start = target_date - timedelta(days=target_date.weekday())
+    week_end = week_start + timedelta(days=4)
+    search_text = (
+        f"{_compact_asana_date(week_start)}-"
+        f"{week_end.month}.{week_end.day}"
+    )
+    opt_fields = ["gid", "name", "parent.gid", "parent.name"]
+    try:
+        search_results = client.tasks.search_tasks_for_workspace(
+            workspace_gid,
+            text=search_text,
+            opt_fields=opt_fields,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Asana 日期父表检查失败，无法查询工作区任务（{expected_name}）：{exc}"
+        ) from exc
+
+    matches: dict[str, AsanaDateParent] = {}
+    for raw_task in list(search_results or []):
+        parsed = parse_asana_adaptation_parent_task(raw_task)
+        if not parsed:
+            continue
+        if parsed.name == expected_name and parsed.start_date <= target_date <= parsed.end_date:
+            matches[parsed.gid] = parsed
+
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    if len(matches) > 1:
+        choices = "、".join(
+            f"{item.name}（{item.gid}）" for item in matches.values()
+        )
+        raise RuntimeError(
+            f"Asana 日期父表检查中止：{expected_name} 存在多个候选父表：{choices}。"
+            "请保留一个后再同步。"
+        )
+
+    raise RuntimeError(
+        f"Asana 日期父表检查中止：本次同步日期为 {target_date.isoformat()}，"
+        f"未找到匹配的父表 {expected_name}。"
+        "程序不会继续使用旧父任务 GID；请先在 Asana 创建该日期父表后重试。"
+    )
 
 
 def get_existing_task_names(client, section_gid: str) -> set[str]:
@@ -2036,6 +2235,7 @@ def sync_packages(
     today: Optional[date] = None,
     parent_task_gid: str = PARENT_TASK_GID,
     notes_by_name: Optional[dict[str, str]] = None,
+    validated_parent_task: Optional[AsanaDateParent] = None,
 ) -> dict:
     """
     主同步编排函数 — Sheet → 过滤 → 差集 → Asana 增量同步（幂等）。
@@ -2047,13 +2247,15 @@ def sync_packages(
         project_gid:  Asana 项目 GID。
         sheet_name:   工作表名称（如 "26年5-6月"），空则读全表。
         today:        可选，注入日期用于测试。
-        parent_task_gid: 父任务 GID，新建任务将作为其子任务。
+        parent_task_gid: 历史兼容参数；实际父任务由同步日期自动匹配。
+        validated_parent_task: 可选，已在本次组合流程开始前校验过的日期父表。
 
     Returns:
         dict 同步结果摘要。
     """
     # 1. 日期
-    sheet_date, section_name = generate_target_dates(today)
+    sync_date = today or date.today()
+    sheet_date, section_name = generate_target_dates(sync_date)
 
     # 2. 读取 Sheet
     range_name = f"{sheet_name}!A:AZ" if sheet_name else "A:AZ"
@@ -2068,17 +2270,33 @@ def sync_packages(
     if notes_by_name:
         task_notes_by_name.update({k: v for k, v in notes_by_name.items() if v})
 
-    # 4. 幂等区段
+    # 4. 安全前置检查：父表必须匹配本次同步日期。这个检查必须位于
+    #    区段创建和任务写入之前，避免新日期误写到配置里残留的旧父表。
+    adaptation_parent = validated_parent_task
+    if adaptation_parent is None:
+        adaptation_parent = find_matching_adaptation_parent_task(
+            asana_client,
+            sync_date,
+        )
+    elif not (
+        adaptation_parent.start_date <= sync_date <= adaptation_parent.end_date
+    ):
+        raise RuntimeError(
+            "Asana 日期父表检查中止：预校验的父表 "
+            f"{adaptation_parent.name} 不包含本次同步日期 {sync_date.isoformat()}。"
+        )
+
+    # 5. 幂等区段
     section_gid = find_or_create_section(asana_client, project_gid, section_name)
 
-    # 5. 定位任务链接列
+    # 6. 定位任务链接列
     task_link_col = get_task_link_column_index(raw_data)
 
-    # 6. 已有任务名 + 链接信息
+    # 7. 已有任务名 + 链接信息
     existing_tasks = get_existing_tasks_by_name(asana_client, section_gid, project_gid)
     existing_names = set(existing_tasks.keys())
 
-    # 7. 先复用昨日仍未完成的同名任务，避免每天重复创建。CP 后台写入
+    # 8. 先复用昨日仍未完成的同名任务，避免每天重复创建。CP 后台写入
     # Sheet 时已经把既有行的“完成时间”更新为今天；这里同步迁移 Asana 分组。
     missing_today_names = compute_diff(task_names, existing_names)
     migrated_tasks = migrate_previous_day_tasks(
@@ -2091,25 +2309,26 @@ def sync_packages(
     existing_tasks.update(migrated_tasks)
     existing_names.update(migrated_tasks.keys())
 
-    # 8. 只有今天与昨日均不存在的任务才新建
+    # 9. 只有今天与昨日均不存在的任务才新建
     new_task_names = compute_diff(task_names, existing_names)
 
-    # 9. 创建任务
+    # 10. 创建任务。parent_task_gid 作为历史配置参数保留兼容性，但不再
+    #     决定新任务归属；实际使用每次由 Asana 日期父表检查解析出的 GID。
     created_tasks = create_tasks_for_packages(
         asana_client, project_gid, section_gid, new_task_names,
-        parent_task_gid=parent_task_gid or PARENT_TASK_GID,
+        parent_task_gid=adaptation_parent.gid,
         notes_by_name=task_notes_by_name,
     )
 
-    # 10. 合并已有和新创建的任务链接映射
+    # 11. 合并已有和新创建的任务链接映射
     task_links_by_name = {**existing_tasks, **created_tasks}
 
-    # 10.5 写入/补齐 Asana 任务描述
+    # 11.5 写入/补齐 Asana 任务描述
     notes_updated_count = update_task_notes_for_packages(
         asana_client, task_links_by_name, task_notes_by_name
     )
 
-    # 11. 回填任务链接
+    # 12. 回填任务链接
     if task_link_col is None:
         updates = []
         backfill_skipped = "missing_task_link_column"
@@ -2124,6 +2343,10 @@ def sync_packages(
         "sheet_date": sheet_date,
         "section_name": section_name,
         "section_gid": section_gid,
+        "parent_task_gid": adaptation_parent.gid,
+        "parent_task_name": adaptation_parent.name,
+        "parent_task_start_date": adaptation_parent.start_date.isoformat(),
+        "parent_task_end_date": adaptation_parent.end_date.isoformat(),
         "total_packages": len(packages),
         "existing_count": len(existing_names),
         "migrated_count": len(migrated_tasks),

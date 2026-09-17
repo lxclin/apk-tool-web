@@ -11,6 +11,8 @@ from ad_replay import (
     run_ad_replay_check,
     split_ad_unit_ids,
     validate_replay_timeout,
+    REPLAY_LOG_DRAIN_BATCH_SIZE,
+    _drain_logcat_queue,
 )
 
 
@@ -26,10 +28,27 @@ def test_split_ad_unit_ids_omits_detector_placeholders():
     assert split_ad_unit_ids("未找到, reward-1, N/A") == ("reward-1",)
 
 
-def test_replay_timeout_defaults_allow_500_seconds():
-    assert validate_replay_timeout("500") == 500
+def test_replay_timeout_defaults_allow_300_seconds():
+    assert validate_replay_timeout("300") == 300
     with pytest.raises(ValueError):
         validate_replay_timeout("5")
+
+
+def test_logcat_drain_is_bounded_for_a_continuously_noisy_queue():
+    class EndlessQueue:
+        def __init__(self):
+            self.calls = 0
+
+        def get_nowait(self):
+            self.calls += 1
+            return "noisy sdk line\n"
+
+    output = EndlessQueue()
+
+    pending = _drain_logcat_queue(output)
+
+    assert len(pending) == REPLAY_LOG_DRAIN_BATCH_SIZE
+    assert output.calls == REPLAY_LOG_DRAIN_BATCH_SIZE
 
 
 def test_load_and_show_requests_do_not_count_as_display():
@@ -143,6 +162,20 @@ def test_timeout_comment_marks_missing_type_and_not_configured_type():
     assert "包名：com.demo" in comment
     assert "插屏广告：未检测到真实展示" in comment
     assert "激励视频：未配置，不要求验证" in comment
+
+
+def test_timeout_comment_keeps_nonterminal_injection_warning():
+    evaluator = AdReplayEvaluator(ReplayExpectation.from_values("inter-1", ""))
+    result = evaluator.result(timed_out=True, elapsed_seconds=300)
+    result["runtime"] = {
+        "injection_warning": True,
+        "summary": "ClassNotFoundException: LicenseClient",
+    }
+
+    comment = build_replay_failure_comment("com.demo", result)
+
+    assert "注入兼容警告（已继续监听）" in comment
+    assert "LicenseClient" in comment
 
 
 def test_replay_comment_reports_runtime_crash_evidence():
@@ -313,6 +346,74 @@ def test_high_volume_logcat_is_drained_before_success_is_evaluated(
     assert "display_success" in displayed[0]
     dismiss_dialog.assert_called_once_with()
     assert any("通知权限" in message for message in progress)
+
+
+@patch("ad_replay.stop_logcat_stream")
+@patch("ad_replay.subprocess.run")
+@patch("ad_replay.force_stop_app", return_value=(True, "ok"))
+@patch("ad_replay.PackageRuntimeMonitor")
+@patch("ad_replay.start_logcat_stream")
+def test_replay_stops_when_injection_runtime_fails_while_app_is_alive(
+    start_stream, runtime_monitor, _force_stop, launch, _stop_stream
+):
+    proc = MagicMock()
+    proc.stdout = io.StringIO(
+        "W [ZG:W]: ClassNotFoundException on "
+        "/data/user/0/com.demo/files/zygotehole\n"
+    )
+    proc.poll.return_value = None
+    start_stream.return_value = proc
+    runtime_monitor.return_value.poll.return_value = {"ok": True}
+    runtime_monitor.return_value.observe_log_line.return_value = {
+        "ok": False,
+        "code": "APP_RUNTIME_INJECTION_FAILED",
+        "message": "应用自动化注入运行时失败，缺少兼容类，已终止自动化适配",
+        "summary": "ClassNotFoundException",
+    }
+    launch.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+    result = run_ad_replay_check(
+        "com.demo",
+        "10250",
+        ReplayExpectation.from_values("inter-1", ""),
+        timeout_seconds=10,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "APP_RUNTIME_INJECTION_FAILED"
+    assert result["runtime"]["summary"] == "ClassNotFoundException"
+
+
+@patch("ad_replay.stop_logcat_stream")
+@patch("ad_replay.subprocess.run")
+@patch("ad_replay.force_stop_app", return_value=(True, "ok"))
+@patch("ad_replay.PackageRuntimeMonitor")
+@patch("ad_replay.start_logcat_stream")
+def test_replay_succeeds_after_nonterminal_injection_class_warning(
+    start_stream, runtime_monitor, _force_stop, launch, _stop_stream
+):
+    proc = MagicMock()
+    proc.stdout = io.StringIO(
+        "E Hook: ClassNotFoundException LicenseClient zygotehole com.demo\n"
+        'ZGSDK.MediationEvent: {"adType":"INTERSTITIAL",'
+        '"adUnitId":"inter-1","status":"display_success"}\n'
+    )
+    proc.poll.return_value = None
+    start_stream.return_value = proc
+    runtime_monitor.return_value.poll.return_value = {"ok": True}
+    runtime_monitor.return_value.observe_log_line.return_value = None
+    runtime_monitor.return_value.injection_warnings = ["LicenseClient missing"]
+    launch.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+    result = run_ad_replay_check(
+        "com.demo",
+        "10250",
+        ReplayExpectation.from_values("inter-1", ""),
+        timeout_seconds=10,
+    )
+
+    assert result["ok"] is True
+    assert result["code"] == "AGGREGATION_REPLAY_SUCCESS"
 
 
 @patch("ad_replay.stop_logcat_stream")

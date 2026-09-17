@@ -8,9 +8,66 @@ import pytest
 from unittest.mock import MagicMock, patch
 from datetime import date
 
+
+@pytest.mark.parametrize("reset_status", ["自动化失败", "待人工检查", "待处理", ""])
+def test_reset_automation_failures_uses_fresh_status_and_keeps_business_outcomes(reset_status):
+    from auto_asana.main import reset_automation_failed_tasks_for_date
+    from dataclasses import replace
+
+    failed = AsanaPrecheckTask(
+        gid="failed", name="com.failed", package_name="com.failed", up2_appid="",
+        gp_link="", workflow_status=reset_status, workflow_terminal=bool(reset_status),
+        notes="保留描述", backend_submission_status="提交失败",
+    )
+    tasks = [failed] + [
+        replace(failed, gid=status, workflow_status=status)
+        for status in ["聚合适配成功", "已加黑", "其他归因", "暂不适配", "回放失败", "参数待确认"]
+    ] + [replace(failed, gid="completed", completed=True)]
+    client = MagicMock()
+    snapshot = {"section_name": "9.16执行", "tasks": tasks}
+    with patch("auto_asana.main.get_asana_tasks_for_date", return_value=snapshot):
+        result = reset_automation_failed_tasks_for_date(
+            client, "project", {t.gid for t in tasks}, today=date(2026, 9, 16),
+        )
+    assert result["reset_gids"] == {"failed"}
+    assert result["reset_skipped"] == 7
+    assert result["reset_errors"] == []
+    restored = result["tasks"][0]
+    assert restored.workflow_status == "待处理"
+    assert restored.workflow_terminal is False
+    assert restored.notes == "保留描述"
+    assert restored.backend_submission_status == ""
+    assert result["tasks"][1:] == tasks[1:]
+    client.stories.create_comment.assert_called_once()
+    assert "RECHECK_REQUESTED" in client.stories.create_comment.call_args.args[1]
+    client.tasks.update_task.assert_not_called()
+
+
+def test_reset_failure_keeps_failed_rows_and_supports_later_repeat_reset():
+    from auto_asana.main import reset_automation_failed_tasks_for_date
+    from dataclasses import replace
+
+    task = AsanaPrecheckTask(
+        gid="a", name="com.a", package_name="com.a", up2_appid="", gp_link="",
+        workflow_status="自动化失败", workflow_terminal=True,
+    )
+    client = MagicMock()
+    client.stories.create_comment.side_effect = [RuntimeError("接口失败"), {}, {}]
+    snapshot = {"tasks": [task, replace(task, gid="b")]}
+    with patch("auto_asana.main.get_asana_tasks_for_date", return_value=snapshot):
+        result = reset_automation_failed_tasks_for_date(client, "project", {"a", "b"})
+        assert result["reset_gids"] == {"b"}
+        assert result["tasks"][0] == task
+        assert result["reset_errors"] == [{"task_gid": "a", "error": "接口失败"}]
+        # The latest snapshot can be another failure after an earlier reset.
+        repeated = reset_automation_failed_tasks_for_date(client, "project", {"b"})
+        assert repeated["reset_gids"] == {"b"}
+    assert client.stories.create_comment.call_count == 3
+
 from auto_asana.main import (
     PackageRow,
     AsanaTaskInfo,
+    AsanaDateParent,
     AsanaPrecheckTask,
     SheetCellUpdate,
     SheetRowUpdate,
@@ -41,6 +98,9 @@ from auto_asana.main import (
     apply_sheet_row_updates,
     GS_SCOPES,
     generate_target_dates,
+    expected_adaptation_parent_name,
+    parse_asana_adaptation_parent_task,
+    find_matching_adaptation_parent_task,
     filter_packages,
     compute_diff,
     get_sheet_data,
@@ -62,6 +122,14 @@ from auto_asana.main import (
     _build_gs_service,
     sync_packages,
 )
+
+
+def configure_mock_adaptation_parent(mock_asana, target_date, gid="parent-date"):
+    """Configure the date-parent lookup used by sync_packages tests."""
+    mock_asana.tasks.search_tasks_for_workspace.return_value = [{
+        "gid": gid,
+        "name": expected_adaptation_parent_name(target_date),
+    }]
 
 
 class TestAutomationOutcomeSheetFeedback:
@@ -183,6 +251,30 @@ class TestGenerateTargetDates:
 
 
 class TestAsanaPrecheckTasks:
+    def test_recheck_request_supersedes_previous_terminal_failure(self):
+        stories = [
+            {
+                "text": "【APK Tool 自动化适配：AUTOMATION_FAILED】\n设备异常",
+                "created_at": "2026-09-10T10:30:00Z",
+            },
+            {
+                "text": "【APK Tool 自动化适配：RECHECK_REQUESTED】\n设备恢复，重新检查",
+                "created_at": "2026-09-10T10:40:00Z",
+            },
+        ]
+
+        stages = classify_precheck_workflow_stages(stories)
+
+        assert stages.workflow_status == "待处理"
+        assert stages.terminal is False
+        assert stages.precheck_status == ""
+        assert stages.aggregation_detection_status == ""
+        assert stages.backend_submission_status == ""
+        assert stages.interstitial_replay_status == ""
+        assert stages.rewarded_replay_status == ""
+        assert stages.action_adaptation_status == ""
+        assert stages.final_business_status == ""
+
     def test_action_failure_does_not_overwrite_aggregation_success(self):
         stories = [
             {
@@ -604,7 +696,7 @@ class TestAsanaPrecheckTasks:
 
         assert add_precheck_comment_once(client, "task-1", result) is True
         client.stories.create_comment.assert_called_once()
-        assert "未发现广告或应用内购标识，继续下载并人工确认（不加黑）" in (
+        assert "未发现广告或应用内购标识，继续下载安装并自动适配（不加黑）" in (
             client.stories.create_comment.call_args.args[1]
         )
 
@@ -630,7 +722,7 @@ class TestAsanaPrecheckTasks:
 
         assert created is True
         new_comment = client.stories.create_comment.call_args.args[1]
-        assert "继续下载并人工确认（不加黑）" in new_comment
+        assert "继续下载安装并自动适配（不加黑）" in new_comment
         assert "此前的自动预检结论已被本次结果替代" in new_comment
 
     def test_new_decision_marks_previous_precheck_comment_as_replaced(self):
@@ -1426,6 +1518,23 @@ class TestAsanaSdkFacades:
             {"data": {"notes": "desc"}}, "task-001", {}
         )
 
+    def test_search_tasks_for_workspace_passes_text_and_fields(self):
+        api = MagicMock()
+        api.search_tasks_for_workspace.return_value = [{"gid": "task-001"}]
+        facade = _TasksFacade(api)
+
+        result = facade.search_tasks_for_workspace(
+            "workspace-123",
+            text="2026.9.14-9.18",
+            opt_fields=["gid", "name"],
+        )
+
+        assert result == [{"gid": "task-001"}]
+        api.search_tasks_for_workspace.assert_called_once_with(
+            "workspace-123",
+            {"text": "2026.9.14-9.18", "opt_fields": "gid,name"},
+        )
+
 
 # ═══════════════════════════════════════════════════════════════
 # TestAsanaTaskInfo — 任务信息与链接映射
@@ -1520,6 +1629,60 @@ class TestAsanaSection:
         mock_client.sections.create_section_for_project.assert_called_once_with(
             "proj-123", {"name": "6.8执行"}
         )
+
+
+class TestAsanaDateParent:
+    """验证同步前的日期父表发现与失败保护。"""
+
+    def test_parses_weekly_parent_name(self):
+        parsed = parse_asana_adaptation_parent_task({
+            "gid": "parent-914",
+            "name": "【2026.9.14-9.18】聚合/动作适配",
+        })
+
+        assert parsed == AsanaDateParent(
+            "parent-914",
+            "【2026.9.14-9.18】聚合/动作适配",
+            date(2026, 9, 14),
+            date(2026, 9, 18),
+        )
+
+    def test_ignores_non_parent_task_name(self):
+        assert parse_asana_adaptation_parent_task({
+            "gid": "task-1",
+            "name": "聚合/动作适配com.example.app",
+        }) is None
+
+    def test_finds_parent_for_sync_date(self):
+        mock_client = MagicMock()
+        mock_client.tasks.search_tasks_for_workspace.return_value = [{
+            "gid": "parent-914",
+            "name": "【2026.9.14-9.18】聚合/动作适配",
+        }]
+
+        result = find_matching_adaptation_parent_task(
+            mock_client,
+            date(2026, 9, 17),
+            workspace_gid="workspace-123",
+        )
+
+        assert result.gid == "parent-914"
+        assert result.start_date == date(2026, 9, 14)
+        mock_client.tasks.search_tasks_for_workspace.assert_called_once_with(
+            "workspace-123",
+            text="2026.9.14-9.18",
+            opt_fields=["gid", "name", "parent.gid", "parent.name"],
+        )
+
+    def test_missing_parent_fails_closed(self):
+        mock_client = MagicMock()
+        mock_client.tasks.search_tasks_for_workspace.return_value = []
+
+        with pytest.raises(RuntimeError, match="未找到匹配的父表"):
+            find_matching_adaptation_parent_task(
+                mock_client,
+                date(2026, 9, 17),
+            )
 
     def test_creates_section_when_name_not_in_list(self):
         """区段列表中有其他区段但没有目标名称时，创建新区段。"""
@@ -1820,6 +1983,7 @@ class TestAsanaSyncIdempotency:
                 "completed": False,
             }],
         ]
+        configure_mock_adaptation_parent(mock_asana, date(2026, 8, 27))
 
         result = sync_packages(
             gs_service=mock_gs,
@@ -1900,6 +2064,7 @@ class TestEndToEndSync:
 
         # -- Mock Asana: 创建任务 --
         mock_asana.tasks.create_task.return_value = {"gid": "task-002"}
+        configure_mock_adaptation_parent(mock_asana, date(2026, 6, 8))
 
         # -- 执行 --
         result = sync_packages(
@@ -1924,7 +2089,7 @@ class TestEndToEndSync:
         mock_asana.tasks.create_task.assert_called_once_with({
             "workspace": "1208177697797743",
             "name": "聚合/动作适配com.app.beta",
-            "parent": "1215490559662224",
+            "parent": "parent-date",
             "memberships": [{"project": "proj-123", "section": "section-001"}],
             "notes": "\n".join([
                 "包名：com.app.beta",
@@ -1951,6 +2116,7 @@ class TestEndToEndSync:
         mock_asana.tasks.get_tasks_for_section.return_value = [
             {"gid": "task-001", "name": "聚合/动作适配com.app.alpha"},
         ]
+        configure_mock_adaptation_parent(mock_asana, date(2026, 6, 8))
 
         result = sync_packages(
             gs_service=mock_gs,
@@ -1987,6 +2153,7 @@ class TestEndToEndSync:
             "gid": "task-001",
             "permalink_url": "https://app.asana.com/0/proj/task-001",
         }
+        configure_mock_adaptation_parent(mock_asana, date(2026, 6, 8))
 
         result = sync_packages(
             gs_service=mock_gs,
@@ -2034,6 +2201,7 @@ class TestEndToEndSync:
         ]
         mock_asana.tasks.get_tasks_for_section.return_value = []
         mock_asana.tasks.create_task.return_value = {"gid": "task-001"}
+        configure_mock_adaptation_parent(mock_asana, date(2026, 6, 25))
 
         sync_packages(
             gs_service=mock_gs,
@@ -2052,7 +2220,7 @@ class TestEndToEndSync:
         mock_asana.tasks.create_task.assert_called_once_with({
             "workspace": "1208177697797743",
             "name": "聚合/动作适配com.app.alpha",
-            "parent": "1215490559662224",
+            "parent": "parent-date",
             "memberships": [{"project": "proj-123", "section": "section-001"}],
             "notes": "\n".join([
                 "包名：com.app.alpha",
@@ -2075,6 +2243,7 @@ class TestEndToEndSync:
         ]
         mock_asana.tasks.get_tasks_for_section.return_value = []
         mock_asana.tasks.create_task.return_value = {"gid": "task-001"}
+        configure_mock_adaptation_parent(mock_asana, date(2026, 6, 25))
 
         result = sync_packages(
             gs_service=mock_gs,
@@ -2121,6 +2290,7 @@ class TestEndToEndSync:
                 "permalink_url": "https://app.asana.com/0/proj/task-001",
             }
         ]
+        configure_mock_adaptation_parent(mock_asana, date(2026, 6, 8))
 
         result = sync_packages(
             gs_service=mock_gs,
@@ -2168,6 +2338,7 @@ class TestEndToEndSync:
                 "permalink_url": "https://app.asana.com/0/proj/task-001",
             }
         ]
+        configure_mock_adaptation_parent(mock_asana, date(2026, 6, 8))
 
         result = sync_packages(
             gs_service=mock_gs,
@@ -2215,6 +2386,7 @@ class TestEndToEndSync:
                 ]),
             }
         ]
+        configure_mock_adaptation_parent(mock_asana, date(2026, 6, 8))
 
         result = sync_packages(
             gs_service=mock_gs,
@@ -2275,6 +2447,7 @@ class TestEndToEndSync:
                 ]),
             }
         ]
+        configure_mock_adaptation_parent(mock_asana, date(2026, 6, 8))
 
         result = sync_packages(
             gs_service=mock_gs,
@@ -2305,6 +2478,7 @@ class TestEndToEndSync:
         ]
         mock_asana.tasks.get_tasks_for_section.return_value = []
         mock_asana.tasks.create_task.return_value = {"gid": "task-001"}
+        configure_mock_adaptation_parent(mock_asana, date(2026, 6, 8))
 
         result = sync_packages(
             gs_service=mock_gs,

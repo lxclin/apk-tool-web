@@ -784,7 +784,7 @@ select.form-input {
         <div class="form-group"><span class="form-label">Task GID</span><input class="form-input mono" id="automationTaskGid"></div>
         <div class="form-group"><span class="form-label">包名</span><input class="form-input mono" id="automationPackage"></div>
         <div class="form-group"><span class="form-label">UP2 appid</span><input class="form-input mono" id="automationAppId"></div>
-        <div class="form-group"><span class="form-label">回放监听（秒）</span><input class="form-input" type="number" id="automationTimeout" min="10" max="600" value="500"></div>
+        <div class="form-group"><span class="form-label">回放监听（秒）</span><input class="form-input" type="number" id="automationTimeout" min="10" max="600" value="300"></div>
         <div class="form-group"><span class="form-label">后台列表接口</span><input class="form-input mono" id="automationApiUrl" value="http://8.131.54.114/admin/gd_web/overseas/cp_adapt/list"></div>
         <div class="form-group"><span class="form-label">后台 X-Token</span><input class="form-input mono" type="password" id="automationXToken" placeholder="当前登录会话 token"></div>
         <div class="form-group"><span class="form-label">后台固定 token</span><input class="form-input mono" type="password" id="automationFixedToken" placeholder="固定 token"></div>
@@ -1597,7 +1597,6 @@ function precheckTaskStatus(result) {
     if (install.code === 'DOWNLOAD_DEFERRED') return '待补下载';
     if (install.code === 'DOWNLOAD_PAUSED') return '下载已暂停';
     if (install.code && install.ok === false) return '下载失败';
-    if (!launch.code || launch.ok === true) return '待人工检查';
   }
   if (launch.ok === true) return '启动正常';
   if (launch.code) return '需人工确认';
@@ -1605,7 +1604,7 @@ function precheckTaskStatus(result) {
   if (install.code === 'ALREADY_INSTALLED') return '已安装';
   if (install.code && !install.ok) return '下载失败';
   return ({
-    HAS_ADS:'含广告，可继续', GOOGLE_NO_PACKAGE:'google无包', ALL_NETWORK_NO_PACKAGE:'全网无包', APKCOMBO_AVAILABLE:'APKCombo有包', APKCOMBO_CHECK_FAILED:'APKCombo待确认', IAP_ONLY:'加黑', JAPANESE_PACKAGE:'日本包体，加黑', NO_ADS_OR_IAP:'待人工检查',
+    HAS_ADS:'含广告，可继续', GOOGLE_NO_PACKAGE:'google无包', ALL_NETWORK_NO_PACKAGE:'全网无包', APKCOMBO_AVAILABLE:'APKCombo有包', APKCOMBO_CHECK_FAILED:'APKCombo待确认', IAP_ONLY:'加黑', JAPANESE_PACKAGE:'日本包体，加黑', NO_ADS_OR_IAP:'待处理',
     DEVICE_UNSUPPORTED:'设备不支持', COUNTRY_UNSUPPORTED:'地区不支持',
     NO_DEVICE:'设备未连接', OPEN_FAILED:'页面打开失败', UNKNOWN:'人工确认',
   })[code] || code;
