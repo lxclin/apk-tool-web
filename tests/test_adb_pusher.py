@@ -1813,6 +1813,45 @@ class TestAdbCommandBuilders:
         assert message == "无效的应用包名"
         mock_run.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "cmd: Failure calling service package: Broken pipe (32)",
+            "cmd: Can't find service: package",
+            "卸载超时",
+            "error: device offline",
+        ],
+    )
+    def test_package_manager_fatal_errors_stop_bulk_cleanup(self, message):
+        from adb_pusher import is_package_manager_fatal_error
+
+        assert is_package_manager_fatal_error(message) is True
+
+    def test_regular_package_failure_is_not_a_system_fatal_error(self):
+        from adb_pusher import is_package_manager_fatal_error
+
+        assert is_package_manager_fatal_error(
+            "Failure [DELETE_FAILED_DEVICE_POLICY_MANAGER]"
+        ) is False
+
+    def test_package_manager_health_check_uses_lightweight_service_lookup(self):
+        from adb_pusher import check_package_manager_ready
+
+        result = MagicMock(
+            returncode=0,
+            stdout="Service package: found\n",
+            stderr="",
+        )
+        with patch("adb_pusher._run_adb", return_value=result) as mock_run:
+            ready, message = check_package_manager_ready()
+
+        assert ready is True
+        assert message == "Package Manager 正常"
+        mock_run.assert_called_once_with(
+            ["shell", "service", "check", "package"],
+            timeout=5,
+        )
+
     def test_build_bulk_uninstall_cmd_filters_invalid_package_names(self):
         from adb_pusher import build_bulk_uninstall_cmd
 

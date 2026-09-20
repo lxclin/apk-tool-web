@@ -4634,6 +4634,7 @@ class TestActionDelayTool:
                 with patch("gui.check_device", return_value=True), \
                      patch("gui.list_third_party_packages", return_value=["com.keep", "com.remove"]), \
                      patch("gui.messagebox.askyesno", return_value=True) as mock_confirm, \
+                     patch("gui.check_package_manager_ready", return_value=(True, "Package Manager 正常")), \
                      patch("gui.uninstall_third_party_package", return_value=(True, "卸载成功")) as mock_uninstall, \
                      patch("gui.save_gui_settings"), \
                     patch("gui.threading.Thread", ImmediateThread):
@@ -4644,6 +4645,33 @@ class TestActionDelayTool:
                 assert app.cleanup_progress_var.get() == 1
                 assert "卸载完成：1/1" in app.cleanup_progress_text_var.get()
                 assert "成功 1 个，失败 0 个" in app.cleanup_preview_var.get()
+        finally:
+            root.destroy()
+
+    def test_cleanup_stops_immediately_when_package_manager_pipe_breaks(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                packages = ["com.one", "com.two", "com.three"]
+                fatal_message = "cmd: Failure calling service package: Broken pipe (32)"
+
+                with patch("gui.check_device", return_value=True), \
+                     patch("gui.list_third_party_packages", return_value=packages), \
+                     patch("gui.messagebox.askyesno", return_value=True), \
+                     patch("gui.check_package_manager_ready", return_value=(True, "Package Manager 正常")), \
+                     patch("gui.uninstall_third_party_package", return_value=(False, fatal_message)) as mock_uninstall, \
+                     patch("gui.save_gui_settings"), \
+                     patch("gui.time.sleep"), \
+                     patch("gui.threading.Thread", ImmediateThread):
+                    app._on_cleanup_third_party_packages()
+
+                mock_uninstall.assert_called_once_with("com.one")
+                assert "保护性停止" in app.cleanup_preview_var.get()
+                assert "1/3" in app.cleanup_progress_text_var.get()
+                assert "剩余 2 个未执行" in app.cleanup_preview_var.get()
         finally:
             root.destroy()
 

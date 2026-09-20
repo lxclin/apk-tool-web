@@ -48,7 +48,8 @@ from adb_pusher import (
     build_get_uid_cmd, build_clear_cache_cmd, build_force_stop_cmd,
     build_open_app_cmd, build_logcat_cmd,
     list_third_party_packages, packages_to_uninstall,
-    uninstall_third_party_package,
+    uninstall_third_party_package, check_package_manager_ready,
+    is_package_manager_fatal_error,
     extract_logcat_fields, download_and_install, download_and_install_apkcombo,
     build_backend_url, extract_uid_from_dumpsys, parse_fill_url,
     extract_google_play_package, is_apk_download_url,
@@ -159,6 +160,9 @@ CONFIG_DEFAULT = os.path.expanduser(
 MULTI_ID_REPLAY_TIMEOUT_SECONDS = 300
 TRANSIENT_REPLAY_RETRY_LIMIT = 1
 UNKNOWN_PRECHECK_RETRY_DELAY_SECONDS = 3
+CLEANUP_UNINSTALL_INTERVAL_SECONDS = 2.0
+CLEANUP_UNINSTALL_BATCH_SIZE = 10
+CLEANUP_UNINSTALL_BATCH_COOLDOWN_SECONDS = 10.0
 WORK_DIR_DEFAULT = os.path.expanduser(
     "~/Documents/适配动作与聚合参数获取_260629"
 )
@@ -3836,7 +3840,11 @@ class APKToolApp:
                 self._safe_after(0, lambda: self._sync_log(f"  Sheet 匹配日期 : {result['sheet_date']}", "info"))
                 self._safe_after(0, lambda: self._sync_log(f"  Asana 区段名称 : {result['section_name']}", "info"))
                 self._safe_after(0, lambda: self._sync_log(f"  Asana 区段 GID  : {result['section_gid']}", "info"))
-                self._safe_after(0, lambda: self._sync_log(f"  日期父表       : {result['parent_task_name']}", "done"))
+                parent_label = "日期父表（回退）" if result.get("parent_task_fallback") else "日期父表"
+                self._safe_after(0, lambda: self._sync_log(
+                    f"  {parent_label:<14}: {result['parent_task_name']}",
+                    "info" if result.get("parent_task_fallback") else "done",
+                ))
                 self._safe_after(0, lambda: self._sync_log(f"  父表 GID       : {result['parent_task_gid']}", "info"))
                 self._safe_after(0, lambda: self._sync_log(f"  Sheet 筛选包数 : {result['total_packages']}", "info"))
                 self._safe_after(0, lambda: self._sync_log(f"  Asana 已有任务 : {result['existing_count']}", "info"))
@@ -3946,12 +3954,19 @@ class APKToolApp:
                 self._safe_after(0, lambda: self._sync_log("  认证通过 ✓", "done"))
 
                 self._safe_after(0, lambda: self._sync_log("[2/5] 检查 Asana 日期父表 ...", "cmd"))
+                sync_date = datetime.now().date()
                 validated_parent_task = find_matching_adaptation_parent_task(
                     asana_client,
-                    datetime.now().date(),
+                    sync_date,
                 )
+                parent_is_fallback = validated_parent_task.end_date < sync_date
                 self._safe_after(0, lambda: self._sync_log(
-                    f"  日期父表匹配 ✓ {validated_parent_task.name}", "done"
+                    (
+                        f"  日期父表回退使用 ⚠ {validated_parent_task.name}"
+                        if parent_is_fallback
+                        else f"  日期父表匹配 ✓ {validated_parent_task.name}"
+                    ),
+                    "info" if parent_is_fallback else "done",
                 ))
 
                 self._safe_after(0, lambda: self._sync_log("[3/5] 拉取 CP 后台并写入 Sheet ...", "cmd"))
@@ -3986,7 +4001,11 @@ class APKToolApp:
                 self._safe_after(0, lambda: self._sync_log("[5/5] 同步结果:", "cmd"))
                 self._safe_after(0, lambda: self._sync_log(f"  Sheet 匹配日期 : {result['sheet_date']}", "info"))
                 self._safe_after(0, lambda: self._sync_log(f"  Asana 区段名称 : {result['section_name']}", "info"))
-                self._safe_after(0, lambda: self._sync_log(f"  日期父表       : {result['parent_task_name']}", "done"))
+                parent_label = "日期父表（回退）" if result.get("parent_task_fallback") else "日期父表"
+                self._safe_after(0, lambda: self._sync_log(
+                    f"  {parent_label:<14}: {result['parent_task_name']}",
+                    "info" if result.get("parent_task_fallback") else "done",
+                ))
                 self._safe_after(0, lambda: self._sync_log(f"  父表 GID       : {result['parent_task_gid']}", "info"))
                 self._safe_after(0, lambda: self._sync_log(f"  Sheet 筛选包数 : {result['total_packages']}", "info"))
                 self._safe_after(0, lambda: self._sync_log(f"  昨日任务迁入   : {result.get('migrated_count', 0)}", "done"))
@@ -8638,41 +8657,84 @@ class APKToolApp:
         def _run():
             succeeded = 0
             failures: list[tuple[str, str]] = []
-            for index, package_name in enumerate(targets, start=1):
-                ok, message = uninstall_third_party_package(package_name)
-                if ok:
-                    succeeded += 1
-                else:
-                    failures.append((package_name, message))
-                self._safe_after(
-                    0,
-                    self._console_line,
-                    f"[卸载 {'成功' if ok else '失败'}] {package_name}"
-                    + ("" if ok else f"：{message}"),
-                    "done" if ok else "error",
-                )
-                self._safe_after(
-                    0,
-                    self._update_cleanup_progress,
-                    index,
-                    len(targets),
-                    package_name,
-                    succeeded,
-                    len(failures),
-                )
+            attempted = 0
+            aborted_reason = ""
+
+            ready, health_message = check_package_manager_ready()
+            if not ready:
+                aborted_reason = health_message
+            else:
+                for index, package_name in enumerate(targets, start=1):
+                    if index > 1:
+                        completed_batch = (index - 1) % CLEANUP_UNINSTALL_BATCH_SIZE == 0
+                        if completed_batch:
+                            time.sleep(CLEANUP_UNINSTALL_BATCH_COOLDOWN_SECONDS)
+                            ready, health_message = check_package_manager_ready()
+                            if not ready:
+                                aborted_reason = health_message
+                                break
+                        else:
+                            time.sleep(CLEANUP_UNINSTALL_INTERVAL_SECONDS)
+
+                    ok, message = uninstall_third_party_package(package_name)
+                    attempted = index
+                    if ok:
+                        succeeded += 1
+                    else:
+                        failures.append((package_name, message))
+                    self._safe_after(
+                        0,
+                        self._console_line,
+                        f"[卸载 {'成功' if ok else '失败'}] {package_name}"
+                        + ("" if ok else f"：{message}"),
+                        "done" if ok else "error",
+                    )
+                    self._safe_after(
+                        0,
+                        self._update_cleanup_progress,
+                        attempted,
+                        len(targets),
+                        package_name,
+                        succeeded,
+                        len(failures),
+                    )
+
+                    if not ok and is_package_manager_fatal_error(message):
+                        aborted_reason = message
+                        break
 
             def _finish():
                 failed = len(failures)
-                summary = (
-                    f"卸载完成：成功 {succeeded} 个，失败 {failed} 个"
-                )
+                remaining = len(targets) - attempted
+                if aborted_reason:
+                    summary = (
+                        f"清理已保护性停止：已处理 {attempted}/{len(targets)}"
+                        f"（成功 {succeeded}，失败 {failed}），剩余 {remaining} 个未执行"
+                    )
+                else:
+                    summary = (
+                        f"卸载完成：成功 {succeeded} 个，失败 {failed} 个"
+                    )
                 self.cleanup_preview_var.set(summary)
-                self.cleanup_progress_text_var.set(
-                    f"卸载完成：{len(targets)}/{len(targets)}（成功 {succeeded}，失败 {failed}）"
-                )
+                if aborted_reason:
+                    self.cleanup_progress_text_var.set(
+                        f"清理已停止：{attempted}/{len(targets)}"
+                        f"（成功 {succeeded}，失败 {failed}）"
+                    )
+                else:
+                    self.cleanup_progress_text_var.set(
+                        f"卸载完成：{len(targets)}/{len(targets)}"
+                        f"（成功 {succeeded}，失败 {failed}）"
+                    )
                 lines: list[tuple[str, str]] = [
-                    (summary, "done" if not failures else "error")
+                    (summary, "done" if not failures and not aborted_reason else "error")
                 ]
+                if aborted_reason:
+                    lines.extend([
+                        ("", ""),
+                        (f"停止原因: {aborted_reason}", "error"),
+                        ("为避免 system_server Watchdog 重启，未继续执行剩余卸载。", "error"),
+                    ])
                 if failures:
                     lines.append(("", ""))
                     lines.append(("卸载失败:", "error"))

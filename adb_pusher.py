@@ -3390,6 +3390,49 @@ def packages_to_uninstall(
     return sorted(pkg for pkg in set(installed_packages) if pkg not in keep)
 
 
+PACKAGE_MANAGER_FATAL_ERRORS = (
+    "broken pipe",
+    "can't find service: package",
+    "cannot find service: package",
+    "failure calling service package",
+    "service package: not found",
+    "device offline",
+    "no devices/emulators found",
+    "device unauthorized",
+    "transport error",
+    "connection reset",
+    "closed",
+    "卸载超时",
+)
+
+
+def is_package_manager_fatal_error(message: str) -> bool:
+    """Return whether cleanup must stop to protect Android system_server."""
+    normalized = str(message or "").casefold()
+    return any(marker in normalized for marker in PACKAGE_MANAGER_FATAL_ERRORS)
+
+
+def check_package_manager_ready() -> tuple[bool, str]:
+    """Lightweight Package Manager health check used between cleanup batches."""
+    try:
+        result = _run_adb(
+            ["shell", "service", "check", "package"],
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Package Manager 健康检查超时"
+    except (FileNotFoundError, OSError) as exc:
+        return False, f"Package Manager 健康检查失败: {exc}"
+
+    output = "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part.strip()
+    )
+    if result.returncode == 0 and "found" in output.casefold() \
+            and "not found" not in output.casefold():
+        return True, "Package Manager 正常"
+    return False, output or f"Package Manager 不可用 (exit={result.returncode})"
+
+
 def uninstall_third_party_package(package_name: str) -> tuple[bool, str]:
     """卸载单个第三方包，返回可用于逐包进度展示的结果。"""
     package_name = package_name.strip()

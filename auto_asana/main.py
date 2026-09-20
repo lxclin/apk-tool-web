@@ -2009,10 +2009,10 @@ def find_matching_adaptation_parent_task(
     The old workflow relied on a manually saved parent GID.  That is unsafe
     when a new weekly parent is created in Asana: the next sync can silently
     keep writing under last week's parent.  Search the workspace by the
-    expected date token instead, and fail closed when the parent is missing or
-    ambiguous.  The search also finds an empty parent task, which a project
-    task listing cannot reliably do because the parent itself is not a project
-    member.
+    expected date token instead.  Prefer a parent containing ``target_date``;
+    when the current period has not been created, fall back to the latest
+    historical parent whose end date is before ``target_date``.  This supports
+    periods where Asana keeps using the same parent for several weeks.
     """
     expected_name = expected_adaptation_parent_name(target_date)
     week_start = target_date - timedelta(days=target_date.weekday())
@@ -2022,40 +2022,70 @@ def find_matching_adaptation_parent_task(
         f"{week_end.month}.{week_end.day}"
     )
     opt_fields = ["gid", "name", "parent.gid", "parent.name"]
-    try:
-        search_results = client.tasks.search_tasks_for_workspace(
-            workspace_gid,
-            text=search_text,
-            opt_fields=opt_fields,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"Asana 日期父表检查失败，无法查询工作区任务（{expected_name}）：{exc}"
-        ) from exc
+    def _search(text: str) -> list[dict[str, Any]]:
+        try:
+            return list(client.tasks.search_tasks_for_workspace(
+                workspace_gid,
+                text=text,
+                opt_fields=opt_fields,
+            ) or [])
+        except Exception as exc:
+            raise RuntimeError(
+                f"Asana 日期父表检查失败，无法查询工作区任务（{expected_name}）：{exc}"
+            ) from exc
 
-    matches: dict[str, AsanaDateParent] = {}
-    for raw_task in list(search_results or []):
-        parsed = parse_asana_adaptation_parent_task(raw_task)
-        if not parsed:
-            continue
-        if parsed.name == expected_name and parsed.start_date <= target_date <= parsed.end_date:
-            matches[parsed.gid] = parsed
+    def _collect(raw_tasks: list[dict[str, Any]]) -> dict[str, AsanaDateParent]:
+        parents: dict[str, AsanaDateParent] = {}
+        for raw_task in raw_tasks:
+            candidates = [raw_task]
+            nested_parent = raw_task.get("parent")
+            if isinstance(nested_parent, dict):
+                candidates.append(nested_parent)
+            for candidate in candidates:
+                parsed = parse_asana_adaptation_parent_task(candidate)
+                if parsed:
+                    parents[parsed.gid] = parsed
+        return parents
 
-    if len(matches) == 1:
-        return next(iter(matches.values()))
-    if len(matches) > 1:
+    candidates = _collect(_search(search_text))
+    exact_matches = {
+        gid: item for gid, item in candidates.items()
+        if item.start_date <= target_date <= item.end_date
+    }
+
+    if len(exact_matches) == 1:
+        return next(iter(exact_matches.values()))
+    if len(exact_matches) > 1:
         choices = "、".join(
-            f"{item.name}（{item.gid}）" for item in matches.values()
+            f"{item.name}（{item.gid}）" for item in exact_matches.values()
         )
         raise RuntimeError(
-            f"Asana 日期父表检查中止：{expected_name} 存在多个候选父表：{choices}。"
+            f"Asana 日期父表检查中止：{expected_name} 存在多个当期父表：{choices}。"
             "请保留一个后再同步。"
+        )
+
+    # The date-specific search intentionally stays fast for the normal case.
+    # Only perform the broader lookup when no current parent was found.
+    candidates.update(_collect(_search("聚合/动作适配")))
+    historical = [
+        item for item in candidates.values()
+        if item.end_date < target_date
+    ]
+    if historical:
+        latest_end = max(item.end_date for item in historical)
+        latest = [item for item in historical if item.end_date == latest_end]
+        if len(latest) == 1:
+            return latest[0]
+        choices = "、".join(f"{item.name}（{item.gid}）" for item in latest)
+        raise RuntimeError(
+            "Asana 日期父表检查中止：最新历史父表存在多个候选："
+            f"{choices}。请保留一个后再同步。"
         )
 
     raise RuntimeError(
         f"Asana 日期父表检查中止：本次同步日期为 {target_date.isoformat()}，"
-        f"未找到匹配的父表 {expected_name}。"
-        "程序不会继续使用旧父任务 GID；请先在 Asana 创建该日期父表后重试。"
+        f"未找到当期父表 {expected_name}，也没有可回退的历史父表。"
+        "程序不会继续使用配置中的旧父任务 GID。"
     )
 
 
@@ -2270,20 +2300,18 @@ def sync_packages(
     if notes_by_name:
         task_notes_by_name.update({k: v for k, v in notes_by_name.items() if v})
 
-    # 4. 安全前置检查：父表必须匹配本次同步日期。这个检查必须位于
-    #    区段创建和任务写入之前，避免新日期误写到配置里残留的旧父表。
+    # 4. 安全前置检查：优先使用当期父表；当新父表尚未创建时允许使用
+    #    目标日期之前最新的历史父表。这个检查必须位于任何 Asana 写入之前。
     adaptation_parent = validated_parent_task
     if adaptation_parent is None:
         adaptation_parent = find_matching_adaptation_parent_task(
             asana_client,
             sync_date,
         )
-    elif not (
-        adaptation_parent.start_date <= sync_date <= adaptation_parent.end_date
-    ):
+    elif adaptation_parent.start_date > sync_date:
         raise RuntimeError(
             "Asana 日期父表检查中止：预校验的父表 "
-            f"{adaptation_parent.name} 不包含本次同步日期 {sync_date.isoformat()}。"
+            f"{adaptation_parent.name} 晚于本次同步日期 {sync_date.isoformat()}。"
         )
 
     # 5. 幂等区段
@@ -2347,6 +2375,7 @@ def sync_packages(
         "parent_task_name": adaptation_parent.name,
         "parent_task_start_date": adaptation_parent.start_date.isoformat(),
         "parent_task_end_date": adaptation_parent.end_date.isoformat(),
+        "parent_task_fallback": adaptation_parent.end_date < sync_date,
         "total_packages": len(packages),
         "existing_count": len(existing_names),
         "migrated_count": len(migrated_tasks),

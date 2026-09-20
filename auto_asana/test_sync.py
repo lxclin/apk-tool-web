@@ -5,7 +5,7 @@ test_sync.py — Google Sheets → Asana 幂等同步 单元测试
 """
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from datetime import date
 
 
@@ -1678,11 +1678,83 @@ class TestAsanaDateParent:
         mock_client = MagicMock()
         mock_client.tasks.search_tasks_for_workspace.return_value = []
 
-        with pytest.raises(RuntimeError, match="未找到匹配的父表"):
+        with pytest.raises(RuntimeError, match="没有可回退的历史父表"):
             find_matching_adaptation_parent_task(
                 mock_client,
                 date(2026, 9, 17),
             )
+
+        assert mock_client.tasks.search_tasks_for_workspace.call_count == 2
+
+    def test_missing_current_parent_falls_back_to_latest_historical_parent(self):
+        mock_client = MagicMock()
+        mock_client.tasks.search_tasks_for_workspace.side_effect = [
+            [],
+            [
+                {
+                    "gid": "parent-907",
+                    "name": "【2026.9.7-9.11】聚合/动作适配",
+                },
+                {
+                    "gid": "parent-914",
+                    "name": "【2026.9.14-9.18】聚合/动作适配",
+                },
+                {
+                    "gid": "parent-future",
+                    "name": "【2026.10.5-10.9】聚合/动作适配",
+                },
+            ],
+        ]
+
+        result = find_matching_adaptation_parent_task(
+            mock_client,
+            date(2026, 9, 30),
+            workspace_gid="workspace-123",
+        )
+
+        assert result.gid == "parent-914"
+        assert result.end_date == date(2026, 9, 18)
+        assert mock_client.tasks.search_tasks_for_workspace.call_args_list == [
+            call(
+                "workspace-123",
+                text="2026.9.28-10.2",
+                opt_fields=["gid", "name", "parent.gid", "parent.name"],
+            ),
+            call(
+                "workspace-123",
+                text="聚合/动作适配",
+                opt_fields=["gid", "name", "parent.gid", "parent.name"],
+            ),
+        ]
+
+    def test_sync_accepts_prevalidated_historical_parent(self):
+        mock_gs = MagicMock()
+        mock_asana = MagicMock()
+        mock_gs.spreadsheets().values().get().execute.return_value = {
+            "values": [["包名", "聚合适配", "完成时间"]]
+        }
+        mock_asana.sections.get_sections_for_project.return_value = [
+            {"gid": "section-930", "name": "9.30执行"}
+        ]
+        mock_asana.tasks.get_tasks_for_section.return_value = []
+        historical_parent = AsanaDateParent(
+            "parent-914",
+            "【2026.9.14-9.18】聚合/动作适配",
+            date(2026, 9, 14),
+            date(2026, 9, 18),
+        )
+
+        result = sync_packages(
+            gs_service=mock_gs,
+            asana_client=mock_asana,
+            sheet_id="sheet-123",
+            project_gid="project-123",
+            today=date(2026, 9, 30),
+            validated_parent_task=historical_parent,
+        )
+
+        assert result["parent_task_gid"] == "parent-914"
+        assert result["parent_task_fallback"] is True
 
     def test_creates_section_when_name_not_in_list(self):
         """区段列表中有其他区段但没有目标名称时，创建新区段。"""
