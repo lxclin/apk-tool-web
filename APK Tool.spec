@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('permission_public_key.pem', '.')],
+    datas=[('permission_public_key.pem', '.'), ('crash_rules.json', '.')],
     hiddenimports=['cryptography', 'cryptography.hazmat.primitives.asymmetric.ed25519'],
     hookspath=[],
     hooksconfig={},

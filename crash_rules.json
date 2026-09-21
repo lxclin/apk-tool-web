@@ -1,0 +1,177 @@
+{
+  "version": 1,
+  "description": "历史 Android 闪退日志规则。priority 越大越先匹配。",
+  "rules": [
+    {
+      "id": "JAVA_MISSING_CLASS",
+      "kind": "crash",
+      "priority": 100,
+      "crash_type": "JAVA_CRASH",
+      "reason_code": "MISSING_RUNTIME_CLASS",
+      "reason": "Java 运行时缺少类或依赖不完整",
+      "requires_any_of": ["FATAL EXCEPTION", "am_crash"],
+      "patterns": ["ClassNotFoundException", "NoClassDefFoundError"],
+      "extract": "missing_class",
+      "confidence": 0.99
+    },
+    {
+      "id": "JAVA_UNSATISFIED_LINK",
+      "kind": "crash",
+      "priority": 95,
+      "crash_type": "JAVA_CRASH",
+      "reason_code": "MISSING_NATIVE_LIBRARY",
+      "reason": "Native 库缺失或 ABI 不匹配",
+      "requires_any_of": ["FATAL EXCEPTION", "am_crash"],
+      "patterns": ["UnsatisfiedLinkError", "dlopen failed"],
+      "confidence": 0.98
+    },
+    {
+      "id": "JAVA_THREAD_RESOURCE",
+      "kind": "crash",
+      "priority": 93,
+      "crash_type": "JAVA_CRASH",
+      "reason_code": "THREAD_RESOURCE_EXHAUSTED",
+      "reason": "线程资源不足，无法创建新线程",
+      "requires_any_of": ["FATAL EXCEPTION", "am_crash"],
+      "patterns": [
+        "pthread_create",
+        "unable to create new native thread",
+        "could not create thread",
+        "failed to create thread"
+      ],
+      "extract": "thread_resource",
+      "confidence": 0.98
+    },
+    {
+      "id": "JAVA_OOM",
+      "kind": "crash",
+      "priority": 90,
+      "crash_type": "JAVA_CRASH",
+      "reason_code": "OUT_OF_MEMORY",
+      "reason": "应用内存不足",
+      "requires_any_of": ["FATAL EXCEPTION", "am_crash"],
+      "patterns": ["OutOfMemoryError"],
+      "confidence": 0.96
+    },
+    {
+      "id": "NATIVE_SIGNAL",
+      "kind": "crash",
+      "priority": 85,
+      "crash_type": "NATIVE_CRASH",
+      "reason_code": "NATIVE_SIGNAL",
+      "reason": "Native 层信号或 abort 崩溃",
+      "requires_any_of": [
+        "am_crash",
+        "Fatal signal",
+        "backtrace:",
+        "SIGSEGV",
+        "SIGABRT"
+      ],
+      "patterns": [
+        "Fatal signal",
+        "backtrace:",
+        "Native crash",
+        "Segmentation fault",
+        "Aborted",
+        "SIGSEGV",
+        "SIGABRT",
+        "signal 11",
+        "signal 6"
+      ],
+      "confidence": 0.98
+    },
+    {
+      "id": "JAVA_BINARY_INCOMPATIBILITY",
+      "kind": "crash",
+      "priority": 88,
+      "crash_type": "JAVA_CRASH",
+      "reason_code": "JAVA_API_BINARY_INCOMPATIBILITY",
+      "reason": "Java/SDK API 二进制不兼容，调用的方法或字段不存在",
+      "requires_any_of": ["FATAL EXCEPTION", "am_crash"],
+      "patterns": [
+        "NoSuchMethodError",
+        "NoSuchFieldError",
+        "AbstractMethodError",
+        "IncompatibleClassChangeError"
+      ],
+      "confidence": 0.97
+    },
+    {
+      "id": "JAVA_SECURITY_EXCEPTION",
+      "kind": "crash",
+      "priority": 80,
+      "crash_type": "JAVA_CRASH",
+      "reason_code": "SECURITY_EXCEPTION",
+      "reason": "权限或系统安全策略异常",
+      "requires_any_of": ["FATAL EXCEPTION", "am_crash"],
+      "patterns": ["SecurityException"],
+      "confidence": 0.92
+    },
+    {
+      "id": "ANR",
+      "kind": "anr",
+      "priority": 70,
+      "crash_type": "ANR",
+      "reason_code": "ANR",
+      "reason": "应用无响应",
+      "patterns": [
+        "am_anr",
+        "Application Not Responding",
+        "input dispatching timed out",
+        "not responding",
+        "ANR"
+      ],
+      "confidence": 0.95
+    },
+    {
+      "id": "APP_START_BLOCKED",
+      "kind": "lifecycle",
+      "priority": 65,
+      "crash_type": "",
+      "reason_code": "APP_START_BLOCKED",
+      "reason": "应用启动被系统阻止，不属于包体闪退",
+      "patterns": [
+        "Failure starting process",
+        "currently frozen",
+        "start failure",
+        "Force stopping"
+      ],
+      "confidence": 0.94
+    },
+    {
+      "id": "TASK_REMOVED",
+      "kind": "lifecycle",
+      "priority": 60,
+      "crash_type": "",
+      "reason_code": "TASK_REMOVED",
+      "reason": "应用任务被移除，不属于闪退",
+      "patterns": ["wm_task_removed", "finish-imm:remove-task"],
+      "confidence": 0.98
+    },
+    {
+      "id": "PROCESS_KILLED_BY_SYSTEM",
+      "kind": "lifecycle",
+      "priority": 58,
+      "crash_type": "",
+      "reason_code": "PROCESS_KILLED_BY_SYSTEM",
+      "reason": "进程被系统回收或杀死，不属于闪退",
+      "patterns": [
+        "has died: cch",
+        "has died: cached",
+        "has died: empty"
+      ],
+      "confidence": 0.88
+    },
+    {
+      "id": "JAVA_REFLECTION_FAILURE",
+      "kind": "crash",
+      "priority": 40,
+      "crash_type": "JAVA_CRASH",
+      "reason_code": "REFLECTION_FAILURE",
+      "reason": "Java 反射调用失败",
+      "requires_any_of": ["FATAL EXCEPTION", "am_crash"],
+      "patterns": ["ReflectException", "InvocationTargetException"],
+      "confidence": 0.85
+    }
+  ]
+}

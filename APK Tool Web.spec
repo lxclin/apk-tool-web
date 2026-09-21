@@ -13,6 +13,7 @@ a = Analysis(
         (os.path.join(SPECPATH, 'static', 'index.html'), 'static'),
         (os.path.join(SPECPATH, 'ip_whitelist.json'), '.'),
         (os.path.join(SPECPATH, 'permission_public_key.pem'), '.'),
+        (os.path.join(SPECPATH, 'crash_rules.json'), '.'),
     ],
     hiddenimports=[
         # FastAPI 依赖

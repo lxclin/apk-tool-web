@@ -40,12 +40,26 @@ def precheck_comment_result(result: dict) -> dict:
     if launch_result and not launch_result.get("ok"):
         summary = str(launch_result.get("summary") or "").strip()
         detail = str(launch_result.get("message") or "应用启动预检失败")
+        reason = str(launch_result.get("reason") or "").strip()
+        rule_id = str(launch_result.get("rule_id") or "").strip()
+        if reason:
+            detail += f"\n规则判定：{reason}"
+        if rule_id:
+            detail += f"（{rule_id}）"
         if summary:
             detail += "\n崩溃摘要：\n" + summary[-1800:]
         return {
             "code": launch_result.get("code", "LAUNCH_FAILED"),
             "package_name": result.get("package_name", ""),
             "detail": detail,
+            "rule_id": rule_id,
+            "reason_code": str(launch_result.get("reason_code") or "").strip(),
+            "evidence_fingerprint": str(
+                launch_result.get("evidence_fingerprint") or ""
+            ).strip(),
+            "unknown_signature": str(
+                launch_result.get("unknown_signature") or ""
+            ).strip(),
         }
 
     install_result = result.get("install_result") or {}

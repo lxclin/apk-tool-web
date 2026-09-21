@@ -2489,6 +2489,37 @@ class TestAutomationBatchActions:
                 assert "com.auto3.game" in output
                 assert "com.auto4.game" in output
                 assert "成功 2，包体闪退 0，启动失败 0，自动化失败 1" in output
+                assert app.automation_batch_progress_var.get() == 3
+                assert "已完成 3/3（100%）" in app.automation_batch_progress_text_var.get()
+                assert "成功 2" in app.automation_batch_progress_text_var.get()
+                assert "失败 1" in app.automation_batch_progress_text_var.get()
+                assert "当前第 3/3 款：com.auto4.game" in app.automation_batch_stage_var.get()
+                assert "全部处理完成" in app.automation_batch_stage_var.get()
+        finally:
+            root.destroy()
+
+    def test_batch_progress_keeps_position_package_stage_and_counters_visible(self):
+        root = tk.Tk()
+        try:
+            from gui import APKToolApp
+
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+            app._automation_batch_active = True
+            app._automation_reset_batch_progress(5)
+            app._automation_update_batch_progress(
+                position=2,
+                completed=1,
+                package_name="com.example.second",
+                stage="ADB 6/6：监听检测日志（剩余约 70 秒）",
+                succeeded=1,
+            )
+
+            assert app.automation_batch_progress_var.get() == 1
+            assert "已完成 1/5（20%）" in app.automation_batch_progress_text_var.get()
+            assert "成功 1" in app.automation_batch_progress_text_var.get()
+            assert "当前第 2/5 款：com.example.second" in app.automation_batch_stage_var.get()
+            assert "剩余约 70 秒" in app.automation_batch_stage_var.get()
         finally:
             root.destroy()
 

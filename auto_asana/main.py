@@ -193,7 +193,10 @@ _AUTOMATION_CODE_STATUSES = {
     "AD_REPLAY_FAILED": "回放失败",
     "REPLAY_TIMEOUT": "回放失败",
     "APP_CRASHED": "包体闪退",
-    "APP_EXITED_DURING_AUTOMATION": "包体闪退",
+    # A missing process without target-specific crash evidence is reviewable;
+    # do not turn a clean exit or an instrumentation failure into a terminal
+    # package crash.
+    "APP_EXITED_DURING_AUTOMATION": "启动待复检",
     "APP_LAUNCH_NOT_CONFIRMED": "启动失败",
     "AUTOMATION_FAILED": "自动化失败",
 }
@@ -1893,6 +1896,12 @@ def build_precheck_asana_comment(result: dict) -> str:
     detail = str(result.get("detail") or "").strip()
     if detail:
         lines.append(f"识别说明：{detail}")
+    evidence_fingerprint = str(result.get("evidence_fingerprint") or "").strip()
+    if evidence_fingerprint:
+        lines.append(f"证据指纹：{evidence_fingerprint}")
+    unknown_signature = str(result.get("unknown_signature") or "").strip()
+    if unknown_signature:
+        lines.append(f"未知异常模式：{unknown_signature}")
     return "\n".join(lines)
 
 
@@ -1954,6 +1963,8 @@ def add_precheck_comment_once(client, task_gid: str, result: dict) -> bool:
         opt_fields=["text", "resource_subtype", "type"],
     )
     has_previous_precheck = False
+    current_fingerprint = str(result.get("evidence_fingerprint") or "").strip()
+    fingerprint_re = re.compile(r"证据指纹：([0-9a-f]{16})", re.IGNORECASE)
     for story in stories:
         text = str(story.get("text") or "")
         if marker in text:
@@ -1967,7 +1978,14 @@ def add_precheck_comment_once(client, task_gid: str, result: dict) -> bool:
             ):
                 has_previous_precheck = True
                 continue
-            return False
+            existing_match = fingerprint_re.search(text)
+            existing_fingerprint = existing_match.group(1) if existing_match else ""
+            if not current_fingerprint or existing_fingerprint == current_fingerprint:
+                return False
+            # Same status code but a different root cause: keep a new comment
+            # so the Asana history records the changed evidence.
+            has_previous_precheck = True
+            continue
         if "【APK Tool 页面预检：" in text:
             has_previous_precheck = True
     if has_previous_precheck:

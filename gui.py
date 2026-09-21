@@ -325,6 +325,25 @@ class APKToolApp:
         self.automation_replay_timeout_var = tk.StringVar(
             value=str(DEFAULT_REPLAY_TIMEOUT_SECONDS)
         )
+        self.automation_batch_progress_var = tk.IntVar(value=0)
+        self.automation_batch_progress_text_var = tk.StringVar(
+            value="总体进度：未开始"
+        )
+        self.automation_batch_stage_var = tk.StringVar(
+            value="当前任务：—"
+        )
+        self._automation_batch_progress_state = {
+            "position": 0,
+            "total": 0,
+            "completed": 0,
+            "package_name": "",
+            "stage": "未开始",
+            "succeeded": 0,
+            "crashed": 0,
+            "launch_failed": 0,
+            "failed": 0,
+            "other": 0,
+        }
         self._automation_task_notes = ""
         # Immutable snapshot for the task currently owned by the worker.
         # UI variables remain editable and are updated through Tk callbacks;
@@ -2699,6 +2718,15 @@ class APKToolApp:
                 f"- 状态：{launch_result.get('code', '')}",
                 f"- 结果：{launch_result.get('message', '')}",
             ])
+            if launch_result.get("rule_id"):
+                lines.append(
+                    f"- 规则判定：{launch_result.get('rule_id')}"
+                    f" / {launch_result.get('reason', '')}"
+                )
+            if launch_result.get("root_cause"):
+                lines.append(f"- 根因：{launch_result.get('root_cause')}")
+            if launch_result.get("resource_detail"):
+                lines.append(f"- 资源详情：{launch_result.get('resource_detail')}")
             if launch_result.get("summary"):
                 lines.extend(["- 崩溃摘要：", launch_result["summary"]])
         backend_blacklist = result.get("backend_blacklist") or {}
@@ -4364,6 +4392,30 @@ class APKToolApp:
         )
         self._automation_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        batch_progress_row = ttk.Frame(control)
+        batch_progress_row.pack(fill=tk.X, pady=(6, 0))
+        self._automation_batch_progress = ttk.Progressbar(
+            batch_progress_row,
+            mode="determinate",
+            maximum=1,
+            variable=self.automation_batch_progress_var,
+            length=260,
+        )
+        self._automation_batch_progress.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(
+            batch_progress_row,
+            textvariable=self.automation_batch_progress_text_var,
+            anchor=tk.W,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(
+            control,
+            textvariable=self.automation_batch_stage_var,
+            foreground="#455a64",
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=1200,
+        ).pack(fill=tk.X, pady=(4, 0))
+
         recovery = ttk.Frame(outer)
         recovery.pack(fill=tk.X, pady=(0, 8))
         self._automation_checkpoint_status = ttk.Label(
@@ -4413,6 +4465,72 @@ class APKToolApp:
 
     def _automation_set_status(self, text: str, color: str = "#616161"):
         self._automation_status.config(text=text, foreground=color)
+
+    def _automation_update_batch_progress(self, **updates) -> None:
+        """Render persistent batch position, counters, package, and stage."""
+        state = getattr(self, "_automation_batch_progress_state", None)
+        if state is None:
+            return
+        state.update({key: value for key, value in updates.items() if value is not None})
+        total = max(0, int(state.get("total") or 0))
+        completed = min(total, max(0, int(state.get("completed") or 0)))
+        position = min(total, max(0, int(state.get("position") or 0)))
+        if hasattr(self, "_automation_batch_progress"):
+            self._automation_batch_progress.configure(maximum=max(1, total))
+        if hasattr(self, "automation_batch_progress_var"):
+            self.automation_batch_progress_var.set(completed)
+        if not total:
+            if hasattr(self, "automation_batch_progress_text_var"):
+                self.automation_batch_progress_text_var.set("总体进度：未开始")
+            if hasattr(self, "automation_batch_stage_var"):
+                self.automation_batch_stage_var.set("当前任务：—")
+            return
+
+        percent = int(completed * 100 / total)
+        counters = (
+            f"成功 {int(state.get('succeeded') or 0)}｜"
+            f"闪退 {int(state.get('crashed') or 0)}｜"
+            f"启动失败 {int(state.get('launch_failed') or 0)}｜"
+            f"失败 {int(state.get('failed') or 0)}｜"
+            f"其他 {int(state.get('other') or 0)}"
+        )
+        if hasattr(self, "automation_batch_progress_text_var"):
+            self.automation_batch_progress_text_var.set(
+                f"总体进度：已完成 {completed}/{total}（{percent}%）｜{counters}"
+            )
+        package_name = str(state.get("package_name") or "—")
+        stage = str(state.get("stage") or "处理中")
+        if hasattr(self, "automation_batch_stage_var"):
+            self.automation_batch_stage_var.set(
+                f"当前第 {position}/{total} 款：{package_name}｜阶段：{stage}"
+            )
+
+    def _automation_reset_batch_progress(
+        self, total: int, *, completed: int = 0
+    ) -> None:
+        self._automation_batch_progress_state = {
+            "position": min(max(0, completed + 1), max(0, total)),
+            "total": max(0, total),
+            "completed": max(0, completed),
+            "package_name": "",
+            "stage": "等待开始",
+            "succeeded": 0,
+            "crashed": 0,
+            "launch_failed": 0,
+            "failed": 0,
+            "other": 0,
+        }
+        self._automation_update_batch_progress()
+
+    def _automation_set_batch_stage(self, stage: str) -> None:
+        """Update the dedicated progress line without replacing status text."""
+        if not getattr(self, "_automation_batch_active", False):
+            return
+        stage_text = str(stage or "处理中")
+        self._safe_after(
+            0,
+            lambda: self._automation_update_batch_progress(stage=stage_text),
+        )
 
     def _automation_begin_report(self, mode: str) -> None:
         package_name = self.automation_package_var.get().strip()
@@ -4488,11 +4606,15 @@ class APKToolApp:
         return report
 
     def _automation_ensure_clash_vpn_sync(self):
+        self._automation_set_batch_stage("检查 Clash VPN")
+
+        def _vpn_progress(message: str) -> None:
+            self._safe_after(0, self._automation_log, f"VPN | {message}")
+            self._automation_set_batch_stage(f"VPN：{message}")
+
         result = ensure_clash_vpn_connected(
             stop_event=getattr(self, "_automation_stop_event", None),
-            on_progress=lambda message: self._safe_after(
-                0, self._automation_log, f"VPN | {message}"
-            ),
+            on_progress=_vpn_progress,
         )
         if not result.get("ok"):
             message = result.get("message", "Clash VPN 尚未就绪")
@@ -5121,15 +5243,54 @@ class APKToolApp:
                     "APP_EXITED_DURING_AUTOMATION",
                 }:
                     package_name = self._automation_current_package_name()
+                    runtime_evidence = result.get("runtime") or {}
+                    runtime_fields = result.get("fields") or {}
                     runtime_summary = str(
-                        (result.get("runtime") or {}).get("summary")
-                        or (result.get("fields") or {}).get("_runtime_summary")
+                        runtime_evidence.get("summary")
+                        or runtime_fields.get("_runtime_summary")
                         or ""
                     ).strip()
+                    runtime_rule_id = str(
+                        runtime_evidence.get("rule_id")
+                        or runtime_fields.get("_runtime_rule_id")
+                        or ""
+                    ).strip()
+                    runtime_fingerprint = str(
+                        runtime_evidence.get("evidence_fingerprint")
+                        or runtime_fields.get("_runtime_evidence_fingerprint")
+                        or ""
+                    ).strip()
+                    runtime_unknown = str(
+                        runtime_evidence.get("unknown_signature")
+                        or runtime_fields.get("_runtime_unknown_signature")
+                        or ""
+                    ).strip()
+                    runtime_candidates = [
+                        str(value or "").strip()
+                        for value in (
+                            runtime_fields.get("运行时候选广告ID")
+                            or runtime_fields.get("AdMob运行时候选ID")
+                            or []
+                        )
+                        if str(value or "").strip()
+                    ]
+                    runtime_metadata = ""
+                    if runtime_rule_id:
+                        runtime_metadata += f"\n规则编号：{runtime_rule_id}"
+                    if runtime_fingerprint:
+                        runtime_metadata += f"\n证据指纹：{runtime_fingerprint}"
+                    if runtime_unknown:
+                        runtime_metadata += f"\n未知异常模式：{runtime_unknown}"
+                    if runtime_candidates:
+                        runtime_metadata += (
+                            "\n运行时候选广告ID："
+                            + ", ".join(runtime_candidates)
+                        )
                     self._automation_comment_failure(
                         result.get("code"),
                         f"{message}\n包名：{package_name}"
-                        + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else ""),
+                        + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else "")
+                        + runtime_metadata,
                     )
             except AutomationVPNUnavailable:
                 pass  # VPN helper already exposes the actionable device error.
@@ -5194,6 +5355,7 @@ class APKToolApp:
         allow_missing_aggregation: bool = False,
         terminal_note: str = "",
     ) -> str:
+        self._automation_set_batch_stage("回填 Asana")
         if not private_feature_enabled("asana_write"):
             raise PermissionError("当前版本未启用 Asana 自动写入权限")
         if not self._automation_fields:
@@ -5265,6 +5427,7 @@ class APKToolApp:
     def _automation_submit_backend_sync(
         self, *, allow_unsupported_attribution: bool = False
     ) -> dict:
+        self._automation_set_batch_stage("提交适配后台")
         if not private_feature_enabled("backend_submission"):
             return {
                 "ok": False,
@@ -5918,6 +6081,7 @@ class APKToolApp:
     ) -> dict:
         if not self._automation_fields:
             raise ValueError("请先提取并校对聚合参数")
+        self._automation_set_batch_stage("准备广告回放")
         self._automation_ensure_clash_vpn_sync()
         package_name = self._automation_current_package_name()
         timeout = validate_replay_timeout(
@@ -5970,6 +6134,7 @@ class APKToolApp:
             if not message:
                 return
             self._safe_after(0, self._automation_set_status, message, "#ef6c00")
+            self._automation_set_batch_stage(f"广告回放：{message}")
             self._automation_report_event("replay_progress", message)
 
         self._automation_report_event("replay_started", "重启应用并检测聚合回放")
@@ -6523,6 +6688,7 @@ class APKToolApp:
             "待人工检查",
             "待人工",
         }
+        self._automation_set_batch_stage("检查包体安装状态")
         if is_package_installed(package_name) and not force_reinstall:
             return True
 
@@ -6539,6 +6705,7 @@ class APKToolApp:
 
         def _progress(message):
             self._safe_after(0, self._automation_log, f"G99 APKCombo | {message}")
+            self._automation_set_batch_stage(f"G99 下载/安装：{message}")
 
         install_result = download_and_install_apkcombo(
             package_name,
@@ -6755,6 +6922,7 @@ class APKToolApp:
 
     def _automation_cleanup_current_app_sync(self, reason: str = "") -> bool:
         """Stop logcat and force-stop the current package after its result is final."""
+        self._automation_set_batch_stage("清理当前应用进程")
         package_name = self._automation_current_package_name()
         self._automation_stop_active_logcat(reason or "当前包体检查结束")
         if not package_name:
@@ -6826,6 +6994,7 @@ class APKToolApp:
         work_dir = self.work_dir_var.get().strip()
         if not package_name or not appid:
             raise ValueError("当前任务缺少包名或 UP2 appid")
+        self._automation_set_batch_stage("执行设备体检")
         self._safe_after(0, self._automation_log, "[设备体检] 检查执行环境")
         health_report = self._automation_device_health_sync()
         if not health_report.ok:
@@ -6856,6 +7025,7 @@ class APKToolApp:
             f"ADB | 应用位数: {bitness}",
         )
 
+        self._automation_set_batch_stage("ADB 1/6：写入当前包体配置")
         self._safe_after(0, self._automation_log, "[ADB 1/6] 写入当前包体配置")
         self._write_automation_task_config(package_name, appid)
         # The automation tab and the manual ADB tab intentionally keep
@@ -6884,6 +7054,7 @@ class APKToolApp:
             ),
         )
 
+        self._automation_set_batch_stage("ADB 2/6：推送 config.json")
         self._safe_after(0, self._automation_log, "[ADB 2/6] 推送 config.json")
         self._automation_run_command_with_retry_sync(
             build_push_config_cmd(config_path),
@@ -6894,6 +7065,7 @@ class APKToolApp:
         if self._automation_stop_event.is_set():
             raise RuntimeError("用户已停止自动化")
 
+        self._automation_set_batch_stage("ADB 3/6：执行 zygote_build")
         self._safe_after(0, self._automation_log, "[ADB 3/6] 执行 zygote_build")
         self._automation_run_command_with_retry_sync(
             build_zygote_build_cmd(work_dir),
@@ -6905,6 +7077,7 @@ class APKToolApp:
         if self._automation_stop_event.is_set():
             raise RuntimeError("用户已停止自动化")
 
+        self._automation_set_batch_stage("ADB 4/6：获取应用 UID")
         self._safe_after(0, self._automation_log, "[ADB 4/6] 获取应用 UID")
         ok, uid = get_app_uid(package_name)
         if not ok:
@@ -6913,6 +7086,7 @@ class APKToolApp:
         self._safe_after(0, self._set_uid, uid)
         self._safe_after(0, self._automation_log, f"ADB | UID={uid}")
 
+        self._automation_set_batch_stage("ADB 5/6：清理日志并启动应用")
         self._safe_after(0, self._automation_log, "[ADB 5/6] 清理旧日志并启动应用")
         clear_logcat_buffer()
         self._automation_run_command_with_retry_sync(
@@ -6941,6 +7115,7 @@ class APKToolApp:
             f"ADB | 启动后应用位数: {runtime_bitness}",
         )
 
+        self._automation_set_batch_stage("ADB 6/6：监听检测日志（最多 90 秒）")
         self._safe_after(
             0,
             self._automation_log,
@@ -6959,6 +7134,7 @@ class APKToolApp:
         next_status_second = 90
         last_dialog_check = -3.0
         notification_dialog_dismissed = False
+        ui_inspection_failed = False
         launch_recovery_attempted = False
         while time.monotonic() < initial_hard_deadline:
             if self._automation_stop_event.is_set():
@@ -6979,6 +7155,17 @@ class APKToolApp:
                         self._automation_log,
                         f"ADB | {dialog_result.get('message')}",
                     )
+                elif dialog_result.get("code") == "UI_READ_FAILED":
+                    ui_inspection_failed = True
+                    notification_dialog_dismissed = True
+                    warning = str(
+                        dialog_result.get("message")
+                        or "UI 层级读取失败，已跳过首启弹窗检查"
+                    )
+                    self._safe_after(0, self._automation_log, f"ADB | {warning}")
+                    self._automation_set_batch_stage(
+                        "首启弹窗检查不可用，继续监听检测日志"
+                    )
             snapshot = self._automation_extract_logcat_fields(seen_lines, uid=uid)
             runtime = runtime_monitor.poll()
             if not runtime.get("ok", True):
@@ -6991,6 +7178,7 @@ class APKToolApp:
                     and not launch_recovery_attempted
                 ):
                     launch_recovery_attempted = True
+                    self._automation_set_batch_stage("首次启动恢复：处理弹窗并重新启动")
                     self._safe_after(
                         0,
                         self._automation_log,
@@ -6999,7 +7187,8 @@ class APKToolApp:
                             "处理首启弹窗后自动重启复检"
                         ),
                     )
-                    dismiss_safe_interrupting_dialog()
+                    if not ui_inspection_failed:
+                        dismiss_safe_interrupting_dialog()
                     self._automation_run_command_with_retry_sync(
                         build_force_stop_cmd(package_name),
                         timeout=15,
@@ -7034,6 +7223,13 @@ class APKToolApp:
                         "code", "APP_EXITED_DURING_AUTOMATION"
                     ),
                     "_runtime_summary": summary,
+                    "_runtime_rule_id": runtime.get("rule_id", ""),
+                    "_runtime_evidence_fingerprint": runtime.get(
+                        "evidence_fingerprint", ""
+                    ),
+                    "_runtime_unknown_signature": runtime.get(
+                        "unknown_signature", ""
+                    ),
                 }
             if not snapshot.get("ok", True):
                 if snapshot.get("_transient"):
@@ -7082,6 +7278,9 @@ class APKToolApp:
                 break
             remaining = max(0, int(initial_hard_deadline - now))
             if remaining <= next_status_second:
+                self._automation_set_batch_stage(
+                    f"ADB 6/6：监听检测日志（剩余约 {remaining} 秒）"
+                )
                 self._safe_after(
                     0,
                     self._automation_log,
@@ -7114,6 +7313,11 @@ class APKToolApp:
         package_name = self._automation_current_package_name()
         self._automation_save_checkpoint("detecting")
         initial_fields = self._automation_prepare_detection_sync()
+
+        def _detection_progress(text: str) -> None:
+            self._safe_after(0, self._automation_log, text)
+            self._automation_set_batch_stage(f"校验聚合参数：{text}")
+
         runtime_monitor = PackageRuntimeMonitor(
             package_name,
             auto_recover_anr=True,
@@ -7126,7 +7330,7 @@ class APKToolApp:
             lambda: self._automation_extract_logcat_fields(),
             first_fields=initial_fields,
             stop_event=self._automation_stop_event,
-            on_progress=lambda text: self._safe_after(0, self._automation_log, text),
+            on_progress=_detection_progress,
             runtime_check=runtime_monitor.poll,
             runtime_reset=runtime_monitor.reset,
         )
@@ -7268,15 +7472,53 @@ class APKToolApp:
                     failure_code, message
                 )
                 self._automation_mark_failed(message, code=failure_code)
+            runtime_evidence = detection.get("runtime") or {}
+            runtime_fields = detection.get("fields") or {}
             runtime_summary = str(
-                (detection.get("runtime") or {}).get("summary")
-                or (detection.get("fields") or {}).get("_runtime_summary")
+                runtime_evidence.get("summary")
+                or runtime_fields.get("_runtime_summary")
                 or ""
             ).strip()
+            runtime_metadata = ""
+            runtime_rule_id = str(
+                runtime_evidence.get("rule_id")
+                or runtime_fields.get("_runtime_rule_id")
+                or ""
+            ).strip()
+            runtime_fingerprint = str(
+                runtime_evidence.get("evidence_fingerprint")
+                or runtime_fields.get("_runtime_evidence_fingerprint")
+                or ""
+            ).strip()
+            runtime_unknown = str(
+                runtime_evidence.get("unknown_signature")
+                or runtime_fields.get("_runtime_unknown_signature")
+                or ""
+            ).strip()
+            runtime_candidates = [
+                str(value or "").strip()
+                for value in (
+                    runtime_fields.get("运行时候选广告ID")
+                    or runtime_fields.get("AdMob运行时候选ID")
+                    or []
+                )
+                if str(value or "").strip()
+            ]
+            if runtime_rule_id:
+                runtime_metadata += f"\n规则编号：{runtime_rule_id}"
+            if runtime_fingerprint:
+                runtime_metadata += f"\n证据指纹：{runtime_fingerprint}"
+            if runtime_unknown:
+                runtime_metadata += f"\n未知异常模式：{runtime_unknown}"
+            if runtime_candidates:
+                runtime_metadata += (
+                    "\n运行时候选广告ID：" + ", ".join(runtime_candidates)
+                )
             self._automation_comment_failure(
                 failure_code,
                 f"{message}\n包名：{package_name}"
-                + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else ""),
+                + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else "")
+                + runtime_metadata,
             )
             return False
 
@@ -7531,6 +7773,9 @@ class APKToolApp:
         self._automation_batch_active = True
         self._automation_set_running(True)
         total_count = len((self._automation_checkpoint or {}).get("tasks") or queue)
+        self._automation_reset_batch_progress(
+            total_count, completed=max(0, start_index)
+        )
         self._automation_set_status(
             f"批量自动适配 {start_index}/{total_count}", "#ef6c00"
         )
@@ -7545,6 +7790,7 @@ class APKToolApp:
             not_adapted = 0
             requeued = 0
             retried = 0
+            completed_count = max(0, start_index)
             crash_codes = {
                 "APP_CRASHED",
                 "APP_EXITED_DURING_AUTOMATION",
@@ -7597,9 +7843,24 @@ class APKToolApp:
                     checkpoint_index = int(entry["checkpoint_index"])
                     attempt = int(entry.get("attempt") or 0)
                     position = checkpoint_index + 1
+                    package_name = str(getattr(task, "package_name", "") or "")
+                    initial_stage = (
+                        f"延迟重试（第 {attempt}/1 次）"
+                        if attempt
+                        else "准备当前任务"
+                    )
+                    self._safe_after(
+                        0,
+                        lambda position=position,
+                        package_name=package_name,
+                        initial_stage=initial_stage: self._automation_update_batch_progress(
+                            position=position,
+                            package_name=package_name,
+                            stage=initial_stage,
+                        ),
+                    )
                     self._automation_switch_task_sync(item_id, task)
                     self._automation_batch_attempt = attempt
-                    package_name = str(getattr(task, "package_name", "") or "")
                     checkpoint = self._automation_checkpoint or {}
                     checkpoint["current_index"] = checkpoint_index
                     is_resumed_current = bool(
@@ -7649,7 +7910,9 @@ class APKToolApp:
                     )
                     task_succeeded = False
                     try:
+                        self._automation_set_batch_stage("检查 Clash VPN")
                         self._automation_ensure_clash_vpn_sync()
+                        self._automation_set_batch_stage("检查/安装当前包体")
                         prepared = self._automation_prepare_g99_task_sync(
                             item_id, task, device_profile
                         )
@@ -7665,6 +7928,7 @@ class APKToolApp:
                                 self._automation_execute_post_detection_sync()
                             )
                         else:
+                            self._automation_set_batch_stage("提取并校验聚合参数")
                             task_succeeded = (
                                 self._automation_process_current_task_sync()
                             )
@@ -7728,6 +7992,36 @@ class APKToolApp:
                         launch_failed += 1
                     else:
                         failed += 1
+                    completed_count += 1
+                    other_count = (
+                        other_attribution
+                        + unsupported_aggregation
+                        + not_adapted
+                        + requeued
+                    )
+                    result_stage = (
+                        "当前任务处理完成"
+                        if task_succeeded
+                        else "当前任务已结束，准备下一款"
+                    )
+                    self._safe_after(
+                        0,
+                        lambda completed_count=completed_count,
+                        succeeded=succeeded,
+                        crashed=crashed,
+                        launch_failed=launch_failed,
+                        failed=failed,
+                        other_count=other_count,
+                        result_stage=result_stage: self._automation_update_batch_progress(
+                            completed=completed_count,
+                            succeeded=succeeded,
+                            crashed=crashed,
+                            launch_failed=launch_failed,
+                            failed=failed,
+                            other=other_count,
+                            stage=result_stage,
+                        ),
+                    )
                     if self._automation_stop_event.is_set():
                         interrupted = True
                         break
@@ -7772,6 +8066,13 @@ class APKToolApp:
                     else f"批量自动适配完成：成功 {succeeded}，包体闪退 {crashed}，启动失败 {launch_failed}，自动化失败 {failed}，其他归因 {other_attribution}，TradPlus暂不适配 {unsupported_aggregation}，疑似白包 {not_adapted}，待重新安装 {requeued}，延迟重试 {retried} 次"
                 )
                 self._safe_after(0, self._automation_log, summary)
+                final_stage = "队列已停止" if stopped or interrupted else "全部处理完成"
+                self._safe_after(
+                    0,
+                    lambda final_stage=final_stage: self._automation_update_batch_progress(
+                        stage=final_stage
+                    ),
+                )
                 self._safe_after(
                     0,
                     self._automation_set_status,
@@ -7823,6 +8124,9 @@ class APKToolApp:
             remaining_minutes = (remaining + 59) // 60
             if remaining_minutes != last_logged_minute:
                 last_logged_minute = remaining_minutes
+                self._automation_set_batch_stage(
+                    f"等待延迟重试（约 {remaining_minutes} 分钟）"
+                )
                 self._safe_after(
                     0,
                     self._automation_set_status,
@@ -7844,6 +8148,7 @@ class APKToolApp:
                 return False
             if not logged:
                 self._safe_after(0, self._automation_log, "批量队列已暂停，等待继续")
+                self._automation_set_batch_stage("队列已暂停")
                 logged = True
             time.sleep(0.2)
         return not self._automation_stop_event.is_set()
@@ -7855,17 +8160,20 @@ class APKToolApp:
             self._automation_pause_event.clear()
             self._automation_pause_btn.configure(text="暂停队列")
             self._automation_set_status("批量队列继续执行", "#ef6c00")
+            self._automation_set_batch_stage("继续当前任务")
             self._automation_log("已继续批量自动适配")
         else:
             self._automation_pause_event.set()
             self._automation_pause_btn.configure(text="继续队列")
             self._automation_set_status("将在当前安全步骤后暂停", "#ef6c00")
+            self._automation_set_batch_stage("等待当前安全步骤后暂停")
             self._automation_log("已请求暂停，不会切换到下一包")
 
     def _automation_stop(self):
         self._automation_stop_event.set()
         self._automation_pause_event.clear()
         self._automation_set_status("正在停止...", "#ef6c00")
+        self._automation_set_batch_stage("正在安全停止")
         self._automation_log("已请求停止，将在当前步骤安全结束后停止")
 
     # ── 自动化脚本事件 ────────────────────────────────────────────

@@ -16,6 +16,8 @@ import time
 import xml.etree.ElementTree as ET
 import glob
 
+from crash_rules import classify_crash_log
+
 DEFAULT_KEEP_THIRD_PARTY_PACKAGES = [
     "com.apktool.sharereceiver",
     "com.github.kr328.clash",
@@ -817,11 +819,25 @@ def open_google_play_page(value: str) -> tuple[bool, str, str]:
 
 
 def collect_device_ui_nodes() -> list[dict]:
-    """Dump the current Android UI hierarchy and return inspectable nodes."""
+    """Dump the Android UI hierarchy, retrying one transient dump timeout."""
     remote_path = "/sdcard/apk_tool_precheck_window.xml"
-    dump_result = _run_adb(
-        ["shell", "uiautomator", "dump", remote_path], timeout=10
-    )
+    dump_result = None
+    for attempt in range(2):
+        try:
+            dump_result = _run_adb(
+                ["shell", "uiautomator", "dump", remote_path], timeout=10
+            )
+            break
+        except subprocess.TimeoutExpired:
+            try:
+                _run_adb(["shell", "rm", "-f", remote_path], timeout=3)
+            except Exception:
+                pass
+            if attempt >= 1:
+                raise
+            time.sleep(0.5)
+    if dump_result is None:
+        return []
     if dump_result.returncode != 0:
         return []
     try:
@@ -941,7 +957,17 @@ def capture_max_debugger_ad_units(
         on_progress(receiver_message)
 
     before = _share_receiver_capture_time()
-    nodes = collect_device_ui_nodes()
+    try:
+        nodes = collect_device_ui_nodes()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        message = f"MAX Debugger 界面读取超时，跳过辅助提取：{exc}"
+        if on_progress:
+            on_progress(message)
+        return {
+            "ok": False,
+            "code": "MAX_DEBUGGER_UI_READ_TIMEOUT",
+            "message": message,
+        }
     share_node = next(
         (
             node
@@ -964,7 +990,17 @@ def capture_max_debugger_ad_units(
     deadline = time.monotonic() + max(5.0, float(timeout_seconds))
     receiver_clicked = False
     while time.monotonic() < deadline:
-        nodes = collect_device_ui_nodes()
+        try:
+            nodes = collect_device_ui_nodes()
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            message = f"MAX Debugger 分享界面读取超时，跳过辅助提取：{exc}"
+            if on_progress:
+                on_progress(message)
+            return {
+                "ok": False,
+                "code": "MAX_DEBUGGER_UI_READ_TIMEOUT",
+                "message": message,
+            }
         receiver_node = next(
             (
                 node
@@ -1780,20 +1816,23 @@ def dismiss_anr_wait_dialog(package_name: str) -> dict:
     }
 
 
-def dismiss_notification_permission_dialog() -> dict:
+def dismiss_notification_permission_dialog(
+    nodes: list[dict] | None = None,
+) -> dict:
     """Dismiss only Android's notification permission prompt.
 
     Other permission prompts are intentionally left untouched because denying
     storage, camera or other capabilities can change the app's test behavior.
     """
-    try:
-        nodes = collect_device_ui_nodes()
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        return {
-            "dismissed": False,
-            "code": "UI_READ_FAILED",
-            "message": str(exc) or "无法读取设备界面",
-        }
+    if nodes is None:
+        try:
+            nodes = collect_device_ui_nodes()
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            return {
+                "dismissed": False,
+                "code": "UI_READ_FAILED",
+                "message": str(exc) or "无法读取设备界面",
+            }
     visible = "\n".join(
         str(value or "").casefold()
         for node in nodes
@@ -1846,21 +1885,22 @@ def dismiss_notification_permission_dialog() -> dict:
     }
 
 
-def dismiss_safe_first_run_dialog() -> dict:
+def dismiss_safe_first_run_dialog(nodes: list[dict] | None = None) -> dict:
     """Advance only low-risk first-run screens using exact UI evidence.
 
     Purchase, subscription and account-deletion screens are explicitly never
     touched. Generic action labels are clicked only when a known onboarding,
     privacy or language context is visible; this avoids blind coordinate taps.
     """
-    try:
-        nodes = collect_device_ui_nodes()
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        return {
-            "dismissed": False,
-            "code": "UI_READ_FAILED",
-            "message": str(exc) or "无法读取设备界面",
-        }
+    if nodes is None:
+        try:
+            nodes = collect_device_ui_nodes()
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            return {
+                "dismissed": False,
+                "code": "UI_READ_FAILED",
+                "message": str(exc) or "无法读取设备界面",
+            }
     visible = "\n".join(
         str(value or "").casefold()
         for node in nodes
@@ -1974,11 +2014,22 @@ def detect_mandatory_google_login_screen() -> dict:
 
 
 def dismiss_safe_interrupting_dialog() -> dict:
-    """Handle notification permission first, then safe app onboarding UI."""
-    notification = dismiss_notification_permission_dialog()
+    """Handle safe interrupting UI from one shared, best-effort snapshot."""
+    try:
+        nodes = collect_device_ui_nodes()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return {
+            "dismissed": False,
+            "code": "UI_READ_FAILED",
+            "message": (
+                "UI 层级读取超时，已跳过首启弹窗检查并继续自动化："
+                f"{exc}"
+            ),
+        }
+    notification = dismiss_notification_permission_dialog(nodes)
     if notification.get("dismissed"):
         return notification
-    return dismiss_safe_first_run_dialog()
+    return dismiss_safe_first_run_dialog(nodes)
 
 
 def install_google_play_app(
@@ -2094,58 +2145,8 @@ def install_google_play_app(
 
 
 def extract_package_crash_evidence(log_text: str, package_name: str) -> dict:
-    """Extract explicit Java/native crash evidence for one package."""
-    package_name = package_name.strip()
-    lines = [line for line in (log_text or "").splitlines() if line.strip()]
-    joined = "\n".join(lines)
-    package_pattern = re.escape(package_name)
-
-    java_crash = bool(
-        re.search(r"FATAL EXCEPTION", joined, re.I)
-        and re.search(rf"Process:\s*{package_pattern}(?:\s|,|$)", joined, re.I)
-    )
-    am_crash = bool(
-        re.search(rf"am_crash[^\n]*\b{package_pattern}\b", joined, re.I)
-    )
-    native_crash = bool(
-        re.search(
-            rf"Fatal signal\s+\d+[^\n]*(?:\({package_pattern}\)|\b{package_pattern}\b)",
-            joined,
-            re.I,
-        )
-        or (
-            re.search(rf">>>\s*{package_pattern}\s*<<<", joined, re.I)
-            and re.search(r"signal\s+\d+|backtrace:", joined, re.I)
-        )
-    )
-
-    if java_crash or am_crash:
-        crash_type = "JAVA_CRASH"
-    elif native_crash:
-        crash_type = "NATIVE_CRASH"
-    else:
-        crash_type = ""
-
-    relevant = []
-    important_patterns = (
-        package_name,
-        "FATAL EXCEPTION",
-        "AndroidRuntime",
-        "Fatal signal",
-        "am_crash",
-        "backtrace:",
-        "Caused by:",
-    )
-    for line in lines:
-        if any(pattern.casefold() in line.casefold() for pattern in important_patterns):
-            relevant.append(line.strip())
-    relevant = relevant[-12:]
-
-    return {
-        "crashed": bool(crash_type),
-        "crash_type": crash_type,
-        "summary": "\n".join(relevant),
-    }
+    """Extract explicit crash evidence and its historical rule judgement."""
+    return classify_crash_log(log_text, package_name)
 
 
 def extract_package_runtime_failure_evidence(log_text: str, package_name: str) -> dict:
@@ -2375,6 +2376,7 @@ class PackageRuntimeMonitor:
                     "ok": True,
                     "code": "APP_STARTING",
                     "message": "应用进程尚在启动宽限期内",
+                    **evidence,
                 }
             return {
                 "ok": False,
@@ -2383,21 +2385,22 @@ class PackageRuntimeMonitor:
                     f"启动应用后 {int(self.startup_grace_seconds)} 秒内"
                     "未检测到目标进程，无法进行自动化检测"
                 ),
-                "summary": evidence.get("summary", ""),
-                "crashed": False,
-                "crash_type": "",
+                **evidence,
             }
 
         self.consecutive_missing += 1
 
         if self.consecutive_missing >= self.missing_threshold:
+            message = (
+                "应用任务被移除，未发现闪退"
+                if evidence.get("exit_reason") == "TASK_REMOVED"
+                else "包体在自动化检测过程中异常退出，疑似闪退，暂不适配"
+            )
             return {
                 "ok": False,
                 "code": "APP_EXITED_DURING_AUTOMATION",
-                "message": "包体在自动化检测过程中异常退出，疑似闪退，暂不适配",
-                "summary": evidence.get("summary", ""),
-                "crashed": False,
-                "crash_type": "",
+                "message": message,
+                **evidence,
             }
 
         return {
@@ -2460,6 +2463,7 @@ def run_app_launch_precheck(
         seen_running = False
         consecutive_missing = 0
         mandatory_google_login_hits = 0
+        ui_inspection_disabled = False
         while time.monotonic() < deadline:
             running = _is_app_process_running(package_name)
             if running:
@@ -2477,21 +2481,37 @@ def run_app_launch_precheck(
                             "message": "包体闪退，暂不适配",
                             **evidence,
                         }
+                    message = (
+                        "应用任务被移除，未发现闪退"
+                        if evidence.get("exit_reason") == "TASK_REMOVED"
+                        else "应用启动后进程退出，但没有取得明确崩溃堆栈"
+                    )
                     return {
                         "ok": False,
                         "code": "APP_EXITED",
-                        "message": "应用启动后进程退出，但没有取得明确崩溃堆栈",
-                        "summary": evidence.get("summary", ""),
+                        "message": message,
+                        **evidence,
                     }
 
             # Deal with notification/onboarding UI before evaluating the
             # login gate.  In particular, a visible guest/skip action is a
             # valid bypass and must never be classified as mandatory login.
-            dialog_result = dismiss_safe_interrupting_dialog()
+            dialog_result = (
+                {"dismissed": False, "code": "UI_INSPECTION_SKIPPED"}
+                if ui_inspection_disabled
+                else dismiss_safe_interrupting_dialog()
+            )
             if dialog_result.get("dismissed"):
                 mandatory_google_login_hits = 0
                 if on_progress:
                     on_progress(str(dialog_result.get("message") or "已处理首启弹窗"))
+            elif dialog_result.get("code") == "UI_READ_FAILED":
+                ui_inspection_disabled = True
+                mandatory_google_login_hits = 0
+                if on_progress:
+                    on_progress(str(dialog_result.get("message") or "UI 层级读取失败，继续观察应用"))
+            elif ui_inspection_disabled:
+                mandatory_google_login_hits = 0
             else:
                 login_gate = detect_mandatory_google_login_screen()
                 if login_gate.get("required"):
@@ -2532,7 +2552,7 @@ def run_app_launch_precheck(
                 "ok": False,
                 "code": "LAUNCH_FAILED",
                 "message": "发送启动命令后未检测到应用进程",
-                "summary": evidence.get("summary", ""),
+                **evidence,
             }
         return {
             "ok": True,
@@ -2981,6 +3001,301 @@ def _clean_detected_value(value: str) -> str:
     return cleaned
 
 
+ADMOB_AD_UNIT_PATTERN = re.compile(r"\bca-app-pub-\d+/\d+\b", re.IGNORECASE)
+RUNTIME_AD_UNIT_PATTERNS = (
+    re.compile(r'"adUnitId"\s*:\s*"([^"]+)"', re.I),
+    re.compile(r"\badUnitId\s*[=:]\s*['\"]?([^,'\"}\s)]+)", re.I),
+    re.compile(r'"ad_unit_id"\s*:\s*"([^"]+)"', re.I),
+    re.compile(r"\bad_unit_id\s*[=:]\s*['\"]?([^,'\"}\s)]+)", re.I),
+    re.compile(r'"placementId"\s*:\s*"([^"]+)"', re.I),
+    re.compile(r"\bplacement(?:Id|_id)\s*[=:]\s*['\"]?([^,'\"}\s)]+)", re.I),
+)
+RUNTIME_PLATFORM_MARKERS = {
+    "max": ("applovin", "maxad", "zgsdk.max", '"platform":"max"'),
+    "ironsource": ("ironsource", '"platform":"ironsource"'),
+    "levelplay": ("levelplay", "iron source", '"platform":"levelplay"'),
+    "admob": ("admob", "google mobile ads", '"platform":"admob"'),
+    "topon": ("topon", "anythink", '"platform":"topon"'),
+    "fyber": ("fyber", "digital turbine", '"platform":"fyber"'),
+}
+
+
+def _logcat_seconds(line: str) -> float | None:
+    match = re.search(
+        r"\b\d{2}-\d{2}\s+(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?",
+        str(line or ""),
+    )
+    if not match:
+        return None
+    milliseconds = int((match.group(4) or "0").ljust(3, "0")[:3])
+    return (
+        int(match.group(1)) * 3600
+        + int(match.group(2)) * 60
+        + int(match.group(3))
+        + milliseconds / 1000
+    )
+
+
+def _seconds_since(current: float | None, previous: float | None) -> float | None:
+    if current is None or previous is None:
+        return None
+    delta = current - previous
+    return delta + 86400 if delta < 0 else delta
+
+
+def extract_admob_runtime_ad_unit_ids(lines: list[str]) -> dict:
+    """Recover typed AdMob IDs from conservative runtime-log correlation.
+
+    Some hosts never print ad-unit IDs in AutoDetector's final summary, but
+    Firebase Analytics logs the concrete ``ca-app-pub-.../...`` exposure.  We
+    only type such an ID when the host exposes exactly one provider family
+    (interstitial or rewarded) and an AdMob full-screen Activity was observed
+    no more than 15 seconds before the ID.  Ambiguous IDs remain candidates.
+    """
+    normalized_lines = [str(line or "") for line in lines if str(line or "").strip()]
+    lowered = "\n".join(normalized_lines).casefold()
+    has_interstitial_provider = "admobinterstitialadprovider" in lowered
+    has_rewarded_provider = any(
+        marker in lowered
+        for marker in (
+            "admobrewardedadprovider",
+            "admobrewardedvideoadprovider",
+        )
+    )
+    provider_type = ""
+    if has_interstitial_provider and not has_rewarded_provider:
+        provider_type = "interstitial"
+    elif has_rewarded_provider and not has_interstitial_provider:
+        provider_type = "rewarded"
+
+    typed = {"interstitial": [], "rewarded": []}
+    candidates: list[str] = []
+    evidence: list[str] = []
+    match_details: dict[tuple[str, str], dict] = {}
+    last_fullscreen_activity_at: float | None = None
+    for line in normalized_lines:
+        line_lower = line.casefold()
+        line_seconds = _logcat_seconds(line)
+        if (
+            "adactivity" in line_lower
+            and any(
+                marker in line_lower
+                for marker in (
+                    "onactivitycreated:",
+                    "onactivitystarted:",
+                    "onactivityresumed:",
+                    "activitytaskmanager: start",
+                )
+            )
+            and (
+                "google.android" in line_lower
+                or "gms.ads" in line_lower
+                or "mobile.sdk.common.adactivity" in line_lower
+            )
+        ):
+            last_fullscreen_activity_at = line_seconds
+            evidence.append(line.strip())
+
+        ids = ADMOB_AD_UNIT_PATTERN.findall(line)
+        if not ids:
+            continue
+        for ad_unit_id in ids:
+            if ad_unit_id not in candidates:
+                candidates.append(ad_unit_id)
+            direct_type = ""
+            if "interstitial" in line_lower:
+                direct_type = "interstitial"
+            elif "rewarded" in line_lower or "reward video" in line_lower:
+                direct_type = "rewarded"
+            elapsed = _seconds_since(line_seconds, last_fullscreen_activity_at)
+            inferred_type = direct_type or (
+                provider_type
+                if elapsed is not None and 0 <= elapsed <= 15
+                else ""
+            )
+            if inferred_type and ad_unit_id not in typed[inferred_type]:
+                typed[inferred_type].append(ad_unit_id)
+                evidence.append(line.strip())
+            if inferred_type:
+                confidence = "高" if direct_type else "中高"
+                detail = {
+                    "id": ad_unit_id,
+                    "type": inferred_type,
+                    "confidence": confidence,
+                    "reason": (
+                        "广告位 ID 与类型出现在同一日志行"
+                        if direct_type
+                        else "Provider 类型 + AdActivity + 15 秒内广告位曝光"
+                    ),
+                }
+                key = (inferred_type, ad_unit_id)
+                previous = match_details.get(key)
+                if previous is None or confidence == "高":
+                    match_details[key] = detail
+
+    details = list(match_details.values())
+    classified_ids = {detail["id"] for detail in details}
+    details.extend(
+        {
+            "id": candidate,
+            "type": "",
+            "confidence": "待验证",
+            "reason": "发现运行期广告位 ID，但类型关联证据不足",
+        }
+        for candidate in candidates
+        if candidate not in classified_ids
+    )
+    return {
+        "interstitial_ids": typed["interstitial"],
+        "rewarded_ids": typed["rewarded"],
+        "candidate_ids": candidates,
+        "matches": details,
+        "evidence": list(dict.fromkeys(evidence)),
+        "source": "admob_runtime_log_correlation" if any(typed.values()) else "",
+    }
+
+
+def _runtime_ad_type(line: str) -> str:
+    lowered = str(line or "").casefold()
+    if re.search(r"(?:adtype|format)['\"]?\s*[=:]\s*['\"]?(?:interstitial|inter)(?:\b|['\"])", lowered):
+        return "interstitial"
+    if re.search(
+        r"(?:adtype|format)['\"]?\s*[=:]\s*['\"]?(?:rewarded_video|reward_video|rewarded|reward)(?:\b|['\"])",
+        lowered,
+    ):
+        return "rewarded"
+    if "interstitial" in lowered:
+        return "interstitial"
+    if "rewarded" in lowered or "reward video" in lowered:
+        return "rewarded"
+    return ""
+
+
+def extract_runtime_ad_unit_ids(lines: list[str], target_sdk: str) -> dict:
+    """Extract platform-owned IDs from explicit runtime ad-unit events.
+
+    AdMob keeps its stronger Activity/exposure correlation.  Other supported
+    mediation platforms are accepted only when one line contains an explicit
+    ad-unit/placement key, an ad type and a marker for the detected platform.
+    IDs lacking that ownership/type evidence remain candidates and are never
+    auto-filled.
+    """
+    if target_sdk == "admob":
+        result = extract_admob_runtime_ad_unit_ids(lines)
+    else:
+        result = {
+            "interstitial_ids": [],
+            "rewarded_ids": [],
+            "candidate_ids": [],
+            "matches": [],
+            "evidence": [],
+            "source": "",
+        }
+
+    markers = RUNTIME_PLATFORM_MARKERS.get(target_sdk, ())
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        ids: list[str] = []
+        for pattern in RUNTIME_AD_UNIT_PATTERNS:
+            match = pattern.search(line)
+            if match:
+                value = match.group(1).strip()
+                if value and value not in ids:
+                    ids.append(value)
+        if not ids:
+            continue
+        lowered = line.casefold().replace(" ", "")
+        platform_owned = any(marker.replace(" ", "") in lowered for marker in markers)
+        ad_type = _runtime_ad_type(line)
+        for ad_unit_id in ids:
+            if ad_unit_id not in result["candidate_ids"]:
+                result["candidate_ids"].append(ad_unit_id)
+            already_typed = any(
+                detail.get("id") == ad_unit_id and detail.get("type")
+                for detail in result["matches"]
+            )
+            if platform_owned and ad_type:
+                target = result[f"{ad_type}_ids"]
+                if ad_unit_id not in target:
+                    target.append(ad_unit_id)
+                if line not in result["evidence"]:
+                    result["evidence"].append(line)
+                if not already_typed:
+                    result["matches"].append({
+                        "id": ad_unit_id,
+                        "type": ad_type,
+                        "confidence": "高",
+                        "reason": "聚合平台标记 + 广告类型 + 广告位字段位于同一日志行",
+                    })
+            elif not any(
+                detail.get("id") == ad_unit_id for detail in result["matches"]
+            ):
+                result["matches"].append({
+                    "id": ad_unit_id,
+                    "type": "",
+                    "confidence": "待验证",
+                    "reason": "发现运行期广告位 ID，但聚合平台归属或类型证据不足",
+                })
+    if not result["source"] and (
+        result["interstitial_ids"] or result["rewarded_ids"]
+    ):
+        result["source"] = f"{target_sdk}_runtime_log_explicit"
+    return result
+
+
+def _is_admob_runtime_evidence_line(line: str) -> bool:
+    lowered = str(line or "").casefold()
+    return bool(
+        ADMOB_AD_UNIT_PATTERN.search(str(line or ""))
+        or "admobinterstitialadprovider" in lowered
+        or "admobrewardedadprovider" in lowered
+        or (
+            "adactivity" in lowered
+            and (
+                "google.android" in lowered
+                or "gms.ads" in lowered
+                or "mobile.sdk.common.adactivity" in lowered
+            )
+        )
+    )
+
+
+def _is_runtime_ad_id_evidence_line(line: str) -> bool:
+    return _is_admob_runtime_evidence_line(line) or any(
+        pattern.search(str(line or "")) for pattern in RUNTIME_AD_UNIT_PATTERNS
+    )
+
+
+def _should_scan_runtime_ad_ids(fields: dict, target_sdk: str) -> bool:
+    """Only run the runtime fallback when ad IDs are the sole missing data.
+
+    This intentionally mirrors the adaptation business gate without importing
+    ``automation_adaptation`` (which imports this module).  A valid supported
+    platform verdict and supported attribution must already exist; AppsFlyer
+    also needs its key.  If either normal detector ID is present, the fallback is not
+    needed and must not collect unrelated IDs from Logcat.
+    """
+    if (
+        not fields.get("ok", True)
+        or target_sdk not in RUNTIME_PLATFORM_MARKERS
+        or target_sdk == "tradplus"
+    ):
+        return False
+    # The fallback is intentionally all-or-nothing: if either standard ID is
+    # already present, do not mix a runtime guess into the detector result.
+    if fields.get("激励视频聚合id") or fields.get("插屏聚合id"):
+        return False
+    attribution = _clean_detected_value(str(fields.get("归因平台") or ""))
+    compact_attribution = attribution.casefold().replace(" ", "")
+    if "adjust" in compact_attribution:
+        return True
+    if "appsflyer" in compact_attribution:
+        return bool(_clean_detected_value(str(fields.get("af_key") or "")))
+    return False
+
+
 def parse_autodetector_fields(lines: list[str]) -> dict:
     """Parse ZGSDK.AutoDetector log lines into structured fields."""
     tag_lines = [line for line in lines if "ZGSDK.AutoDetector" in line]
@@ -3097,7 +3412,44 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
 
     fields["激励视频聚合id"] = selected_ids.get("reward", "")
     fields["插屏聚合id"] = selected_ids.get("interstitial", "")
-    fields["完整日志"] = "\n".join(tag_lines[-50:])
+    runtime_ids = {
+        "interstitial_ids": [],
+        "rewarded_ids": [],
+        "candidate_ids": [],
+        "matches": [],
+        "evidence": [],
+        "source": "",
+    }
+    if _should_scan_runtime_ad_ids(fields, target_sdk):
+        fields["_runtime_ad_id_scan_applied"] = True
+        fields["_runtime_ad_id_scan_platform"] = target_sdk
+        runtime_ids = extract_runtime_ad_unit_ids(lines, target_sdk)
+        if not fields["激励视频聚合id"] and runtime_ids["rewarded_ids"]:
+            fields["激励视频聚合id"] = ", ".join(runtime_ids["rewarded_ids"])
+        if not fields["插屏聚合id"] and runtime_ids["interstitial_ids"]:
+            fields["插屏聚合id"] = ", ".join(runtime_ids["interstitial_ids"])
+        if runtime_ids["source"] and (
+            runtime_ids["rewarded_ids"] or runtime_ids["interstitial_ids"]
+        ):
+            fields["广告ID识别来源"] = runtime_ids["source"]
+            fields["广告ID识别置信度"] = (
+                "高"
+                if any(
+                    match.get("confidence") == "高"
+                    for match in runtime_ids["matches"]
+                )
+                else "中高"
+            )
+    if runtime_ids["candidate_ids"]:
+        fields["运行时候选广告ID"] = runtime_ids["candidate_ids"]
+        fields["运行时候选广告ID详情"] = runtime_ids["matches"]
+        if target_sdk == "admob":
+            fields["AdMob运行时候选ID"] = runtime_ids["candidate_ids"]
+            fields["AdMob运行时候选ID详情"] = runtime_ids["matches"]
+    retained_logs = list(
+        dict.fromkeys(tag_lines[-50:] + runtime_ids["evidence"][-20:])
+    )
+    fields["完整日志"] = "\n".join(retained_logs)
     return fields
 
 
@@ -4555,11 +4907,17 @@ def extract_logcat_fields(
                     "_logcat_attempts": attempt,
                 }
             lines = result.stdout.split("\n")
+            fields = parse_autodetector_fields(lines)
             if on_line:
                 for line in lines:
-                    if "ZGSDK.AutoDetector" in line:
+                    if (
+                        "ZGSDK.AutoDetector" in line
+                        or (
+                            fields.get("_runtime_ad_id_scan_applied")
+                            and _is_runtime_ad_id_evidence_line(line)
+                        )
+                    ):
                         on_line(line.rstrip())
-            fields = parse_autodetector_fields(lines)
             fields["_logcat_attempts"] = attempt
             return fields
         except subprocess.TimeoutExpired as exc:

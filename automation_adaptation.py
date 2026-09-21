@@ -986,6 +986,31 @@ def format_aggregation_fields(data: dict[str, Any]) -> str:
         )
         if attribution_evidence:
             lines.append(f"归因识别依据:{attribution_evidence}")
+    ad_id_source = str(data.get("广告ID识别来源") or "").strip()
+    if ad_id_source:
+        source_label = {
+            "admob_runtime_log_correlation": "AdMob运行期日志关联",
+            "max_runtime_log_explicit": "MAX运行期日志明确字段",
+            "ironsource_runtime_log_explicit": "IronSource运行期日志明确字段",
+            "levelplay_runtime_log_explicit": "LevelPlay运行期日志明确字段",
+            "topon_runtime_log_explicit": "TopOn运行期日志明确字段",
+            "fyber_runtime_log_explicit": "Fyber运行期日志明确字段",
+        }.get(ad_id_source, ad_id_source)
+        lines.append(f"广告ID识别方式:{source_label}")
+        ad_id_confidence = str(data.get("广告ID识别置信度") or "").strip()
+        if ad_id_confidence:
+            lines.append(f"广告ID识别置信度:{ad_id_confidence}")
+    runtime_candidates = [
+        str(value or "").strip()
+        for value in (
+            data.get("运行时候选广告ID")
+            or data.get("AdMob运行时候选ID")
+            or []
+        )
+        if str(value or "").strip()
+    ]
+    if runtime_candidates:
+        lines.append("运行时候选广告ID:" + ", ".join(runtime_candidates))
     return "\n".join(lines)
 
 

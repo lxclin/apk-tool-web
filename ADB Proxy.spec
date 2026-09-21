@@ -12,6 +12,7 @@ a = Analysis(
         # 用 datas 而非 binaries，避免 PyInstaller 裁剪架构为 arm64-only
         (ADB_SRC, 'adb'),
         ('permission_public_key.pem', '.'),
+        ('crash_rules.json', '.'),
     ],
     hiddenimports=[
         'websockets',

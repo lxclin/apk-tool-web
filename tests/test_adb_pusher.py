@@ -646,6 +646,23 @@ Format     - REWARDED
         assert installed is True
         mock_sleep.assert_called_once_with(0)
 
+    def test_max_debugger_ui_dump_timeout_is_a_recoverable_result(self):
+        from adb_pusher import capture_max_debugger_ad_units
+
+        progress = []
+        with patch(
+            "adb_pusher.ensure_share_receiver_installed",
+            return_value=(True, "接收器已安装"),
+        ), patch(
+            "adb_pusher.collect_device_ui_nodes",
+            side_effect=subprocess.TimeoutExpired("uiautomator dump", 10),
+        ):
+            result = capture_max_debugger_ad_units(on_progress=progress.append)
+
+        assert result["ok"] is False
+        assert result["code"] == "MAX_DEBUGGER_UI_READ_TIMEOUT"
+        assert any("跳过辅助提取" in message for message in progress)
+
 
 class TestApkDownloadUrl:
     def test_builds_apkcombo_search_url_from_google_play_url(self):
@@ -683,6 +700,45 @@ class TestApkDownloadUrl:
 
 
 class TestGooglePlayPrecheck:
+    def test_ui_dump_retries_once_after_timeout(self):
+        from adb_pusher import collect_device_ui_nodes
+
+        xml = '<hierarchy><node text="Continue" bounds="[1,2][3,4]" /></hierarchy>'
+        completed = lambda output="": subprocess.CompletedProcess(
+            [], 0, output, ""
+        )
+        with patch(
+            "adb_pusher._run_adb",
+            side_effect=[
+                subprocess.TimeoutExpired("uiautomator dump", 10),
+                completed(),
+                completed(),
+                completed(xml),
+                completed(),
+            ],
+        ) as run_adb, patch("adb_pusher.time.sleep") as sleep:
+            nodes = collect_device_ui_nodes()
+
+        assert nodes[0]["text"] == "Continue"
+        assert sum(
+            call_item.args[0][:3] == ["shell", "uiautomator", "dump"]
+            for call_item in run_adb.call_args_list
+        ) == 2
+        sleep.assert_called_once_with(0.5)
+
+    def test_safe_dialog_ui_timeout_returns_warning_instead_of_raising(self):
+        from adb_pusher import dismiss_safe_interrupting_dialog
+
+        with patch(
+            "adb_pusher.collect_device_ui_nodes",
+            side_effect=subprocess.TimeoutExpired("uiautomator dump", 10),
+        ):
+            result = dismiss_safe_interrupting_dialog()
+
+        assert result["dismissed"] is False
+        assert result["code"] == "UI_READ_FAILED"
+        assert "继续自动化" in result["message"]
+
     def test_apkcombo_exact_search_without_redirect_is_not_found(self):
         from adb_pusher import inspect_apkcombo_package
 
@@ -1412,6 +1468,41 @@ class TestAppLaunchPrecheck:
         assert result["crash_type"] == "JAVA_CRASH"
         assert "com.example.game" in result["summary"]
 
+    def test_classifies_historical_missing_appsflyer_class_rule(self):
+        from adb_pusher import extract_package_crash_evidence
+
+        log_text = """
+        E AndroidRuntime: FATAL EXCEPTION: Thread-51
+        E AndroidRuntime: Process: com.sohi.rainbowarrow.gp, PID: 27445
+        E AndroidRuntime: java.lang.NoClassDefFoundError: Failed resolution of: Lcom/appsflyer/exception_manager/ExceptionManager;
+        E AndroidRuntime: Caused by: java.lang.ClassNotFoundException: com.appsflyer.exception_manager.ExceptionManager
+        """
+
+        result = extract_package_crash_evidence(
+            log_text, "com.sohi.rainbowarrow.gp"
+        )
+
+        assert result["crashed"] is True
+        assert result["rule_id"] == "JAVA_MISSING_CLASS"
+        assert result["reason_code"] == "MISSING_RUNTIME_CLASS"
+        assert result["missing_class"] == "com.appsflyer.exception_manager.ExceptionManager"
+        assert "缺少运行时类" in result["root_cause"]
+
+    def test_task_removal_is_not_classified_as_crash(self):
+        from adb_pusher import extract_package_crash_evidence
+
+        log_text = """
+        I/wm_set_resumed_activity: com.android.launcher3/.QuickstepLauncher
+        I/wm_destroy_activity: com.example.game/.MainActivity,finish-imm:remove-task
+        I/wm_task_removed: com.example.game/.MainActivity
+        """
+
+        result = extract_package_crash_evidence(log_text, "com.example.game")
+
+        assert result["crashed"] is False
+        assert result["rule_id"] == "TASK_REMOVED"
+        assert result["exit_reason"] == "TASK_REMOVED"
+
     def test_ignores_crash_from_another_package(self):
         from adb_pusher import extract_package_crash_evidence
 
@@ -1534,6 +1625,38 @@ class TestAppLaunchPrecheck:
 
         assert result["ok"] is True
         assert result["code"] == "LAUNCH_OK"
+
+    def test_launch_precheck_continues_when_ui_dump_times_out(self):
+        from adb_pusher import run_app_launch_precheck
+
+        command_result = MagicMock(returncode=0, stdout="Events injected: 1", stderr="")
+        progress = []
+        with patch("adb_pusher.is_package_installed", return_value=True), \
+             patch("adb_pusher._run_adb", return_value=command_result), \
+             patch("adb_pusher._is_app_process_running", return_value=True), \
+             patch(
+                 "adb_pusher.dismiss_safe_interrupting_dialog",
+                 return_value={
+                     "dismissed": False,
+                     "code": "UI_READ_FAILED",
+                     "message": "UI 层级读取超时，继续自动化",
+                 },
+             ) as dismiss, \
+             patch("adb_pusher.detect_mandatory_google_login_screen") as login, \
+             patch("adb_pusher._read_crash_logcat", return_value=""), \
+             patch("adb_pusher.time.monotonic", side_effect=[0, 0.1, 0.2, 1.1]):
+            result = run_app_launch_precheck(
+                "com.ui.timeout.game",
+                observation_seconds=1,
+                poll_interval_seconds=0,
+                on_progress=progress.append,
+            )
+
+        assert result["ok"] is True
+        assert result["code"] == "LAUNCH_OK"
+        dismiss.assert_called_once_with()
+        login.assert_not_called()
+        assert any("UI 层级读取超时" in message for message in progress)
 
 
 class TestPackageRuntimeMonitor:
@@ -2318,6 +2441,128 @@ class TestParseAutodetectorFields:
         assert fields["激励视频聚合id"] == "tp-reward"
         assert fields["插屏聚合id"] == "tp-inter"
 
+    def test_recovers_admob_interstitial_id_from_runtime_activity_correlation(self):
+        from adb_pusher import parse_autodetector_fields
+
+        lines = [
+            "09-21 12:10:05.497 E YouDrama: [AdmobInterstitialAdProvider] onAdFailedToPreload",
+            "09-21 12:10:39.253 I ZGSDK.AutoDetector: 最终判断: admob聚合（自动化检测确认）",
+            "09-21 12:10:40.000 I ZGSDK.AutoDetector: 归因平台: Adjust",
+            "09-21 12:10:49.923 E ZGSDK.actMonitor: onActivityCreated:com.google.android.libraries.ads.mobile.sdk.common.AdActivity@46a9ae8",
+            "09-21 12:10:53.752 E FA: Call to endAdUnitExposure for unknown ad unit id: ca-app-pub-6289051987561348/2495281954",
+        ]
+
+        fields = parse_autodetector_fields(lines)
+
+        assert fields["激励视频聚合id"] == ""
+        assert fields["插屏聚合id"] == "ca-app-pub-6289051987561348/2495281954"
+        assert fields["广告ID识别来源"] == "admob_runtime_log_correlation"
+        assert fields["广告ID识别置信度"] == "中高"
+        assert fields["AdMob运行时候选ID"] == [
+            "ca-app-pub-6289051987561348/2495281954"
+        ]
+        assert "endAdUnitExposure" in fields["完整日志"]
+
+    def test_keeps_ambiguous_admob_runtime_ids_as_candidates_only(self):
+        from adb_pusher import parse_autodetector_fields
+
+        fields = parse_autodetector_fields([
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 最终判断: admob聚合",
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 归因平台: Adjust",
+            "09-21 12:00:01 E Host: [AdmobInterstitialAdProvider] preload",
+            "09-21 12:00:02 E Host: [AdmobRewardedAdProvider] preload",
+            "09-21 12:00:03 E Host: onActivityCreated:com.google.android.gms.ads.AdActivity@1",
+            "09-21 12:00:04 E FA: endAdUnitExposure unknown ad unit id: ca-app-pub-1/2",
+        ])
+
+        assert fields["激励视频聚合id"] == ""
+        assert fields["插屏聚合id"] == ""
+        assert fields["AdMob运行时候选ID"] == ["ca-app-pub-1/2"]
+        assert fields["AdMob运行时候选ID详情"] == [{
+            "id": "ca-app-pub-1/2",
+            "type": "",
+            "confidence": "待验证",
+            "reason": "发现运行期广告位 ID，但类型关联证据不足",
+        }]
+
+    def test_does_not_scan_runtime_ids_when_attribution_is_missing(self):
+        from adb_pusher import parse_autodetector_fields
+
+        fields = parse_autodetector_fields([
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 最终判断: admob聚合",
+            "09-21 12:00:01 E Host: [AdmobInterstitialAdProvider] preload",
+            "09-21 12:00:02 E Host: onActivityCreated:com.google.android.gms.ads.AdActivity@1",
+            "09-21 12:00:03 E FA: endAdUnitExposure unknown ad unit id: ca-app-pub-1/2",
+        ])
+
+        assert fields["插屏聚合id"] == ""
+        assert "AdMob运行时候选ID" not in fields
+        assert "_runtime_ad_id_scan_applied" not in fields
+
+    def test_scans_for_max_but_does_not_ingest_admob_only_evidence(self):
+        from adb_pusher import parse_autodetector_fields
+
+        fields = parse_autodetector_fields([
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 最终判断: max聚合",
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 归因平台: Adjust",
+            "09-21 12:00:01 E Host: [AdmobInterstitialAdProvider] preload",
+            "09-21 12:00:02 E Host: onActivityCreated:com.google.android.gms.ads.AdActivity@1",
+            "09-21 12:00:03 E FA: endAdUnitExposure unknown ad unit id: ca-app-pub-1/2",
+        ])
+
+        assert fields["插屏聚合id"] == ""
+        assert "AdMob运行时候选ID" not in fields
+        assert fields["_runtime_ad_id_scan_applied"] is True
+        assert fields["_runtime_ad_id_scan_platform"] == "max"
+
+    def test_does_not_scan_when_only_one_id_is_missing(self):
+        from adb_pusher import parse_autodetector_fields
+
+        fields = parse_autodetector_fields([
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 最终判断: admob聚合",
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 归因平台: Adjust",
+            "09-21 12:00:00 I ZGSDK.AutoDetector: AdMob:",
+            "09-21 12:00:00 I ZGSDK.AutoDetector:   插屏聚合id: [known-id]",
+            "09-21 12:00:01 E Host: [AdmobRewardedAdProvider] preload",
+            "09-21 12:00:02 E Host: onActivityCreated:com.google.android.gms.ads.AdActivity@1",
+            "09-21 12:00:03 E FA: endAdUnitExposure unknown ad unit id: ca-app-pub-1/2",
+        ])
+
+        assert fields["插屏聚合id"] == "known-id"
+        assert fields["激励视频聚合id"] == ""
+        assert "运行时候选广告ID" not in fields
+        assert "_runtime_ad_id_scan_applied" not in fields
+
+    def test_recovers_max_id_from_explicit_platform_type_and_ad_unit_fields(self):
+        from adb_pusher import parse_autodetector_fields
+
+        fields = parse_autodetector_fields([
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 最终判断: AppLovin MAX聚合",
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 归因平台: Adjust",
+            '09-21 12:00:03 I ZGSDK.mediationEvent: {"platform":"MAX",'
+            '"adUnitId":"max-inter-123","adType":"INTERSTITIAL",'
+            '"status":"load_success"}',
+        ])
+
+        assert fields["插屏聚合id"] == "max-inter-123"
+        assert fields["激励视频聚合id"] == ""
+        assert fields["广告ID识别来源"] == "max_runtime_log_explicit"
+        assert fields["广告ID识别置信度"] == "高"
+        assert fields["运行时候选广告ID"] == ["max-inter-123"]
+
+    def test_does_not_scan_appsflyer_case_until_af_key_is_available(self):
+        from adb_pusher import parse_autodetector_fields
+
+        fields = parse_autodetector_fields([
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 最终判断: MAX聚合",
+            "09-21 12:00:00 I ZGSDK.AutoDetector: 归因平台: AppsFlyer",
+            "09-21 12:00:03 I AppLovin MAX adUnitId=max-inter-123 adType=INTERSTITIAL",
+        ])
+
+        assert fields["插屏聚合id"] == ""
+        assert "运行时候选广告ID" not in fields
+        assert "_runtime_ad_id_scan_applied" not in fields
+
 
 class TestExtractLogcatFields:
     def test_decodes_logcat_with_replacement_for_invalid_bytes(self):
@@ -2358,6 +2603,47 @@ class TestExtractLogcatFields:
             extract_logcat_fields(on_line=received.append)
 
         assert received == ["I ZGSDK.AutoDetector: 最终判断: max聚合"]
+
+    def test_forwards_admob_runtime_id_evidence_to_automation_log(self):
+        from adb_pusher import extract_logcat_fields
+
+        evidence = (
+            "09-21 12:10:53.752 E FA: endAdUnitExposure unknown ad unit id: "
+            "ca-app-pub-6289051987561348/2495281954"
+        )
+        output = "\n".join([
+            "09-21 12:10:39.253 I ZGSDK.AutoDetector: 最终判断: admob聚合",
+            "09-21 12:10:40.000 I ZGSDK.AutoDetector: 归因平台: Adjust",
+            "09-21 12:10:48.000 E Host: [AdmobInterstitialAdProvider] preload",
+            "09-21 12:10:49.923 E Host: onActivityCreated:com.google.android.gms.ads.AdActivity@1",
+            evidence,
+        ])
+        received = []
+        with patch("adb_pusher.get_adb_path", return_value="/usr/bin/adb"), \
+             patch(
+                 "adb_pusher.subprocess.run",
+                 return_value=MagicMock(returncode=0, stdout=output, stderr=""),
+             ):
+            extract_logcat_fields(on_line=received.append)
+
+        assert evidence in received
+
+    def test_does_not_forward_runtime_evidence_when_base_fields_are_incomplete(self):
+        from adb_pusher import extract_logcat_fields
+
+        evidence = (
+            "09-21 12:10:53.752 E FA: endAdUnitExposure unknown ad unit id: "
+            "ca-app-pub-6289051987561348/2495281954"
+        )
+        received = []
+        with patch("adb_pusher.get_adb_path", return_value="/usr/bin/adb"), \
+             patch(
+                 "adb_pusher.subprocess.run",
+                 return_value=MagicMock(returncode=0, stdout=evidence, stderr=""),
+             ):
+            extract_logcat_fields(on_line=received.append)
+
+        assert received == []
 
     def test_retries_one_online_logcat_timeout_then_recovers(self):
         from adb_pusher import extract_logcat_fields

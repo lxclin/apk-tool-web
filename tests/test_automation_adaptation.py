@@ -123,6 +123,35 @@ def test_formats_manifest_attribution_source_and_evidence():
     assert any("Manifest证据" in item for item in assessment["evidence"])
 
 
+def test_formats_runtime_admob_id_source_confidence_and_candidates():
+    fields = dict(FIELDS)
+    fields["广告ID识别来源"] = "admob_runtime_log_correlation"
+    fields["广告ID识别置信度"] = "中高"
+    fields["AdMob运行时候选ID"] = [
+        "ca-app-pub-1/2",
+        "ca-app-pub-1/3",
+    ]
+
+    text = format_aggregation_fields(fields)
+
+    assert "广告ID识别方式:AdMob运行期日志关联" in text
+    assert "广告ID识别置信度:中高" in text
+    assert "运行时候选广告ID:ca-app-pub-1/2, ca-app-pub-1/3" in text
+
+
+def test_formats_generic_runtime_id_source_and_candidates():
+    fields = dict(FIELDS)
+    fields["广告ID识别来源"] = "max_runtime_log_explicit"
+    fields["广告ID识别置信度"] = "高"
+    fields["运行时候选广告ID"] = ["max-inter-123"]
+
+    text = format_aggregation_fields(fields)
+
+    assert "广告ID识别方式:MAX运行期日志明确字段" in text
+    assert "广告ID识别置信度:高" in text
+    assert "运行时候选广告ID:max-inter-123" in text
+
+
 def test_merges_below_gp_link_and_replaces_old_result():
     existing = (
         "包名：com.demo\nUP2 appid：app-1\n"
