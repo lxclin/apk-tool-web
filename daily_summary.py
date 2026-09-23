@@ -45,6 +45,14 @@ AUTOMATION_MARKER_RE = re.compile(r"^【APK Tool[^】]*】\s*")
 AUTOMATION_CODE_RE = re.compile(
     r"^【APK Tool\s*自动化适配：([A-Z0-9_]+)】", re.I
 )
+REVIEW_AUTOMATION_CODES = frozenset({
+    "REPLAY_NOT_TRIGGERED",
+    "REPLAY_UNVERIFIED",
+    "INFERRED_REPLAY_UNVERIFIED",
+    "MAX_INFERRED_REPLAY_UNVERIFIED",
+    "SUSPECTED_WHITE_PACKAGE_REVIEW",
+    "REPLAY_ENVIRONMENT_REVIEW",
+})
 URL_RE = re.compile(r"https?://\S+")
 
 # These codes are already terminal after the automation retry policy has been
@@ -389,9 +397,19 @@ def classify_task_comments(
             continue
         automation_match = AUTOMATION_CODE_RE.match(text.strip())
         if automation_match:
-            structured_reason = STRUCTURED_AUTOMATION_ISSUES.get(
-                automation_match.group(1).upper()
-            )
+            code = automation_match.group(1).upper()
+            if code in REVIEW_AUTOMATION_CODES:
+                aggregation_state = "review"
+                aggregation_reason = {
+                    "REPLAY_NOT_TRIGGERED": "广告未触发，待人工验证",
+                    "REPLAY_UNVERIFIED": "广告展示未验证，待复测",
+                    "INFERRED_REPLAY_UNVERIFIED": "聚合推断未验证，待人工复检",
+                    "MAX_INFERRED_REPLAY_UNVERIFIED": "MAX推断未验证，待人工复检",
+                    "SUSPECTED_WHITE_PACKAGE_REVIEW": "疑似白包，待人工复检",
+                    "REPLAY_ENVIRONMENT_REVIEW": "回放环境异常，待复检",
+                }[code]
+                continue
+            structured_reason = STRUCTURED_AUTOMATION_ISSUES.get(code)
             if structured_reason:
                 aggregation_state = "not_adapted"
                 aggregation_reason = structured_reason
@@ -428,6 +446,8 @@ def render_daily_summary(
         issues, "not_adapted", "暂不适配"
     )
     blacklist_summary = _format_issue_state_summary(issues, "blacklist", "加黑")
+    review_count = sum(item.get("state") == "review" for item in issues)
+    review_summary = f"；{review_count}个待人工验证" if review_count else ""
     lines = [
         f"【{target_date.month}.{target_date.day}】",
         f"完成{len(aggregation_success)}个聚合适配",
@@ -435,7 +455,7 @@ def render_daily_summary(
         "",
         (
             f"{len(issues)}个聚合适配问题:"
-            f"{not_adapted_summary}；{blacklist_summary}"
+            f"{not_adapted_summary}；{blacklist_summary}{review_summary}"
         ),
         "",
     ]
@@ -500,7 +520,7 @@ def generate_daily_asana_summary(client, project_gid: str, target_date: date) ->
         result = classify_task_comments(task.package_name, comments)
         if result["aggregation_state"] == "success":
             aggregation_success.append(task.package_name)
-        elif result["aggregation_state"] in {"not_adapted", "blacklist"}:
+        elif result["aggregation_state"] in {"not_adapted", "blacklist", "review"}:
             issues.append(
                 {
                     "package_name": task.package_name,
@@ -529,6 +549,7 @@ def generate_daily_asana_summary(client, project_gid: str, target_date: date) ->
         "issue_count": len(issues),
         "not_adapted_count": sum(item["state"] == "not_adapted" for item in issues),
         "blacklist_count": sum(item["state"] == "blacklist" for item in issues),
+        "review_count": sum(item["state"] == "review" for item in issues),
         "not_adapted_categories": summarize_issue_reasons(
             issues, "not_adapted"
         ),

@@ -98,6 +98,7 @@ from automation_adaptation import (
     detection_field_issue,
     fetch_google_play_install_count,
     format_aggregation_fields,
+    format_detection_review_evidence,
     has_any_ad_unit_id,
     has_explicit_attribution,
     has_aggregation_type,
@@ -108,8 +109,6 @@ from automation_adaptation import (
     submit_backend_via_api,
     submit_precheck_blacklist_via_api,
     update_asana_aggregation_notes,
-    INFERRED_AGGREGATION_FAILURE_NOTE,
-    INFERRED_MAX_FAILURE_NOTE,
 )
 from daily_summary import generate_daily_asana_summary
 from cp_candidate_assignment import (
@@ -131,6 +130,7 @@ from private_features import (
 from automation_checkpoint import (
     AutomationCheckpointStore,
     new_batch_checkpoint,
+    pending_task_indexes,
     resumable_summary,
 )
 from automation_report import AutomationReportStore
@@ -191,6 +191,12 @@ AUTOMATION_INFRASTRUCTURE_FAILURE_CODES = frozenset(
         "LOGCAT_READ_FAILED",
     }
 )
+REPLAY_ENVIRONMENT_FAILURE_CODES = frozenset(
+    {"LOGCAT_ENDED", "APP_RUNTIME_INJECTION_FAILED", "REPLAY_EXCEPTION"}
+)
+INFERRED_AGGREGATION_REVIEW_NOTE = "聚合类型未确认，待人工触发广告复检"
+INFERRED_MAX_REVIEW_NOTE = "MAX聚合推断未验证，待人工触发广告复检"
+WHITE_PACKAGE_REVIEW_NOTE = "疑似白包，聚合证据不足，待人工复检"
 G99_CRASH_RESULT_CODE = "G99_APP_CRASHED"
 G99_CRASH_TERMINAL_NOTE = "闪退，g99也闪退，暂不适配"
 
@@ -393,6 +399,7 @@ class APKToolApp:
         self._automation_discard_checkpoint_btn = None
         self._automation_report_store = AutomationReportStore(AUTOMATION_REPORT_DIR)
         self._automation_report_path = ""
+        self._automation_report_store.reconcile_interrupted()
         self._automation_report_store.cleanup()
         self._daily_summary_running = False
         self._cp_candidate_running = False
@@ -4544,6 +4551,7 @@ class APKToolApp:
             f"闪退 {int(state.get('crashed') or 0)}｜"
             f"启动失败 {int(state.get('launch_failed') or 0)}｜"
             f"失败 {int(state.get('failed') or 0)}｜"
+            f"待验证 {int(state.get('needs_review') or 0)}｜"
             f"其他 {int(state.get('other') or 0)}"
         )
         if hasattr(self, "automation_batch_progress_text_var"):
@@ -4570,6 +4578,7 @@ class APKToolApp:
             "crashed": 0,
             "launch_failed": 0,
             "failed": 0,
+            "needs_review": 0,
             "other": 0,
         }
         self._automation_update_batch_progress()
@@ -4754,7 +4763,10 @@ class APKToolApp:
     ) -> None:
         terminal_outcome = outcome or ("success" if success else "failed")
         self._automation_finish_report(
-            "success" if success else ("skipped" if outcome else "handled"),
+            "success" if success else (
+                "needs_review" if outcome == "needs_review"
+                else "skipped" if outcome else "handled"
+            ),
             (
                 "AUTOMATION_TASK_SUCCESS"
                 if success
@@ -4765,6 +4777,8 @@ class APKToolApp:
                     if outcome == "unsupported_aggregation"
                     else "SUSPECTED_WHITE_PACKAGE"
                     if outcome == "not_adapted"
+                    else (self._automation_last_result_code or "REPLAY_NOT_TRIGGERED")
+                    if outcome == "needs_review"
                     else "TARGET_APP_NOT_INSTALLED"
                     if outcome == "requeued"
                     else "AUTOMATION_TASK_HANDLED"
@@ -4779,11 +4793,7 @@ class APKToolApp:
         if 0 <= index < len(tasks):
             tasks[index]["result"] = terminal_outcome
             tasks[index]["message"] = str(message or "")
-        unfinished_indexes = [
-            task_index
-            for task_index, task in enumerate(tasks)
-            if not str(task.get("result") or "").strip()
-        ]
+        unfinished_indexes = pending_task_indexes(checkpoint)
         if not unfinished_indexes:
             self._automation_checkpoint_store.clear()
             self._automation_checkpoint = None
@@ -5130,11 +5140,6 @@ class APKToolApp:
             not isinstance(fields, dict)
             or not fields.get("ok", True)
             or fields.get("_runtime_code")
-            or (
-                detection.get("code")
-                in {"AGGREGATION_TYPE_EMPTY", "AD_IDS_EMPTY"}
-                and non_game_empty_backend_note(fields)
-            )
             or (has_aggregation_type(fields) and has_any_ad_unit_id(fields))
         ):
             return detection
@@ -5147,6 +5152,9 @@ class APKToolApp:
         )
         installs_result = fetch_google_play_install_count(package_name)
         if not installs_result.get("ok"):
+            detection["_white_package_check_message"] = str(
+                installs_result.get("message") or "Google Play 下载量未核实"
+            )
             self._safe_after(
                 0,
                 self._automation_log,
@@ -5167,7 +5175,7 @@ class APKToolApp:
             self._safe_after(
                 0,
                 self._automation_log,
-                f"下载量为 {fields['_google_play_installs_text']}，按疑似白包暂不适配",
+                f"下载量为 {fields['_google_play_installs_text']}，疑似白包，转人工复检",
             )
         else:
             self._safe_after(
@@ -5554,7 +5562,7 @@ class APKToolApp:
 
     def _automation_clear_inferred_backend_sync(
         self,
-        note: str = INFERRED_AGGREGATION_FAILURE_NOTE,
+        note: str,
     ) -> dict:
         """Rollback the provisional video/inter submission after replay failure."""
         return clear_backend_adaptation_via_api(
@@ -5623,19 +5631,19 @@ class APKToolApp:
     def _automation_handle_inferred_replay_failure_sync(
         self, replay: dict
     ) -> bool:
-        """Clear provisional backend data and record the terminal conclusion."""
+        """Remove unverified provisional data without rejecting the package."""
         package_name = self._automation_current_package_name()
         replay_message = replay.get("message", "聚合广告回放失败")
 
         # ``video`` / ``inter`` are only provisional IronSource placeholders.
-        # Once replay disproves that inference, re-evaluate the package from its
-        # real terminal state so a low-install package can still enter the
-        # suspected-white-package flow.
+        # A replay without a verified display does not disprove mediation.
+        # Restore the raw detection evidence before a possible manual review.
         terminal_fields = dict(self._automation_fields or {})
         terminal_fields["最终判断"] = ""
         terminal_fields["激励视频聚合id"] = ""
         terminal_fields["插屏聚合id"] = ""
         terminal_fields.pop("_aggregation_type_inferred", None)
+        self._automation_fields = terminal_fields
         white_package_detection = (
             self._automation_apply_suspected_white_package_rule_sync(
                 {
@@ -5645,84 +5653,96 @@ class APKToolApp:
                     "fields": terminal_fields,
                 }
             )
+            if not self._automation_stop_event.is_set()
+            else {}
         )
         if white_package_detection.get("code") == "SUSPECTED_WHITE_PACKAGE":
             self._automation_fields = white_package_detection["fields"]
             self._safe_after(
                 0,
                 self._automation_log,
-                "临时 IronSource 推断已被回放否定；重新核对下载量后命中疑似白包规则",
+                "临时 IronSource 尚未验证；低下载量且缺少证据，转人工复检",
             )
-            return self._automation_complete_suspected_white_package_sync(
-                f"{white_package_detection.get('message', '疑似白包，暂不适配')}"
-                f"\n临时 IronSource 回放结果：{replay_message}"
+            result = self._automation_complete_suspected_white_package_sync(
+                f"{white_package_detection.get('message', '疑似白包，待复检')}"
+                f"\n临时 IronSource 回放结果：{replay_message}",
+                clear_provisional=True,
             )
+            if replay.get("code") == "LOGCAT_ENDED" and self._automation_batch_active:
+                self._automation_stop_event.set()
+            return result
 
         self._safe_after(
             0,
             self._automation_log,
             "推断 IronSource 回放未成功，正在清空刚提交的后台适配参数",
         )
-        cleared = self._automation_clear_inferred_backend_sync()
+        cleared = self._automation_clear_inferred_backend_sync(
+            note=INFERRED_AGGREGATION_REVIEW_NOTE
+        )
         self._safe_after(0, self._automation_log, cleared.get("message", ""))
+        if not cleared.get("ok"):
+            message = (
+                f"临时参数清空失败，需要人工立即处理；包名：{package_name}；"
+                f"回放：{replay_message}；后台：{cleared.get('message', '未知错误')}"
+            )
+            self._automation_mark_failed(message)
+            self._automation_comment_failure(
+                cleared.get("code", "INFERRED_AGGREGATION_CLEAR_FAILED"), message
+            )
+            if self._automation_batch_active:
+                self._automation_stop_event.set()
+            return False
+        if replay.get("code") == "REPLAY_CANCELLED" and self._automation_stop_event.is_set():
+            self._safe_after(0, self._automation_set_status, "自动化已停止", "#ef6c00")
+            return False
 
         description_error = ""
         try:
             self._automation_fill_asana_sync(
-                terminal_note=INFERRED_AGGREGATION_FAILURE_NOTE
+                allow_missing_aggregation=True,
+                terminal_note=INFERRED_AGGREGATION_REVIEW_NOTE,
             )
             self._safe_after(
                 0,
                 self._automation_log,
-                "暂不适配结论已回填至 Asana 描述",
+                "待复检结论已回填至 Asana 描述",
             )
         except Exception as exc:
             description_error = str(exc)
             self._safe_after(
                 0,
                 self._automation_log,
-                f"Asana 暂不适配描述回填失败: {exc}",
+                f"Asana 待复检描述回填失败: {exc}",
             )
 
         comment_lines = [
-            INFERRED_AGGREGATION_FAILURE_NOTE,
+            INFERRED_AGGREGATION_REVIEW_NOTE,
             f"包名：{package_name}",
             f"回放结果：{replay_message}",
+            f"回放代码：{replay.get('code', '未知')}",
             f"后台清空：{cleared.get('message', '未返回结果')}",
         ]
+        white_check_message = str(
+            white_package_detection.get("_white_package_check_message") or ""
+        ).strip()
+        if white_check_message:
+            comment_lines.append(f"疑似白包条件未核实：{white_check_message}")
         if description_error:
             comment_lines.append(f"Asana 描述回填失败：{description_error}")
-        comment_code = (
-            "INFERRED_AGGREGATION_REPLAY_FAILED"
-            if cleared.get("ok")
-            else "INFERRED_AGGREGATION_CLEAR_FAILED"
+        self._automation_comment_review(
+            "INFERRED_REPLAY_UNVERIFIED",
+            "\n".join(comment_lines),
+            "聚合推断待复检",
         )
-        self._automation_comment_failure(comment_code, "\n".join(comment_lines))
-
-        if cleared.get("ok"):
-            self._safe_after(
-                0,
-                self._automation_set_status,
-                "未识别出聚合类型，暂不适配",
-                "#ef6c00",
-            )
-            if self._automation_precheck_item_id:
-                self._safe_after(
-                    0,
-                    self._set_precheck_task_status,
-                    self._automation_precheck_item_id,
-                    "未识别聚合类型",
-                )
-        else:
-            self._automation_mark_failed(
-                "回放失败且后台参数清空失败，需要人工立即处理"
-            )
+        if replay.get("code") == "LOGCAT_ENDED" and self._automation_batch_active:
+            self._automation_stop_event.set()
         return False
 
     def _automation_handle_inferred_max_replay_failure_sync(
         self, replay: dict
     ) -> bool:
-        """Revoke provisional MAX, clear backend, and preserve the real IDs."""
+        """Clear unverified MAX submission while preserving real ad IDs."""
         package_name = self._automation_current_package_name()
         replay_message = replay.get("message", "聚合广告回放失败")
         terminal_fields = dict(self._automation_fields or {})
@@ -5742,15 +5762,30 @@ class APKToolApp:
             "临时 MAX 回放未成功，正在清空后台适配参数并恢复真实检测结果",
         )
         cleared = self._automation_clear_inferred_backend_sync(
-            note=INFERRED_MAX_FAILURE_NOTE
+            note=INFERRED_MAX_REVIEW_NOTE
         )
         self._safe_after(0, self._automation_log, cleared.get("message", ""))
+        if not cleared.get("ok"):
+            message = (
+                f"临时 MAX 参数清空失败，需要人工立即处理；包名：{package_name}；"
+                f"回放：{replay_message}；后台：{cleared.get('message', '未知错误')}"
+            )
+            self._automation_mark_failed(message)
+            self._automation_comment_failure(
+                cleared.get("code", "INFERRED_MAX_CLEAR_FAILED"), message
+            )
+            if self._automation_batch_active:
+                self._automation_stop_event.set()
+            return False
+        if replay.get("code") == "REPLAY_CANCELLED" and self._automation_stop_event.is_set():
+            self._safe_after(0, self._automation_set_status, "自动化已停止", "#ef6c00")
+            return False
 
         description_error = ""
         try:
             self._automation_fill_asana_sync(
                 allow_missing_aggregation=True,
-                terminal_note=INFERRED_MAX_FAILURE_NOTE,
+                terminal_note=INFERRED_MAX_REVIEW_NOTE,
             )
         except Exception as exc:
             description_error = str(exc)
@@ -5761,53 +5796,25 @@ class APKToolApp:
             )
 
         comment_lines = [
-            INFERRED_MAX_FAILURE_NOTE,
+            INFERRED_MAX_REVIEW_NOTE,
             f"包名：{package_name}",
             f"回放结果：{replay_message}",
+            f"回放代码：{replay.get('code', '未知')}",
             f"后台清空：{cleared.get('message', '未返回结果')}",
         ]
         if description_error:
             comment_lines.append(f"Asana 描述回填失败：{description_error}")
-        self._automation_comment_business_outcome(
-            "MAX_INFERRED_REPLAY_FAILED", "\n".join(comment_lines)
+        self._automation_comment_review(
+            "MAX_INFERRED_REPLAY_UNVERIFIED",
+            "\n".join(comment_lines),
+            "MAX推断待复检",
         )
-
-        if not cleared.get("ok"):
-            self._automation_mark_failed(
-                "临时 MAX 回放失败且后台参数清空失败，需要人工立即处理"
-            )
-            self._automation_comment_failure(
-                cleared.get("code", "INFERRED_MAX_CLEAR_FAILED"),
-                "\n".join(comment_lines),
-            )
-            return False
-        if description_error:
-            self._automation_mark_failed(
-                f"后台已复原，但 Asana 回填失败：{description_error}"
-            )
-            return False
-
-        self._automation_task_outcome = "not_adapted"
-        self._safe_after(
-            0,
-            self._automation_set_status,
-            INFERRED_MAX_FAILURE_NOTE,
-            "#ef6c00",
-        )
-        if self._automation_precheck_item_id:
-            self._safe_after(
-                0,
-                self._set_precheck_task_status,
-                self._automation_precheck_item_id,
-                "聚合类型为空",
-            )
-        self._automation_write_sheet_outcome_sync(
-            "not_adapted", INFERRED_MAX_FAILURE_NOTE
-        )
+        if replay.get("code") == "LOGCAT_ENDED" and self._automation_batch_active:
+            self._automation_stop_event.set()
         self._safe_after(
             0,
             self._automation_log,
-            "临时 MAX 参数已清空；Asana 已记录“聚合类型为空，但存在广告id”",
+            "临时 MAX 参数已清空；真实广告 ID 已保留，等待人工复检",
         )
         return False
 
@@ -5855,6 +5862,119 @@ class APKToolApp:
             self._safe_after(0, self._automation_log, "失败原因已写入 Asana 评论")
         except Exception as exc:
             self._safe_after(0, self._automation_log, f"Asana 评论失败: {exc}")
+
+    def _automation_comment_review(
+        self, code: str, comment: str, status: str
+    ) -> None:
+        """Save an inconclusive result without recording an adaptation failure."""
+        code = str(code or "REPLAY_NOT_TRIGGERED").strip().upper()
+        message = str(comment or status).strip()
+        self._automation_task_outcome = "needs_review"
+        self._automation_last_result_code = code
+        self._automation_last_result_message = message
+        self._automation_deferred_failure = None
+        self._automation_finish_report("needs_review", code, message)
+        self._safe_after(
+            0, self._automation_set_status, status, "#ef6c00"
+        )
+        self._safe_after(0, self._automation_log, message)
+        if self._automation_precheck_item_id:
+            self._safe_after(
+                0, self._set_precheck_task_status,
+                self._automation_precheck_item_id, status,
+            )
+        task_gid = self._automation_current_task_gid()
+        if not task_gid:
+            return
+        try:
+            add_automation_comment_once(
+                self._automation_asana_client(), task_gid, code, message
+            )
+        except Exception as exc:
+            self._safe_after(0, self._automation_log, f"Asana 评论失败: {exc}")
+
+    def _automation_comment_replay_review(self, comment: str) -> None:
+        self._automation_comment_review(
+            "REPLAY_NOT_TRIGGERED", comment, "广告未触发待验证"
+        )
+
+    def _automation_handle_unverified_replay(self, replay: dict) -> bool:
+        """Retry a display timeout once in batch, then report it as reviewable."""
+        raw_code = str(replay.get("code") or "").strip().upper()
+        if raw_code not in {
+            "REPLAY_TIMEOUT", "REPLAY_ID_CANDIDATES_EXHAUSTED",
+            "REPLAY_NOT_TRIGGERED",
+        }:
+            return False
+        code = (
+            "REPLAY_NOT_TRIGGERED"
+            if raw_code == "REPLAY_NOT_TRIGGERED" else "REPLAY_UNVERIFIED"
+        )
+        review_result = dict(replay, code=code)
+        comment = "\n".join(
+            build_replay_failure_comment(
+                self._automation_current_package_name(), review_result
+            ).splitlines()[1:]
+        )
+        if (
+            code == "REPLAY_UNVERIFIED"
+            and self._automation_batch_active
+            and should_defer_automation_failure(
+                code, self._automation_batch_attempt
+            )
+        ):
+            self._automation_comment_failure(code, comment)
+        elif code == "REPLAY_NOT_TRIGGERED":
+            self._automation_comment_replay_review(comment)
+        else:
+            self._automation_comment_review(
+                code, comment, "广告展示待验证"
+            )
+        return True
+
+    def _automation_handle_replay_environment(self, replay: dict) -> bool:
+        """Keep replay transport/injection problems out of business failures."""
+        code = str(replay.get("code") or "").strip().upper()
+        if code == "REPLAY_CANCELLED":
+            self._automation_last_result_code = code
+            self._automation_last_result_message = "用户已停止广告回放"
+            self._automation_stop_event.set()
+            self._safe_after(0, self._automation_set_status, "自动化已停止", "#ef6c00")
+            return True
+        if code not in REPLAY_ENVIRONMENT_FAILURE_CODES:
+            return False
+        message = (
+            f"回放环境异常，不能据此判断包体适配结果\n"
+            f"包名：{self._automation_current_package_name()}\n"
+            f"原因：{replay.get('message', code)}"
+        )
+        self._automation_comment_review(
+            "REPLAY_ENVIRONMENT_REVIEW",
+            f"故障代码：{code}\n{message}",
+            "回放环境待复检",
+        )
+        if code == "LOGCAT_ENDED" and self._automation_batch_active:
+            self._automation_stop_event.set()
+            self._safe_after(0, self._automation_log, "Logcat 监听中断，已安全停止批量队列")
+        return True
+
+    def _automation_handle_execution_exception(self, exc: Exception) -> bool:
+        """Do not attribute operator cancellation or device loss to an APK."""
+        message = str(exc)
+        if self._automation_stop_event.is_set() or "用户已停止自动化" in message:
+            self._automation_last_result_code = "AUTOMATION_CANCELLED"
+            self._automation_last_result_message = message
+            self._automation_stop_event.set()
+            self._safe_after(0, self._automation_set_status, "自动化已停止", "#ef6c00")
+            return True
+        if message.startswith("设备体检未通过:"):
+            self._automation_last_result_code = "DEVICE_ENVIRONMENT_FAILED"
+            self._automation_last_result_message = message
+            self._automation_stop_event.set()
+            self._safe_after(0, self._automation_set_status, "设备异常，队列已停止", "#e53935")
+            self._safe_after(0, self._automation_log, message)
+            return True
+        return False
 
     def _automation_comment_business_outcome(self, code: str, message: str):
         """Write a terminal business decision without reporting automation failure."""
@@ -6015,18 +6135,6 @@ class APKToolApp:
                 "其他归因",
             )
 
-    def _automation_mark_suspected_white_package(self, message: str):
-        self._automation_task_outcome = "not_adapted"
-        self._safe_after(0, self._automation_set_status, "疑似白包", "#ef6c00")
-        self._safe_after(0, self._automation_log, message)
-        if self._automation_precheck_item_id:
-            self._safe_after(
-                0,
-                self._set_precheck_task_status,
-                self._automation_precheck_item_id,
-                "疑似白包",
-            )
-
     def _automation_is_g99_confirmed_crash(self, detection: dict) -> bool:
         """Whether a batch result is a target-specific crash on the G99."""
         return bool(
@@ -6167,22 +6275,44 @@ class APKToolApp:
         return False
 
     def _automation_complete_suspected_white_package_sync(
-        self, message: str
+        self, message: str, *, clear_provisional: bool = False
     ) -> bool:
-        """Persist the low-install white-package conclusion and skip replay."""
+        """Review low-install packages; undo only this run's provisional submit."""
         package_name = self._automation_current_package_name()
-        terminal_note = "疑似白包，暂不适配"
+        review_note = WHITE_PACKAGE_REVIEW_NOTE
+        message = str(message or "").replace("疑似白包，暂不适配", "疑似白包，待复检")
+        if self._automation_stop_event.is_set():
+            return False
+        backend_message = "未修改（仅证据不足）"
+        if clear_provisional:
+            self._safe_after(
+                0,
+                self._automation_log,
+                "[疑似白包 1/2] 清空本轮临时参数并回读校验",
+            )
+            submit = self._automation_clear_inferred_backend_sync(note=review_note)
+            self._safe_after(0, self._automation_log, submit.get("message", ""))
+            if not submit.get("ok"):
+                submit_message = submit.get("message", "后台临时参数清空失败")
+                self._automation_mark_failed(submit_message)
+                self._automation_comment_failure(
+                    submit.get("code", "BACKEND_CLEAR_FAILED"), submit_message
+                )
+                if self._automation_batch_active:
+                    self._automation_stop_event.set()
+                return False
+            backend_message = "临时参数已清空并回读确认"
         self._safe_after(
             0,
             self._automation_log,
-            "[疑似白包 1/2] 回填检测依据与暂不适配结论",
+            "[疑似白包 2/2] 回填检测依据与待复检结论",
         )
         asana_error = ""
         try:
             self._automation_fill_asana_sync(
                 allow_unsupported_attribution=True,
                 allow_missing_aggregation=True,
-                terminal_note=terminal_note,
+                terminal_note=review_note,
             )
         except Exception as exc:
             asana_error = str(exc)
@@ -6191,42 +6321,25 @@ class APKToolApp:
                 self._automation_log,
                 f"疑似白包检测结果回填 Asana 描述失败：{exc}",
             )
-        self._automation_comment_business_outcome(
-            "SUSPECTED_WHITE_PACKAGE",
-            f"{message}\n包名：{package_name}",
+        review_message = (
+            f"{message}\n包名：{package_name}\n"
+            f"后台：{backend_message}"
         )
-        if self._automation_stop_event.is_set():
-            return False
-        self._safe_after(
-            0,
-            self._automation_log,
-            "[疑似白包 2/2] 清空适配参数，仅提交备注并回读校验",
-        )
-        submit = self._automation_clear_inferred_backend_sync(note=terminal_note)
-        self._safe_after(0, self._automation_log, submit.get("message", ""))
-        if not submit.get("ok"):
-            submit_message = submit.get("message", "后台自动提交失败")
-            self._automation_mark_failed(submit_message)
-            self._automation_comment_failure(
-                submit.get("code", "BACKEND_SUBMIT_FAILED"), submit_message
-            )
-            return False
         if asana_error:
-            failure_message = (
-                "疑似白包备注已提交后台并刷新成功，但 Asana 描述回填失败，"
-                f"任务保留为未完成以便重试：{asana_error}"
-            )
-            self._automation_mark_failed(failure_message)
-            self._automation_comment_failure(
-                "SUSPECTED_WHITE_PACKAGE_ASANA_FAILED", failure_message
-            )
-            return False
-        self._automation_mark_suspected_white_package(message)
-        self._automation_write_sheet_outcome_sync("not_adapted", terminal_note)
+            review_message += f"\nAsana 描述回填失败，请人工补录：{asana_error}"
+        self._automation_comment_review(
+            "SUSPECTED_WHITE_PACKAGE_REVIEW",
+            review_message,
+            "疑似白包待复检",
+        )
         self._safe_after(
             0,
             self._automation_log,
-            "后台已仅保留备注“疑似白包，暂不适配”并清除缓存；跳过聚合回放",
+            (
+                "本轮临时参数已清空；疑似白包转人工复检"
+                if clear_provisional else
+                "疑似白包转人工复检；未触碰已有后台配置"
+            ),
         )
         return False
 
@@ -6591,6 +6704,12 @@ class APKToolApp:
         locked: dict[str, dict] = {}
         exhausted: set[str] = set()
         transient_retries = {item: 0 for item in configured}
+        request_observed: dict[str, bool | None] = {
+            item: None for item in configured
+        }
+        replay_errors: dict[str, set[str]] = {
+            item: set() for item in configured
+        }
         last_result: dict = {}
         attempts = 0
 
@@ -6629,6 +6748,15 @@ class APKToolApp:
                 result = self._automation_replay_sync(**replay_kwargs)
             last_result = result
 
+            for ad_type in configured:
+                state = result.get(ad_type) or {}
+                if "request_observed" in state:
+                    request_observed[ad_type] = bool(
+                        request_observed[ad_type]
+                        or state["request_observed"]
+                    )
+                replay_errors[ad_type].update(state.get("errors") or [])
+
             if result.get("code") == "AGGREGATION_TYPE_CHANGED_DURING_REPLAY":
                 return result
             if result.get("action_success"):
@@ -6666,7 +6794,9 @@ class APKToolApp:
                 # A pending-only replay can be successful while a previously
                 # exhausted type is still unresolved; keep the combined result.
                 pass
-            elif result.get("code") != "REPLAY_TIMEOUT":
+            elif result.get("code") not in {
+                "REPLAY_TIMEOUT", "REPLAY_NOT_TRIGGERED"
+            }:
                 return result
 
             changed: list[str] = []
@@ -6730,12 +6860,23 @@ class APKToolApp:
                         + submit.get("message", "未知错误"),
                     }
 
+        unverified = configured - set(locked)
+        not_triggered = {
+            item for item in unverified
+            if request_observed[item] is False
+        }
         final = dict(last_result)
         final.update(
             ok=False,
-            code="REPLAY_ID_CANDIDATES_EXHAUSTED",
-            message="多 ID 已按顺序尝试完毕，仍有广告类型未确认展示："
-            + "、".join(labels[item] for item in configured - set(locked)),
+            code=(
+                "REPLAY_NOT_TRIGGERED"
+                if not_triggered else "REPLAY_ID_CANDIDATES_EXHAUSTED"
+            ),
+            message=(
+                "未观察到目标广告请求；需要人工触发后验证："
+                if not_triggered else
+                "多 ID 已按顺序尝试完毕，仍有广告类型未确认展示："
+            ) + "、".join(labels[item] for item in unverified),
         )
         for ad_type in configured:
             if ad_type in locked:
@@ -6747,6 +6888,10 @@ class APKToolApp:
                     displayed=False,
                     expected_ids=[candidates[ad_type][indexes[ad_type]]],
                 )
+                if request_observed[ad_type] is not None:
+                    state["request_observed"] = request_observed[ad_type]
+                if replay_errors[ad_type]:
+                    state["errors"] = sorted(replay_errors[ad_type])
                 final[ad_type] = state
         return final
 
@@ -6767,23 +6912,17 @@ class APKToolApp:
             self._automation_set_status("回放待补充广告 ID", "#ef6c00")
             self._automation_log(message)
             return
+        if self._automation_handle_unverified_replay(result):
+            return
+        if self._automation_handle_replay_environment(result):
+            return
         self._automation_mark_failed(message)
-        if result.get("code") in {
-            "REPLAY_TIMEOUT",
-            "REPLAY_ID_CANDIDATES_EXHAUSTED",
-        }:
-            comment = build_replay_failure_comment(
-                self._automation_current_package_name(), result
-            )
-            comment = "\n".join(comment.splitlines()[1:])
-            comment_code = "AD_REPLAY_FAILED"
-        else:
-            comment = (
-                "聚合广告回放失败，自动化适配终止，需要测试人员确认\n"
-                f"包名：{self._automation_current_package_name()}\n"
-                f"失败原因：{message}"
-            )
-            comment_code = result.get("code", "AD_REPLAY_FAILED")
+        comment = (
+            "聚合广告回放失败，自动化适配终止，需要测试人员确认\n"
+            f"包名：{self._automation_current_package_name()}\n"
+            f"失败原因：{message}"
+        )
+        comment_code = result.get("code", "AD_REPLAY_FAILED")
         self._automation_comment_failure(comment_code, comment)
 
     def _automation_start_replay(self):
@@ -7036,6 +7175,16 @@ class APKToolApp:
                                 detection.get("code"),
                                 f"{message}\n"
                                 f"包名：{self._automation_current_package_name()}"
+                                + (
+                                    "\n" + format_detection_review_evidence(self._automation_fields)
+                                    if detection.get("code") in {
+                                        "AGGREGATION_TYPE_EMPTY",
+                                        "AGGREGATION_RESULT_INCOMPLETE",
+                                        "AD_IDS_EMPTY",
+                                        "AF_KEY_EMPTY",
+                                    }
+                                    else ""
+                                )
                                 + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else ""),
                             )
                         return
@@ -7045,8 +7194,9 @@ class APKToolApp:
             except AutomationVPNUnavailable:
                 pass
             except Exception as exc:
-                self._automation_mark_failed(f"自动化执行失败: {exc}")
-                self._automation_comment_failure("AUTOMATION_FAILED", str(exc))
+                if not self._automation_handle_execution_exception(exc):
+                    self._automation_mark_failed(f"自动化执行失败: {exc}")
+                    self._automation_comment_failure("AUTOMATION_FAILED", str(exc))
             finally:
                 self._automation_cleanup_current_app_sync("自动化适配结束")
                 self._safe_after(0, self._automation_set_running, False)
@@ -7966,6 +8116,16 @@ class APKToolApp:
             self._automation_comment_failure(
                 failure_code,
                 f"{message}\n包名：{package_name}"
+                + (
+                    "\n" + format_detection_review_evidence(self._automation_fields)
+                    if failure_code in {
+                        "AGGREGATION_TYPE_EMPTY",
+                        "AGGREGATION_RESULT_INCOMPLETE",
+                        "AD_IDS_EMPTY",
+                        "AF_KEY_EMPTY",
+                    }
+                    else ""
+                )
                 + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else "")
                 + runtime_metadata,
             )
@@ -8048,25 +8208,21 @@ class APKToolApp:
             return self._automation_handle_inferred_replay_failure_sync(replay)
 
         message = replay.get("message", "聚合广告回放失败")
+        if self._automation_handle_unverified_replay(replay):
+            return False
+        if self._automation_handle_replay_environment(replay):
+            return False
         self._automation_mark_failed(message)
-        if replay.get("code") in {
-            "REPLAY_TIMEOUT",
-            "REPLAY_ID_CANDIDATES_EXHAUSTED",
-        }:
-            comment = build_replay_failure_comment(package_name, replay)
-            comment = "\n".join(comment.splitlines()[1:])
-            code = "AD_REPLAY_FAILED"
-        else:
-            comment = (
-                "聚合广告回放失败，自动化适配终止，需要测试人员确认\n"
-                f"包名：{package_name}\n失败原因：{message}"
-            )
-            runtime_summary = str(
-                (replay.get("runtime") or {}).get("summary") or ""
-            ).strip()
-            if runtime_summary:
-                comment += f"\n关键运行时日志：\n{runtime_summary}"
-            code = replay.get("code", "AD_REPLAY_FAILED")
+        comment = (
+            "聚合广告回放失败，自动化适配终止，需要测试人员确认\n"
+            f"包名：{package_name}\n失败原因：{message}"
+        )
+        runtime_summary = str(
+            (replay.get("runtime") or {}).get("summary") or ""
+        ).strip()
+        if runtime_summary:
+            comment += f"\n关键运行时日志：\n{runtime_summary}"
+        code = replay.get("code", "AD_REPLAY_FAILED")
         self._automation_comment_failure(code, comment)
         return False
 
@@ -8158,11 +8314,12 @@ class APKToolApp:
         if not current_gids and not current_packages:
             return True
 
-        try:
-            start_index = max(0, int((checkpoint or {}).get("current_index", 0)))
-        except (TypeError, ValueError):
-            start_index = 0
-        remaining = list((checkpoint or {}).get("tasks") or [])[start_index:]
+        pending_indexes = set(pending_task_indexes(checkpoint or {}))
+        remaining = [
+            record
+            for index, record in enumerate((checkpoint or {}).get("tasks") or [])
+            if index in pending_indexes
+        ]
         checkpoint_gids = {
             str(record.get("gid") or "").strip()
             for record in remaining
@@ -8193,8 +8350,15 @@ class APKToolApp:
             return
         self._automation_checkpoint = checkpoint
         start_index = int(checkpoint.get("current_index", 0))
+        pending_indexes = pending_task_indexes(checkpoint)
+        if start_index not in pending_indexes:
+            start_index = pending_indexes[0]
+        ordered_indexes = [start_index] + [
+            index for index in pending_indexes if index != start_index
+        ]
         queue = []
-        for record in (checkpoint.get("tasks") or [])[start_index:]:
+        for index in ordered_indexes:
+            record = checkpoint["tasks"][index]
             queue.append(
                 (
                     self._automation_checkpoint_item_id(record),
@@ -8216,6 +8380,7 @@ class APKToolApp:
             queue,
             start_index=start_index,
             resume_stage=str(checkpoint.get("stage") or "queued"),
+            checkpoint_indices=ordered_indexes,
         )
 
     def _automation_start_batch_queue(
@@ -8225,6 +8390,7 @@ class APKToolApp:
         start_index: int,
         resume_stage: str,
         device_profile=None,
+        checkpoint_indices: list[int] | None = None,
     ):
         if not self._automation_access_allowed():
             return False
@@ -8233,24 +8399,29 @@ class APKToolApp:
         self._automation_batch_device_profile = dict(device_profile or {})
         self._automation_set_running(True)
         total_count = len((self._automation_checkpoint or {}).get("tasks") or queue)
-        self._automation_reset_batch_progress(
-            total_count, completed=max(0, start_index)
+        initial_completed = (
+            max(0, total_count - len(queue))
+            if checkpoint_indices is not None
+            else max(0, start_index)
         )
+        self._automation_reset_batch_progress(total_count, completed=initial_completed)
         self._automation_set_status(
-            f"批量自动适配 {start_index}/{total_count}", "#ef6c00"
+            f"批量自动适配 {initial_completed}/{total_count}", "#ef6c00"
         )
+        checkpoint_tasks = (self._automation_checkpoint or {}).get("tasks") or []
 
         def _run():
             succeeded = 0
             crashed = 0
             launch_failed = 0
             failed = 0
+            needs_review = 0
             other_attribution = 0
             unsupported_aggregation = 0
             not_adapted = 0
             requeued = 0
             retried = 0
-            completed_count = max(0, start_index)
+            completed_count = initial_completed
             crash_codes = {
                 "APP_CRASHED",
                 "APP_EXITED_DURING_AUTOMATION",
@@ -8262,8 +8433,19 @@ class APKToolApp:
                 {
                     "item_id": item_id,
                     "task": task,
-                    "checkpoint_index": start_index + offset,
-                    "attempt": 0,
+                    "checkpoint_index": (
+                        checkpoint_indices[offset]
+                        if checkpoint_indices is not None
+                        else start_index + offset
+                    ),
+                    "attempt": (
+                        int(
+                            checkpoint_tasks[checkpoint_indices[offset]].get("attempt")
+                            or 0
+                        )
+                        if checkpoint_indices is not None
+                        else 0
+                    ),
                     "due_at": 0.0,
                     "resume_stage": resume_stage if offset == 0 else "queued",
                 }
@@ -8399,11 +8581,12 @@ class APKToolApp:
                         interrupted = True
                         break
                     except Exception as exc:
-                        message = f"自动化执行失败: {exc}"
-                        self._automation_mark_failed(message)
-                        self._automation_comment_failure("AUTOMATION_FAILED", message)
-                        if self._automation_checkpoint:
-                            self._automation_checkpoint["last_error"] = message
+                        if not self._automation_handle_execution_exception(exc):
+                            message = f"自动化执行失败: {exc}"
+                            self._automation_mark_failed(message)
+                            self._automation_comment_failure("AUTOMATION_FAILED", message)
+                            if self._automation_checkpoint:
+                                self._automation_checkpoint["last_error"] = message
                     finally:
                         self._automation_cleanup_current_app_sync("当前包体已完成")
 
@@ -8418,6 +8601,23 @@ class APKToolApp:
                             delay_seconds=retry_delay_seconds
                         )
                         retry_entry["resume_stage"] = "queued"
+                        checkpoint = self._automation_checkpoint
+                        if checkpoint:
+                            checkpoint["tasks"][checkpoint_index]["attempt"] = (
+                                attempt + 1
+                            )
+                            checkpoint["stage"] = "queued"
+                            checkpoint["current_fields"] = {}
+                            checkpoint["replay_id_candidates"] = {}
+                            try:
+                                self._automation_checkpoint = (
+                                    self._automation_checkpoint_store.save(checkpoint)
+                                )
+                            except OSError as exc:
+                                self._safe_after(
+                                    0, self._automation_log,
+                                    f"延迟重试断点保存失败: {exc}",
+                                )
                         pending.append(retry_entry)
                         retried += 1
                         wait_minutes = max(
@@ -8431,6 +8631,10 @@ class APKToolApp:
                         self._automation_deferred_failure = None
                         continue
 
+                    if self._automation_stop_event.is_set():
+                        interrupted = True
+                        break
+
                     if task_succeeded:
                         succeeded += 1
                     elif self._automation_task_outcome == "g99_crash_not_adapted":
@@ -8443,6 +8647,8 @@ class APKToolApp:
                         not_adapted += 1
                     elif self._automation_task_outcome == "requeued":
                         requeued += 1
+                    elif self._automation_task_outcome == "needs_review":
+                        needs_review += 1
                     elif (
                         str(self._automation_last_result_code or "").strip().upper()
                         in crash_codes
@@ -8474,6 +8680,7 @@ class APKToolApp:
                         crashed=crashed,
                         launch_failed=launch_failed,
                         failed=failed,
+                        needs_review=needs_review,
                         other_count=other_count,
                         result_stage=result_stage: self._automation_update_batch_progress(
                             completed=completed_count,
@@ -8481,6 +8688,7 @@ class APKToolApp:
                             crashed=crashed,
                             launch_failed=launch_failed,
                             failed=failed,
+                            needs_review=needs_review,
                             other=other_count,
                             stage=result_stage,
                         ),
@@ -8508,6 +8716,12 @@ class APKToolApp:
                                 else "应用未安装，已退回待处理"
                                 if self._automation_task_outcome == "requeued"
                                 else (
+                                    self._automation_last_result_message.splitlines()[0]
+                                    if self._automation_last_result_message
+                                    else "待人工验证"
+                                )
+                                if self._automation_task_outcome == "needs_review"
+                                else (
                                     "包体闪退，暂不适配"
                                     if str(
                                         self._automation_last_result_code or ""
@@ -8527,9 +8741,9 @@ class APKToolApp:
                     )
                 stopped = self._automation_stop_event.is_set()
                 summary = (
-                    f"批量自动适配已停止：成功 {succeeded}，包体闪退 {crashed}，启动失败 {launch_failed}，自动化失败 {failed}，其他归因 {other_attribution}，TradPlus暂不适配 {unsupported_aggregation}，疑似白包 {not_adapted}，待重新安装 {requeued}，延迟重试 {retried} 次"
+                    f"批量自动适配已停止：成功 {succeeded}，包体闪退 {crashed}，启动失败 {launch_failed}，自动化失败 {failed}，待人工验证 {needs_review}，其他归因 {other_attribution}，TradPlus暂不适配 {unsupported_aggregation}，其他暂不适配 {not_adapted}，待重新安装 {requeued}，延迟重试 {retried} 次"
                     if stopped or interrupted
-                    else f"批量自动适配完成：成功 {succeeded}，包体闪退 {crashed}，启动失败 {launch_failed}，自动化失败 {failed}，其他归因 {other_attribution}，TradPlus暂不适配 {unsupported_aggregation}，疑似白包 {not_adapted}，待重新安装 {requeued}，延迟重试 {retried} 次"
+                    else f"批量自动适配完成：成功 {succeeded}，包体闪退 {crashed}，启动失败 {launch_failed}，自动化失败 {failed}，待人工验证 {needs_review}，其他归因 {other_attribution}，TradPlus暂不适配 {unsupported_aggregation}，其他暂不适配 {not_adapted}，待重新安装 {requeued}，延迟重试 {retried} 次"
                 )
                 self._safe_after(0, self._automation_log, summary)
                 final_stage = "队列已停止" if stopped or interrupted else "全部处理完成"
@@ -8550,6 +8764,7 @@ class APKToolApp:
                         or crashed
                         or launch_failed
                         or failed
+                        or needs_review
                         or requeued
                     )
                     else "#2e7d32",

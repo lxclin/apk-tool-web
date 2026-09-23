@@ -158,10 +158,94 @@ def test_timeout_comment_marks_missing_type_and_not_configured_type():
 
     comment = build_replay_failure_comment("com.demo", result)
 
-    assert "AD_REPLAY_FAILED" in comment
+    assert result["code"] == "REPLAY_NOT_TRIGGERED"
+    assert "REPLAY_NOT_TRIGGERED" in comment
     assert "包名：com.demo" in comment
-    assert "插屏广告：未检测到真实展示" in comment
+    assert "插屏广告：未观察到目标广告请求，待触发验证" in comment
     assert "激励视频：未配置，不要求验证" in comment
+
+
+def test_matching_request_without_display_remains_unverified():
+    evaluator = AdReplayEvaluator(ReplayExpectation.from_values("inter-1", ""))
+    evaluator.feed("ZGSDK.Max: showInterAd showAd adUnitId=inter-1 adType=INTERSTITIAL")
+
+    result = evaluator.result(timed_out=True, elapsed_seconds=200)
+
+    assert result["code"] == "REPLAY_TIMEOUT"
+    assert result["interstitial"]["request_observed"] is True
+    assert "REPLAY_UNVERIFIED" in build_replay_failure_comment("com.demo", result)
+
+
+def test_timeout_then_later_real_displays_becomes_success():
+    evaluator = AdReplayEvaluator(
+        ReplayExpectation.from_values("inter-1", "reward-1", "MAX聚合")
+    )
+    for ad_type, ad_id in (
+        ("interstitial", "inter-1"),
+        ("reward", "reward-1"),
+    ):
+        evaluator.feed(
+            'ZGSDK.mediationEvent: {"status":"load_start",'
+            f'"adUnitId":"{ad_id}","adType":"{ad_type}"}}'
+        )
+        evaluator.feed(
+            'ZGSDK.mediationEvent: {"status":"load_failed",'
+            f'"adUnitId":"{ad_id}","adType":"{ad_type}",'
+            '"errorMessage":"ad load timed out"}'
+        )
+    assert evaluator.result(timed_out=True)["code"] == "REPLAY_TIMEOUT"
+    for ad_type, ad_id in (
+        ("interstitial", "inter-1"),
+        ("reward", "reward-1"),
+    ):
+        evaluator.feed(
+            'ZGSDK.mediationEvent: {"status":"display_success",'
+            f'"adUnitId":"{ad_id}","adType":"{ad_type}"}}'
+        )
+    assert evaluator.result()["code"] == "AGGREGATION_REPLAY_SUCCESS"
+
+
+def test_unverified_comment_does_not_claim_adaptation_failure():
+    result = {
+        "code": "REPLAY_UNVERIFIED",
+        "elapsed_seconds": 331.7,
+        "interstitial": {"required": True, "displayed": False, "errors": ["No Fill"]},
+        "rewarded": {"required": True, "displayed": True, "errors": []},
+    }
+
+    comment = build_replay_failure_comment("com.demo", result)
+
+    assert "【APK Tool 自动化适配：REPLAY_UNVERIFIED】" in comment
+    assert "适配失败" not in comment
+    assert "插屏广告：未检测到真实展示" in comment
+    assert "激励视频：回放成功" in comment
+
+
+def test_one_displayed_type_does_not_hide_untriggered_second_type():
+    evaluator = AdReplayEvaluator(
+        ReplayExpectation.from_values("inter-1", "reward-1")
+    )
+    evaluator.feed(
+        'ZGSDK.mediationEvent: {"status":"display_success",'
+        '"adUnitId":"inter-1","adType":"interstitial"}'
+    )
+
+    result = evaluator.result(timed_out=True, elapsed_seconds=300)
+    comment = build_replay_failure_comment("com.demo", result)
+
+    assert result["code"] == "REPLAY_NOT_TRIGGERED"
+    assert "插屏广告：回放成功" in comment
+    assert "激励视频：未观察到目标广告请求，待触发验证" in comment
+
+
+def test_matching_error_is_evidence_of_attempted_request():
+    evaluator = AdReplayEvaluator(ReplayExpectation.from_values("inter-1", ""))
+    evaluator.feed("MAX Error 508 adUnitId=inter-1 adType=INTERSTITIAL")
+
+    result = evaluator.result(timed_out=True, elapsed_seconds=300)
+
+    assert result["code"] == "REPLAY_TIMEOUT"
+    assert result["interstitial"]["request_observed"] is True
 
 
 def test_timeout_comment_keeps_nonterminal_injection_warning():

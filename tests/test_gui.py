@@ -2337,8 +2337,8 @@ class TestAutomationBatchActions:
                         "message": "后台适配参数已全部清空",
                     },
                 ) as clear_backend, patch.object(
-                    app, "_automation_comment_failure"
-                ) as comment, patch(
+                    app, "_automation_comment_review"
+                ) as review, patch(
                     "gui.fetch_google_play_install_count",
                     return_value={
                         "ok": True,
@@ -2352,12 +2352,14 @@ class TestAutomationBatchActions:
                 assert fill_asana.call_count == 2
                 fill_asana.assert_any_call()
                 fill_asana.assert_any_call(
-                    terminal_note="未识别出聚合类型，暂不适配"
+                    allow_missing_aggregation=True,
+                    terminal_note="聚合类型未确认，待人工触发广告复检",
                 )
-                clear_backend.assert_called_once_with()
-                assert comment.call_args.args[0] == "INFERRED_AGGREGATION_REPLAY_FAILED"
-                assert "未识别出聚合类型，暂不适配" in comment.call_args.args[1]
-                assert app._automation_status.cget("text") == "未识别出聚合类型，暂不适配"
+                clear_backend.assert_called_once_with(
+                    note="聚合类型未确认，待人工触发广告复检"
+                )
+                assert review.call_args.args[0] == "INFERRED_REPLAY_UNVERIFIED"
+                assert "待人工触发广告复检" in review.call_args.args[1]
         finally:
             root.destroy()
 
@@ -5011,15 +5013,23 @@ class TestSuspectedWhitePackageRule:
     @staticmethod
     def _app():
         from gui import APKToolApp
+        import threading
 
         app = object.__new__(APKToolApp)
         app._automation_current_package_name = lambda: "com.example.game"
         app._automation_log = MagicMock()
         app._safe_after = lambda _delay, callback, *args: callback(*args)
+        app._automation_stop_event = threading.Event()
+        app._automation_batch_active = False
+        app._automation_precheck_item_id = ""
+        app._automation_finish_report = MagicMock()
+        app._automation_current_task_gid = lambda: ""
+        app._automation_set_status = MagicMock()
+        app._automation_deferred_failure = None
         return app
 
     @pytest.mark.parametrize("installs", [50000, 100000, 160000, 179999])
-    def test_low_download_missing_ids_becomes_white_package(self, installs):
+    def test_low_download_explicit_max_without_ids_is_not_white(self, installs):
         app = self._app()
         detection = {
             "ok": False,
@@ -5045,10 +5055,10 @@ class TestSuspectedWhitePackageRule:
             )
 
         assert result["ok"] is False
-        assert result["code"] == "SUSPECTED_WHITE_PACKAGE"
+        assert result["code"] == "AD_IDS_EMPTY"
         assert result["fields"]["_google_play_installs"] == installs
 
-    def test_non_game_empty_detection_skips_white_package_override(self):
+    def test_low_download_native_empty_detection_becomes_white_package(self):
         app = self._app()
         detection = {
             "ok": False,
@@ -5060,13 +5070,114 @@ class TestSuspectedWhitePackageRule:
                 "归因平台": "Adjust",
             },
         }
-        with patch("gui.fetch_google_play_install_count") as fetch_installs:
+        with patch(
+            "gui.fetch_google_play_install_count",
+            return_value={"ok": True, "installs": 500, "display": "500+"},
+        ) as fetch_installs:
+            result = app._automation_apply_suspected_white_package_rule_sync(
+                detection
+            )
+
+        assert result["code"] == "SUSPECTED_WHITE_PACKAGE"
+        assert result["fields"]["_google_play_installs"] == 500
+        fetch_installs.assert_called_once_with("com.example.game")
+
+    def test_high_download_native_empty_detection_is_not_white_package(self):
+        app = self._app()
+        detection = {
+            "ok": False,
+            "code": "AGGREGATION_TYPE_EMPTY",
+            "message": "聚合类型识别为空",
+            "fields": {
+                "应用类型": "Native",
+                "最终判断": "未检测到主要聚合平台",
+                "归因平台": "Adjust",
+            },
+        }
+        with patch(
+            "gui.fetch_google_play_install_count",
+            return_value={"ok": True, "installs": 180000, "display": "180,000+"},
+        ):
             result = app._automation_apply_suspected_white_package_rule_sync(
                 detection
             )
 
         assert result["code"] == "AGGREGATION_TYPE_EMPTY"
-        fetch_installs.assert_not_called()
+
+    def test_native_with_max_key_is_not_white_package_even_at_low_downloads(self):
+        app = self._app()
+        detection = {
+            "ok": False,
+            "code": "AGGREGATION_TYPE_EMPTY",
+            "message": "聚合类型识别为空",
+            "fields": {
+                "应用类型": "Native",
+                "最终判断": "未检测到主要聚合平台",
+                "AppLovin SDK Key": "valid-key",
+                "归因平台": "Adjust",
+            },
+        }
+        with patch(
+            "gui.fetch_google_play_install_count",
+            return_value={"ok": True, "installs": 500, "display": "500+"},
+        ):
+            result = app._automation_apply_suspected_white_package_rule_sync(
+                detection
+            )
+
+        assert result["code"] == "AGGREGATION_RESULT_INCOMPLETE"
+
+    def test_native_without_install_count_does_not_guess_white_package(self):
+        app = self._app()
+        detection = {
+            "ok": False,
+            "code": "AGGREGATION_TYPE_EMPTY",
+            "message": "聚合类型识别为空",
+            "fields": {
+                "应用类型": "Native",
+                "最终判断": "未检测到主要聚合平台",
+                "归因平台": "Adjust",
+            },
+        }
+        with patch(
+            "gui.fetch_google_play_install_count",
+            return_value={"ok": False, "message": "Google Play 下载量读取失败"},
+        ):
+            result = app._automation_apply_suspected_white_package_rule_sync(
+                detection
+            )
+
+        assert result["code"] == "AGGREGATION_TYPE_EMPTY"
+        assert "_google_play_installs" not in result["fields"]
+        assert result["_white_package_check_message"] == "Google Play 下载量读取失败"
+
+    def test_inferred_replay_review_explains_unverified_install_count(self):
+        app = self._app()
+        app._automation_fields = {
+            "最终判断": "IronSource聚合（根据 video/inter 自动推断）",
+            "_aggregation_type_inferred": True,
+            "应用类型": "Native",
+            "归因平台": "Adjust",
+            "激励视频聚合id": "video",
+            "插屏聚合id": "inter",
+        }
+        app._automation_clear_inferred_backend_sync = MagicMock(
+            return_value={"ok": True, "message": "后台适配参数已清空"}
+        )
+        app._automation_fill_asana_sync = MagicMock()
+        app._automation_comment_review = MagicMock()
+        with patch(
+            "gui.fetch_google_play_install_count",
+            return_value={"ok": False, "message": "Google Play 下载量读取失败"},
+        ):
+            app._automation_handle_inferred_replay_failure_sync({
+                "ok": False,
+                "code": "REPLAY_NOT_TRIGGERED",
+                "message": "未观察到目标广告请求",
+            })
+
+        comment = app._automation_comment_review.call_args.args[1]
+        assert "疑似白包条件未核实：Google Play 下载量读取失败" in comment
 
     def test_180k_downloads_preserves_original_detection_result(self):
         app = self._app()
@@ -5129,6 +5240,52 @@ class TestSuspectedWhitePackageRule:
         )
         assert "Google Play 下载量5+" in terminal_message
         assert "临时 IronSource 回放结果：回放监听超时" in terminal_message
+        assert app._automation_complete_suspected_white_package_sync.call_args.kwargs == {
+            "clear_provisional": True
+        }
+        app._automation_clear_inferred_backend_sync.assert_not_called()
+
+    def test_dramahome_native_inferred_replay_untriggered_becomes_white_review(self):
+        app = self._app()
+        app._automation_current_package_name = lambda: "dramahome.drama.shorts"
+        app._automation_fields = {
+            "ok": True,
+            "最终判断": "IronSource聚合（根据 video/inter 自动推断）",
+            "_raw_aggregation_verdict": "未检测到主要聚合平台",
+            "_aggregation_type_inferred": True,
+            "初始Activity": "com.dramalauncher.ui.activities.LandingActivity",
+            "AppLovin SDK Key": "未找到",
+            "IronSource SDK Key": "",
+            "LevelPlay SDK Key": "未找到",
+            "应用类型": "Native",
+            "归因平台": "Adjust",
+            "激励视频聚合id": "video",
+            "插屏聚合id": "inter",
+        }
+        app._automation_complete_suspected_white_package_sync = MagicMock(
+            return_value=False
+        )
+        app._automation_clear_inferred_backend_sync = MagicMock()
+        with patch(
+            "gui.fetch_google_play_install_count",
+            return_value={"ok": True, "installs": 500, "display": "500+"},
+        ) as fetch_installs:
+            result = app._automation_handle_inferred_replay_failure_sync({
+                "ok": False,
+                "code": "REPLAY_NOT_TRIGGERED",
+                "message": "未观察到目标广告请求",
+            })
+
+        assert result is False
+        assert app._automation_fields["最终判断"] == ""
+        assert app._automation_fields["激励视频聚合id"] == ""
+        assert app._automation_fields["插屏聚合id"] == ""
+        assert app._automation_fields["_google_play_installs"] == 500
+        fetch_installs.assert_called_once_with("dramahome.drama.shorts")
+        app._automation_complete_suspected_white_package_sync.assert_called_once()
+        assert app._automation_complete_suspected_white_package_sync.call_args.kwargs == {
+            "clear_provisional": True
+        }
         app._automation_clear_inferred_backend_sync.assert_not_called()
 
     def test_failed_inferred_max_clears_backend_and_restores_empty_verdict(self):
@@ -5153,7 +5310,7 @@ class TestSuspectedWhitePackageRule:
         app._automation_replay_id_candidates = {"old": ["candidate"]}
         app._automation_render_fields = MagicMock()
         app._automation_fill_asana_sync = MagicMock()
-        app._automation_comment_business_outcome = MagicMock()
+        app._automation_comment_review = MagicMock()
         app._automation_comment_failure = MagicMock()
         app._automation_mark_failed = MagicMock()
         app._automation_set_status = MagicMock()
@@ -5173,18 +5330,16 @@ class TestSuspectedWhitePackageRule:
         assert "_max_aggregation_type_inferred" not in app._automation_fields
         assert app._automation_replay_id_candidates == {}
         app._automation_clear_inferred_backend_sync.assert_called_once_with(
-            note="聚合类型为空，但存在广告id"
+            note="MAX聚合推断未验证，待人工触发广告复检"
         )
         app._automation_fill_asana_sync.assert_called_once_with(
             allow_missing_aggregation=True,
-            terminal_note="聚合类型为空，但存在广告id",
+            terminal_note="MAX聚合推断未验证，待人工触发广告复检",
         )
-        comment = app._automation_comment_business_outcome.call_args.args
-        assert comment[0] == "MAX_INFERRED_REPLAY_FAILED"
-        assert comment[1].startswith("聚合类型为空，但存在广告id")
-        app._automation_write_sheet_outcome_sync.assert_called_once_with(
-            "not_adapted", "聚合类型为空，但存在广告id"
-        )
+        comment = app._automation_comment_review.call_args.args
+        assert comment[0] == "MAX_INFERRED_REPLAY_UNVERIFIED"
+        assert comment[1].startswith("MAX聚合推断未验证")
+        app._automation_write_sheet_outcome_sync.assert_not_called()
 
     def test_high_download_empty_aggregation_uses_w_unit_in_failure_message(self):
         app = self._app()
@@ -5211,7 +5366,7 @@ class TestSuspectedWhitePackageRule:
             "聚合类型识别为空\nGoogle Play下载量：50000w+"
         )
 
-    def test_white_package_terminal_writes_asana_backend_and_sheet(self):
+    def test_white_package_review_preserves_backend_without_terminal_sheet(self):
         import threading
 
         app = self._app()
@@ -5223,11 +5378,10 @@ class TestSuspectedWhitePackageRule:
         app._automation_stop_event = threading.Event()
         app._automation_precheck_item_id = ""
         app._automation_fill_asana_sync = MagicMock()
-        app._automation_comment_business_outcome = MagicMock()
+        app._automation_comment_review = MagicMock()
         app._automation_clear_inferred_backend_sync = MagicMock(
             return_value={"ok": True, "message": "提交并刷新成功"}
         )
-        app._automation_mark_suspected_white_package = MagicMock()
         app._automation_write_sheet_outcome_sync = MagicMock()
 
         result = app._automation_complete_suspected_white_package_sync(
@@ -5238,13 +5392,373 @@ class TestSuspectedWhitePackageRule:
         app._automation_fill_asana_sync.assert_called_once_with(
             allow_unsupported_attribution=True,
             allow_missing_aggregation=True,
-            terminal_note="疑似白包，暂不适配",
+            terminal_note="疑似白包，聚合证据不足，待人工复检",
         )
-        app._automation_comment_business_outcome.assert_called_once()
+        assert app._automation_comment_review.call_args.args[0] == (
+            "SUSPECTED_WHITE_PACKAGE_REVIEW"
+        )
+        app._automation_clear_inferred_backend_sync.assert_not_called()
+        assert "后台：未修改" in app._automation_comment_review.call_args.args[1]
+        app._automation_write_sheet_outcome_sync.assert_not_called()
+
+    def test_inferred_ironsource_timeout_is_review_not_business_rejection(self):
+        app = self._app()
+        app._automation_fields = {
+            "最终判断": "IronSource聚合（自动推断）",
+            "_aggregation_type_inferred": True,
+            "激励视频聚合id": "video",
+            "插屏聚合id": "inter",
+        }
+        app._automation_fill_asana_sync = MagicMock()
+        app._automation_clear_inferred_backend_sync = MagicMock(
+            return_value={"ok": True, "message": "已清空"}
+        )
+        app._automation_comment_review = MagicMock()
+        app._automation_comment_failure = MagicMock()
+        with patch(
+            "gui.fetch_google_play_install_count",
+            return_value={"ok": True, "installs": 180000, "display": "180,000+"},
+        ):
+            result = app._automation_handle_inferred_replay_failure_sync(
+                {"ok": False, "code": "REPLAY_NOT_TRIGGERED", "message": "未观察到广告请求"}
+            )
+
+        assert result is False
+        assert app._automation_fields["最终判断"] == ""
+        assert app._automation_fields["激励视频聚合id"] == ""
         app._automation_clear_inferred_backend_sync.assert_called_once_with(
-            note="疑似白包，暂不适配"
+            note="聚合类型未确认，待人工触发广告复检"
         )
-        app._automation_mark_suspected_white_package.assert_called_once()
-        app._automation_write_sheet_outcome_sync.assert_called_once_with(
-            "not_adapted", "疑似白包，暂不适配"
+        app._automation_fill_asana_sync.assert_called_once_with(
+            allow_missing_aggregation=True,
+            terminal_note="聚合类型未确认，待人工触发广告复检",
         )
+        assert app._automation_comment_review.call_args.args[0] == (
+            "INFERRED_REPLAY_UNVERIFIED"
+        )
+        app._automation_comment_failure.assert_not_called()
+
+    def test_logcat_ended_is_environment_review_and_stops_batch(self):
+        app = self._app()
+        app._automation_batch_active = True
+        app._automation_comment_review = MagicMock()
+
+        assert app._automation_handle_replay_environment({
+            "code": "LOGCAT_ENDED", "message": "监听进程提前结束"
+        }) is True
+        assert app._automation_comment_review.call_args.args[0] == (
+            "REPLAY_ENVIRONMENT_REVIEW"
+        )
+        assert app._automation_stop_event.is_set()
+
+    def test_device_loss_and_user_stop_are_not_package_failures(self):
+        app = self._app()
+        assert app._automation_handle_execution_exception(
+            RuntimeError("设备体检未通过: 未检测到在线设备")
+        ) is True
+        assert app._automation_last_result_code == "DEVICE_ENVIRONMENT_FAILED"
+        assert app._automation_stop_event.is_set()
+
+        stopped = self._app()
+        assert stopped._automation_handle_execution_exception(
+            RuntimeError("用户已停止自动化")
+        ) is True
+        assert stopped._automation_last_result_code == "AUTOMATION_CANCELLED"
+        assert stopped._automation_stop_event.is_set()
+
+    def test_white_package_clear_failure_does_not_write_review_description(self):
+        app = self._app()
+        app._automation_batch_active = True
+        app._automation_fill_asana_sync = MagicMock()
+        app._automation_comment_review = MagicMock()
+        app._automation_comment_failure = MagicMock()
+        app._automation_mark_failed = MagicMock()
+        app._automation_clear_inferred_backend_sync = MagicMock(
+            return_value={"ok": False, "code": "BACKEND_CLEAR_FAILED", "message": "回读不一致"}
+        )
+
+        assert app._automation_complete_suspected_white_package_sync(
+            "疑似白包，待复检", clear_provisional=True
+        ) is False
+        app._automation_fill_asana_sync.assert_not_called()
+        app._automation_comment_review.assert_not_called()
+        assert app._automation_comment_failure.call_args.args[0] == (
+            "BACKEND_CLEAR_FAILED"
+        )
+        assert app._automation_stop_event.is_set()
+
+    def test_white_package_after_provisional_submit_clears_only_that_submit(self):
+        app = self._app()
+        app._automation_fill_asana_sync = MagicMock()
+        app._automation_comment_review = MagicMock()
+        app._automation_clear_inferred_backend_sync = MagicMock(
+            return_value={"ok": True, "message": "已清空并回读"}
+        )
+
+        assert app._automation_complete_suspected_white_package_sync(
+            "疑似白包，待复检", clear_provisional=True
+        ) is False
+        app._automation_clear_inferred_backend_sync.assert_called_once_with(
+            note="疑似白包，聚合证据不足，待人工复检"
+        )
+        assert "后台：临时参数已清空" in (
+            app._automation_comment_review.call_args.args[1]
+        )
+
+    def test_inferred_max_logcat_failure_stops_after_safe_rollback(self):
+        app = self._app()
+        app._automation_batch_active = True
+        app._automation_fields = {
+            "最终判断": "MAX聚合（自动推断）",
+            "_max_aggregation_type_inferred": True,
+            "插屏聚合id": "real-id",
+        }
+        app._automation_context_version = 1
+        app._automation_replay_id_candidates = {}
+        app._automation_render_fields = MagicMock()
+        app._automation_fill_asana_sync = MagicMock()
+        app._automation_clear_inferred_backend_sync = MagicMock(
+            return_value={"ok": True, "message": "已清空并回读"}
+        )
+        app._automation_comment_review = MagicMock()
+
+        assert app._automation_handle_inferred_max_replay_failure_sync({
+            "ok": False, "code": "LOGCAT_ENDED", "message": "监听进程提前结束"
+        }) is False
+        assert app._automation_fields["插屏聚合id"] == "real-id"
+        assert app._automation_comment_review.call_args.args[0] == (
+            "MAX_INFERRED_REPLAY_UNVERIFIED"
+        )
+        assert app._automation_stop_event.is_set()
+
+    def test_cancelled_inferred_replay_rolls_back_without_asana_write(self):
+        app = self._app()
+        app._automation_stop_event.set()
+        app._automation_fields = {
+            "最终判断": "IronSource聚合（自动推断）",
+            "_aggregation_type_inferred": True,
+            "插屏聚合id": "inter",
+            "激励视频聚合id": "video",
+        }
+        app._automation_clear_inferred_backend_sync = MagicMock(
+            return_value={"ok": True, "message": "已清空"}
+        )
+        app._automation_fill_asana_sync = MagicMock()
+        app._automation_comment_review = MagicMock()
+
+        with patch("gui.fetch_google_play_install_count") as fetch_installs:
+            assert app._automation_handle_inferred_replay_failure_sync({
+                "ok": False, "code": "REPLAY_CANCELLED", "message": "用户已停止"
+            }) is False
+
+        fetch_installs.assert_not_called()
+        app._automation_clear_inferred_backend_sync.assert_called_once()
+        app._automation_fill_asana_sync.assert_not_called()
+        app._automation_comment_review.assert_not_called()
+
+
+def test_batch_checkpoint_keeps_unstarted_task_after_first_finishes(tmp_path):
+    from types import SimpleNamespace
+    from automation_checkpoint import AutomationCheckpointStore, new_batch_checkpoint
+    from gui import APKToolApp
+
+    app = object.__new__(APKToolApp)
+    app._automation_checkpoint_store = AutomationCheckpointStore(
+        str(tmp_path / "checkpoint.json")
+    )
+    queue = [
+        ("one", SimpleNamespace(package_name="com.example.one")),
+        ("two", SimpleNamespace(package_name="com.example.two")),
+    ]
+    app._automation_checkpoint = app._automation_checkpoint_store.save(
+        new_batch_checkpoint(queue, replay_timeout_seconds=300)
+    )
+    app._automation_finish_report = MagicMock()
+    app._automation_refresh_checkpoint_ui = MagicMock()
+    app._safe_after = lambda _delay, callback, *args: callback(*args)
+
+    app._automation_finish_checkpoint_task(0, success=True)
+
+    saved = app._automation_checkpoint_store.load()
+    assert saved is not None
+    assert saved["current_index"] == 1
+    assert [task["result"] for task in saved["tasks"]] == ["success", "pending"]
+
+
+def test_resume_checkpoint_includes_deferred_task_before_current_index(tmp_path):
+    from types import SimpleNamespace
+    from automation_checkpoint import AutomationCheckpointStore, new_batch_checkpoint
+    from gui import APKToolApp
+
+    app = object.__new__(APKToolApp)
+    app._automation_checkpoint_store = AutomationCheckpointStore(
+        str(tmp_path / "checkpoint.json")
+    )
+    queue = [
+        (str(index), SimpleNamespace(package_name=f"com.example.{index}"))
+        for index in range(3)
+    ]
+    checkpoint = new_batch_checkpoint(queue, replay_timeout_seconds=300)
+    checkpoint["tasks"][1]["result"] = "success"
+    checkpoint["current_index"] = 2
+    app._automation_checkpoint_store.mark_interrupted(checkpoint, "中断")
+    app._automation_access_allowed = MagicMock(return_value=True)
+    app._automation_running = False
+    app._automation_refresh_checkpoint_ui = MagicMock()
+    app._automation_set_status = MagicMock()
+    app._automation_log = MagicMock()
+    app._automation_checkpoint_item_id = lambda record: record["item_id"]
+    app._automation_start_batch_queue = MagicMock()
+    app.automation_replay_timeout_var = MagicMock()
+
+    app._automation_resume_checkpoint()
+
+    call_args = app._automation_start_batch_queue.call_args
+    assert [task.package_name for _item, task in call_args.args[0]] == [
+        "com.example.2", "com.example.0"
+    ]
+    assert call_args.kwargs["checkpoint_indices"] == [2, 0]
+
+
+def test_untriggered_replay_goes_to_review_without_failure_comment():
+    from gui import APKToolApp
+
+    app = object.__new__(APKToolApp)
+    app._automation_current_package_name = MagicMock(return_value="com.example.game")
+    app._automation_comment_replay_review = MagicMock()
+    app._automation_mark_failed = MagicMock()
+    app._automation_comment_failure = MagicMock()
+    app._automation_log = MagicMock()
+    app._automation_set_status = MagicMock()
+    app._automation_precheck_item_id = ""
+
+    app._automation_handle_replay_result({
+        "ok": False,
+        "code": "REPLAY_NOT_TRIGGERED",
+        "elapsed_seconds": 300,
+        "interstitial": {
+            "required": True, "displayed": False,
+            "request_observed": False, "errors": [],
+        },
+        "rewarded": {"required": False, "displayed": False},
+    })
+
+    assert "未观察到目标广告请求" in (
+        app._automation_comment_replay_review.call_args.args[0]
+    )
+    app._automation_mark_failed.assert_not_called()
+    app._automation_comment_failure.assert_not_called()
+
+
+def test_requested_but_unverified_replay_is_review_not_failure():
+    from gui import APKToolApp
+
+    app = object.__new__(APKToolApp)
+    app._automation_batch_active = False
+    app._automation_current_package_name = MagicMock(return_value="com.demo")
+    app._automation_comment_review = MagicMock()
+    app._automation_mark_failed = MagicMock()
+    app._automation_comment_failure = MagicMock()
+
+    app._automation_handle_replay_result({
+        "ok": False,
+        "code": "REPLAY_ID_CANDIDATES_EXHAUSTED",
+        "elapsed_seconds": 331.7,
+        "interstitial": {
+            "required": True, "displayed": False, "request_observed": True,
+            "errors": ["广告加载超时", "No Fill"],
+        },
+        "rewarded": {
+            "required": True, "displayed": True, "request_observed": True,
+            "errors": [],
+        },
+    })
+
+    args = app._automation_comment_review.call_args.args
+    assert args[0] == "REPLAY_UNVERIFIED"
+    assert "插屏广告：未检测到真实展示" in args[1]
+    assert "激励视频：回放成功" in args[1]
+    assert args[2] == "广告展示待验证"
+    app._automation_mark_failed.assert_not_called()
+    app._automation_comment_failure.assert_not_called()
+
+
+def test_batch_unverified_replay_defers_once_then_needs_review():
+    from gui import APKToolApp
+
+    app = object.__new__(APKToolApp)
+    app._automation_batch_active = True
+    app._automation_batch_attempt = 0
+    app._automation_current_package_name = MagicMock(return_value="com.demo")
+    app._automation_comment_failure = MagicMock()
+    app._automation_comment_review = MagicMock()
+    replay = {
+        "ok": False,
+        "code": "REPLAY_TIMEOUT",
+        "interstitial": {
+            "required": True, "displayed": False, "request_observed": True,
+            "errors": ["No Fill"],
+        },
+        "rewarded": {"required": False, "displayed": False},
+    }
+
+    assert app._automation_handle_unverified_replay(replay) is True
+    assert app._automation_comment_failure.call_args.args[0] == "REPLAY_UNVERIFIED"
+    app._automation_comment_review.assert_not_called()
+
+    app._automation_batch_attempt = 1
+    assert app._automation_handle_unverified_replay(replay) is True
+    assert app._automation_comment_review.call_args.args[0] == "REPLAY_UNVERIFIED"
+    assert app._automation_comment_failure.call_count == 1
+
+
+def test_replay_rotation_preserves_untriggered_result():
+    import threading
+    from ad_replay import AdReplayEvaluator, ReplayExpectation
+    from gui import APKToolApp
+
+    app = object.__new__(APKToolApp)
+    app._automation_fields = {"插屏聚合id": "inter-1"}
+    app._automation_replay_id_candidates = {"interstitial": ("inter-1",)}
+    app._automation_stop_event = threading.Event()
+    app._automation_replay_sync = MagicMock(return_value=(
+        AdReplayEvaluator(ReplayExpectation.from_values("inter-1", ""))
+        .result(timed_out=True, elapsed_seconds=300)
+    ))
+    app._safe_after = lambda _delay, callback, *args: callback(*args)
+    app._automation_log = MagicMock()
+
+    result = app._automation_replay_with_id_rotation_sync()
+
+    assert result["code"] == "REPLAY_NOT_TRIGGERED"
+    assert result["interstitial"]["request_observed"] is False
+    app._automation_replay_sync.assert_called_once_with()
+
+
+def test_replay_review_records_nonfailure_outcome():
+    from gui import APKToolApp
+
+    app = object.__new__(APKToolApp)
+    app._automation_task_outcome = ""
+    app._automation_deferred_failure = {"code": "OLD"}
+    app._automation_precheck_item_id = "item-1"
+    app._automation_finish_report = MagicMock()
+    app._automation_set_status = MagicMock()
+    app._automation_log = MagicMock()
+    app._set_precheck_task_status = MagicMock()
+    app._automation_current_task_gid = MagicMock(return_value="task-1")
+    app._automation_asana_client = MagicMock(return_value=object())
+    app._safe_after = lambda _delay, callback, *args: callback(*args)
+
+    with patch("gui.add_automation_comment_once") as add_comment:
+        app._automation_comment_replay_review("未观察到目标广告请求")
+
+    assert app._automation_task_outcome == "needs_review"
+    assert app._automation_deferred_failure is None
+    app._automation_finish_report.assert_called_once_with(
+        "needs_review", "REPLAY_NOT_TRIGGERED", "未观察到目标广告请求"
+    )
+    app._set_precheck_task_status.assert_called_once_with(
+        "item-1", "广告未触发待验证"
+    )
+    assert add_comment.call_args.args[2] == "REPLAY_NOT_TRIGGERED"

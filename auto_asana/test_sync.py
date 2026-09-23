@@ -251,6 +251,43 @@ class TestGenerateTargetDates:
 
 
 class TestAsanaPrecheckTasks:
+    @pytest.mark.parametrize("code", [
+        "BACKEND_READBACK_NOT_FOUND",
+        "BACKEND_READBACK_PAGINATION_FAILED",
+        "BACKEND_READBACK_MISMATCH",
+    ])
+    def test_backend_readback_error_is_actionable_status(self, code):
+        stages = classify_precheck_workflow_stages([{
+            "text": f"【APK Tool 自动化适配：{code}】\n回读未确认"
+        }])
+        assert stages.workflow_status == "后台回读待确认"
+        assert stages.backend_submission_status == "后台回读待确认"
+
+    @pytest.mark.parametrize("code, expected", [
+        ("INFERRED_REPLAY_UNVERIFIED", "聚合推断待复检"),
+        ("MAX_INFERRED_REPLAY_UNVERIFIED", "MAX推断待复检"),
+        ("SUSPECTED_WHITE_PACKAGE_REVIEW", "疑似白包待复检"),
+        ("REPLAY_ENVIRONMENT_REVIEW", "回放环境待复检"),
+    ])
+    def test_review_comment_supersedes_old_terminal_status(self, code, expected):
+        stories = [
+            {"text": "【APK Tool 自动化适配：SUSPECTED_WHITE_PACKAGE】\n疑似白包，暂不适配", "created_at": "2026-09-10T10:00:00Z"},
+            {"text": f"【APK Tool 自动化适配：{code}】\n待复检", "created_at": "2026-09-10T11:00:00Z"},
+        ]
+        stages = classify_precheck_workflow_stages(stories)
+        assert stages.workflow_status == expected
+        assert stages.final_business_status == ""
+
+    def test_white_package_review_records_whether_backend_was_changed(self):
+        direct = classify_precheck_workflow_stages([{
+            "text": "【APK Tool 自动化适配：SUSPECTED_WHITE_PACKAGE_REVIEW】\n后台：未修改（仅证据不足）"
+        }])
+        provisional = classify_precheck_workflow_stages([{
+            "text": "【APK Tool 自动化适配：SUSPECTED_WHITE_PACKAGE_REVIEW】\n后台：临时参数已清空并回读确认"
+        }])
+        assert direct.backend_submission_status == "后台未修改"
+        assert provisional.backend_submission_status == "临时参数已清空"
+
     def test_recheck_request_supersedes_previous_terminal_failure(self):
         stories = [
             {
@@ -316,6 +353,35 @@ class TestAsanaPrecheckTasks:
         assert stages.precheck_status == "APKCombo有包"
         assert stages.backend_submission_status == "后台提交失败"
         assert stages.workflow_status == "后台提交失败"
+
+    def test_workflow_stages_keep_partial_replay_evidence_for_review(self):
+        comment = (
+            "【APK Tool 自动化适配：REPLAY_NOT_TRIGGERED】\n"
+            "至少一种目标广告未观察到请求，无法完成验证\n"
+            "插屏广告：回放成功\n"
+            "激励视频：未观察到目标广告请求，待触发验证"
+        )
+
+        stages = classify_precheck_workflow_stages([{"text": comment}])
+
+        assert stages.workflow_status == "广告未触发待验证"
+        assert stages.terminal is True
+        assert stages.interstitial_replay_status == "回放成功"
+        assert stages.rewarded_replay_status == "未触发待验证"
+
+    def test_workflow_stages_keep_partial_display_evidence_for_review(self):
+        comment = (
+            "【APK Tool 自动化适配：REPLAY_UNVERIFIED】\n"
+            "已观察到广告请求，但本次未确认全部真实展示\n"
+            "插屏广告：回放成功\n"
+            "激励视频：未检测到真实展示"
+        )
+
+        stages = classify_precheck_workflow_stages([{"text": comment}])
+
+        assert stages.workflow_status == "广告展示待验证"
+        assert stages.interstitial_replay_status == "回放成功"
+        assert stages.rewarded_replay_status == "未确认展示"
 
     def test_clean_exit_comment_remains_actionable(self):
         comment = (
@@ -448,6 +514,10 @@ class TestAsanaPrecheckTasks:
             ("【APK Tool 自动化适配：AF_KEY_EMPTY】\naf_key为空", "af_key为空"),
             ("人工检查：af_key未找到", "af_key为空"),
             ("【APK Tool 自动化适配：AD_REPLAY_FAILED】\n未确认广告展示", "回放失败"),
+            (
+                "【APK Tool 自动化适配：REPLAY_NOT_TRIGGERED】\n广告未触发，待人工验证",
+                "广告未触发待验证",
+            ),
             (
                 "【APK Tool 自动化适配：PRECHECK_BLACKLIST_CACHE_FAILED】\n刷新缓存失败",
                 "加黑缓存刷新失败",

@@ -119,6 +119,7 @@ class AdTypeReplayState:
     expected_ids: tuple[str, ...]
     displayed: bool = False
     revenue_reported: bool = False
+    request_observed: bool = False
     evidence: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -128,6 +129,7 @@ class AdTypeReplayState:
             "expected_ids": list(self.expected_ids),
             "displayed": self.displayed,
             "revenue_reported": self.revenue_reported,
+            "request_observed": self.request_observed,
             "evidence": list(self.evidence),
             "errors": list(self.errors),
         }
@@ -197,6 +199,10 @@ class AdReplayEvaluator:
         "onUserEarnedReward",
         "Reward confirmed",
         "onAdRewarded",
+    )
+    _REQUEST_RE = re.compile(
+        r"\b(?:loadAd|showAd|loadInterstitial|showInterstitial|"
+        r"loadRewarded|showRewarded)\b", re.I
     )
     _ERROR_RULES = (
         (re.compile(r"(?:error\s*508|errorCode[\"'=:\s]+508|init\(\) must be called before)", re.I), "Error 508：SDK 未正确初始化"),
@@ -282,6 +288,15 @@ class AdReplayEvaluator:
             ad_type in self.expectation.required_types
             and ad_unit_id in self.expectation.ids_for(ad_type)
         ):
+            if not inference_only and (
+                status in {
+                    "load_start", "load_success", "load_failed",
+                    "display_start", "display_failed", "display_success",
+                }
+                or self._REQUEST_RE.search(line)
+                or any(pattern.search(line) for pattern, _message in self._ERROR_RULES)
+            ):
+                self.states[ad_type].request_observed = True
             attempt = (session_id, ad_type, ad_unit_id)
             if status in {"load_start", "display_start"}:
                 # A later status for the same session replaces its previous
@@ -337,13 +352,22 @@ class AdReplayEvaluator:
             code = "AGGREGATION_REPLAY_SUCCESS"
             message = "已配置的聚合广告均回放成功"
         elif timed_out:
-            code = "REPLAY_TIMEOUT"
+            untriggered = [
+                item for item in self.expectation.required_types
+                if not self.states[item].displayed
+                and not self.states[item].request_observed
+            ]
+            code = "REPLAY_NOT_TRIGGERED" if untriggered else "REPLAY_TIMEOUT"
             missing = [
                 "插屏" if item == INTERSTITIAL else "激励视频"
                 for item in self.expectation.required_types
                 if not self.states[item].displayed
             ]
-            message = "回放监听超时，未确认" + "、".join(missing) + "广告展示"
+            message = (
+                "监听结束，至少一种目标广告未观察到请求；需要人工触发后验证"
+                if untriggered else
+                "回放监听超时，未确认" + "、".join(missing) + "广告展示"
+            )
         else:
             code = "REPLAY_PENDING"
             message = "正在等待广告展示"
@@ -448,10 +472,23 @@ def _drain_logcat_queue(output: queue.Queue, limit: int = REPLAY_LOG_DRAIN_BATCH
 
 
 def build_replay_failure_comment(package_name: str, result: dict) -> str:
-    """Build the terminal Asana comment requested by the automation flow."""
+    """Build a replay evidence comment without overstating missing triggers."""
+    code = result.get("code")
+    untriggered = code == "REPLAY_NOT_TRIGGERED"
+    unverified = code in {
+        "REPLAY_UNVERIFIED", "REPLAY_TIMEOUT", "REPLAY_ID_CANDIDATES_EXHAUSTED"
+    }
     lines = [
-        "【APK Tool 自动化适配：AD_REPLAY_FAILED】",
-        "广告回放监听超时，自动化适配失败，需要测试人员确认",
+        "【APK Tool 自动化适配：REPLAY_NOT_TRIGGERED】"
+        if untriggered else (
+            "【APK Tool 自动化适配：REPLAY_UNVERIFIED】"
+            if unverified else "【APK Tool 自动化适配：AD_REPLAY_FAILED】"
+        ),
+        "至少一种目标广告未观察到请求，无法完成验证；请人工进入广告页面并触发后复测"
+        if untriggered else (
+            "已观察到广告请求，但本次未确认全部真实展示；聚合识别不因此失效，待延后复测或人工验证"
+            if unverified else "广告回放监听超时，自动化适配失败，需要测试人员确认"
+        ),
         f"包名：{package_name}",
         f"监听时间：{result.get('elapsed_seconds', 0)} 秒",
     ]
@@ -477,6 +514,8 @@ def build_replay_failure_comment(package_name: str, result: dict) -> str:
             lines.append(f"{label}：未配置，不要求验证")
         elif state.get("displayed"):
             lines.append(f"{label}：回放成功")
+        elif untriggered and state.get("request_observed") is False:
+            lines.append(f"{label}：未观察到目标广告请求，待触发验证")
         else:
             lines.append(f"{label}：未检测到真实展示")
             for error in state.get("errors") or []:

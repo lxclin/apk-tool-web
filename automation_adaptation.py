@@ -71,6 +71,8 @@ BACKEND_CACHE_CLEAR_URL = (
 )
 BACKEND_READBACK_ATTEMPTS = 3
 BACKEND_READBACK_DELAY_SECONDS = 1.0
+BACKEND_READBACK_PAGE_SIZE = 999
+BACKEND_READBACK_MAX_PAGES = 100
 PRECHECK_BLACKLIST_REASONS = {
     "IAP_ONLY": "应用内购，无广告，加黑",
     "JAPANESE_PACKAGE": "日本包体，加黑",
@@ -275,6 +277,47 @@ def has_any_ad_unit_id(fields: dict[str, Any] | None) -> bool:
     )
 
 
+def format_detection_review_evidence(fields: dict[str, Any] | None) -> str:
+    """Summarize missing fields and safe clues for an Asana manual review."""
+    snapshot = dict(fields or {})
+    if not snapshot:
+        return ""
+    missing = []
+    if not has_aggregation_type(snapshot):
+        missing.append("聚合类型")
+    ad_ids = {
+        "插屏": get_ad_unit_id(snapshot, "插屏聚合id"),
+        "激励视频": get_ad_unit_id(snapshot, "激励视频聚合id"),
+    }
+    if not any(ad_ids.values()):
+        missing.append("广告 ID")
+    if requires_af_key(snapshot) and not get_af_key(snapshot):
+        missing.append("af_key")
+    lines = ["复核缺失项：" + ("、".join(missing) if missing else "无；请核对证据冲突")]
+    raw_verdict = normalize_optional_parameter(
+        snapshot.get("_raw_aggregation_verdict") or snapshot.get("最终判断")
+    )
+    if raw_verdict:
+        lines.append("检测判断：" + raw_verdict[:160])
+    sdk_names = []
+    for sdk in snapshot.get("SDK列表") or []:
+        if not isinstance(sdk, dict):
+            continue
+        name = normalize_optional_parameter(sdk.get("名称"))
+        if name and name not in sdk_names:
+            sdk_names.append(name[:60])
+    if sdk_names:
+        lines.append("SDK 线索：" + "、".join(sdk_names[:6]))
+    lines.append(
+        "广告 ID 线索："
+        + "、".join(f"{kind}{'已识别' if value else '未识别'}" for kind, value in ad_ids.items())
+    )
+    attribution = normalize_optional_parameter(snapshot.get("归因平台"))
+    if attribution:
+        lines.append("归因线索：" + attribution[:100])
+    return "\n".join(lines)
+
+
 NON_GAME_APPLICATION_TYPES = {
     "native",
     "flutter",
@@ -398,7 +441,7 @@ def format_google_play_install_count_cn(value: Any) -> str:
 
 
 def is_suspected_white_package(fields: dict[str, Any] | None) -> bool:
-    """Return whether low installs and missing mediation evidence meet the rule."""
+    """Low installs are only a white-package clue when mediation evidence is absent."""
     fields = fields or {}
     try:
         installs = int(fields.get("_google_play_installs"))
@@ -406,13 +449,20 @@ def is_suspected_white_package(fields: dict[str, Any] | None) -> bool:
         return False
     if installs >= GOOGLE_PLAY_LOW_INSTALL_THRESHOLD:
         return False
-    return not has_aggregation_type(fields) or not has_any_ad_unit_id(fields)
+    return not has_aggregation_type(fields) and not has_partial_aggregation_evidence(fields)
 
 
 def has_partial_aggregation_evidence(fields: dict[str, Any] | None) -> bool:
     """Return whether progressive logs already contain mediation evidence."""
     fields = fields or {}
     if has_any_ad_unit_id(fields):
+        return True
+    if get_applovin_sdk_key(fields):
+        return True
+    if any(
+        normalize_optional_parameter(fields.get(name))
+        for name in ("IronSource SDK Key", "LevelPlay SDK Key")
+    ):
         return True
     aggregation_sdks = {
         "applovin", "max", "ironsource", "levelplay", "admob", "unityads",
@@ -445,7 +495,7 @@ def detection_field_issue(fields: dict[str, Any] | None) -> tuple[str, str] | No
         display = str((fields or {}).get("_google_play_installs_text") or "").strip()
         return (
             "SUSPECTED_WHITE_PACKAGE",
-            f"Google Play 下载量{display or '少于18万'}，且聚合类型或广告 ID 缺失，疑似白包，暂不适配",
+            f"Google Play 下载量{display or '少于18万'}，且未发现可用聚合线索，疑似白包，待复检",
         )
     if not has_aggregation_type(fields):
         if has_partial_aggregation_evidence(fields):
@@ -1334,6 +1384,19 @@ def _extract_backend_list_records(body: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _backend_list_total(body: Any) -> int | None:
+    """Return the list endpoint's total, if it supplied a usable value."""
+    if not isinstance(body, dict):
+        return None
+    data = body.get("data")
+    source = data if isinstance(data, dict) else body
+    try:
+        total = int(source.get("total"))
+    except (TypeError, ValueError):
+        return None
+    return total if total >= 0 else None
+
+
 def verify_backend_persisted_record(
     http: Any,
     *,
@@ -1345,7 +1408,7 @@ def verify_backend_persisted_record(
     delay_seconds: float = BACKEND_READBACK_DELAY_SECONDS,
     sleep=time.sleep,
 ) -> dict[str, Any]:
-    """Read the CP record back and strictly compare all submitted key fields."""
+    """Search every list page, then strictly compare submitted key fields."""
     list_url = derive_backend_list_url(api_url)
     package_name = str(payload.get("package_name") or "").strip()
     query = {
@@ -1354,8 +1417,7 @@ def verify_backend_persisted_record(
         "hide_no_up2_appid": False,
         "assign": "",
         "package_name": package_name,
-        "limit": 999,
-        "page": 1,
+        "limit": BACKEND_READBACK_PAGE_SIZE,
     }
     attempts = max(1, int(attempts))
     last_result: dict[str, Any] = {
@@ -1365,79 +1427,128 @@ def verify_backend_persisted_record(
         "url": list_url,
     }
     for attempt in range(1, attempts + 1):
-        try:
-            response = http.post(
-                list_url,
-                headers=headers,
-                json=query,
-                timeout=max(10, min(int(timeout_seconds), 120)),
-            )
-            response.raise_for_status()
-            body = response.json()
-        except requests.Timeout:
-            last_result = {
-                "ok": False,
-                "code": "BACKEND_READBACK_TIMEOUT",
-                "message": "后台参数已提交并清除缓存，但回读校验超时；不会进入聚合回放",
-                "url": list_url,
-            }
-        except (requests.RequestException, ValueError) as exc:
-            last_result = {
-                "ok": False,
-                "code": "BACKEND_READBACK_FAILED",
-                "message": f"后台参数已提交并清除缓存，但回读校验失败：{exc}",
-                "url": list_url,
-            }
-        else:
-            if not isinstance(body, dict) or body.get("code") != 200:
+        seen_pages: set[tuple[tuple[str, str], ...]] = set()
+        scanned = 0
+        for page in range(1, BACKEND_READBACK_MAX_PAGES + 1):
+            try:
+                response = http.post(
+                    list_url,
+                    headers=headers,
+                    json={**query, "page": page},
+                    timeout=max(10, min(int(timeout_seconds), 120)),
+                )
+                response.raise_for_status()
+                body = response.json()
+            except requests.Timeout:
+                last_result = {
+                    "ok": False,
+                    "code": "BACKEND_READBACK_TIMEOUT",
+                    "message": "后台参数已提交并清除缓存，但回读校验超时；不会进入聚合回放",
+                    "url": list_url,
+                }
+                break
+            except (requests.RequestException, ValueError) as exc:
+                last_result = {
+                    "ok": False,
+                    "code": "BACKEND_READBACK_FAILED",
+                    "message": f"后台参数已提交并清除缓存，但回读校验失败：{exc}",
+                    "url": list_url,
+                }
+                break
+            data = body.get("data") if isinstance(body, dict) else None
+            if (
+                not isinstance(body, dict)
+                or body.get("code") != 200
+                or (isinstance(data, dict) and data.get("code") not in (None, 200))
+            ):
                 last_result = {
                     "ok": False,
                     "code": "BACKEND_READBACK_REJECTED",
-                    "message": (
-                        "后台参数已提交并清除缓存，但回读接口返回异常："
-                        f"code={body.get('code') if isinstance(body, dict) else 'invalid'}"
-                    ),
+                    "message": "后台参数已提交并清除缓存，但回读接口返回异常",
                     "url": list_url,
                 }
-            else:
-                records = _extract_backend_list_records(body)
-                record = next(
-                    (
-                        item
-                        for item in records
-                        if str(item.get("package_name") or "").strip()
-                        == package_name
-                    ),
-                    None,
-                )
-                if record is None:
+                break
+
+            records = _extract_backend_list_records(body)
+            record = next(
+                (
+                    item for item in records
+                    if str(item.get("package_name") or "").strip() == package_name
+                ),
+                None,
+            )
+            if record is not None:
+                mismatches = _verify_backend_response_record(payload, record)
+                if not mismatches:
+                    return {
+                        "ok": True,
+                        "code": "BACKEND_READBACK_VERIFIED",
+                        "message": "CP 后台回读字段一致",
+                        "url": list_url,
+                        "record": record,
+                        "attempt": attempt,
+                        "page": page,
+                    }
+                last_result = {
+                    "ok": False,
+                    "code": "BACKEND_READBACK_MISMATCH",
+                    "message": "后台提交后回读字段不一致：" + ", ".join(mismatches),
+                    "url": list_url,
+                    "record": record,
+                    "mismatches": mismatches,
+                    "page": page,
+                }
+                break
+
+            total = _backend_list_total(body)
+            if not records:
+                if total is not None and scanned < total:
                     last_result = {
                         "ok": False,
-                        "code": "BACKEND_READBACK_NOT_FOUND",
-                        "message": f"后台提交后回读不到包名 {package_name}",
+                        "code": "BACKEND_READBACK_PAGINATION_FAILED",
+                        "message": f"后台列表第 {page} 页为空，但仍有未读取记录；不会进入聚合回放",
                         "url": list_url,
                     }
                 else:
-                    mismatches = _verify_backend_response_record(payload, record)
-                    if not mismatches:
-                        return {
-                            "ok": True,
-                            "code": "BACKEND_READBACK_VERIFIED",
-                            "message": "CP 后台回读字段一致",
-                            "url": list_url,
-                            "record": record,
-                            "attempt": attempt,
-                        }
                     last_result = {
                         "ok": False,
-                        "code": "BACKEND_READBACK_MISMATCH",
-                        "message": (
-                            "后台提交后回读字段不一致：" + ", ".join(mismatches)
-                        ),
+                        "code": "BACKEND_READBACK_NOT_FOUND",
+                        "message": f"后台提交后回读不到包名 {package_name}（已检查 {page} 页）",
                         "url": list_url,
-                        "record": record,
-                        "mismatches": mismatches,
                     }
+                break
+            fingerprint = tuple(
+                (str(item.get("id") or ""), str(item.get("package_name") or ""))
+                for item in records
+            )
+            if fingerprint in seen_pages:
+                last_result = {
+                    "ok": False,
+                    "code": "BACKEND_READBACK_PAGINATION_FAILED",
+                    "message": "后台列表分页重复，无法确认已读完全部记录；不会进入聚合回放",
+                    "url": list_url,
+                }
+                break
+            seen_pages.add(fingerprint)
+            scanned += len(records)
+            if (
+                (total is not None and scanned >= total)
+                or (total is None and len(records) < BACKEND_READBACK_PAGE_SIZE)
+            ):
+                last_result = {
+                    "ok": False,
+                    "code": "BACKEND_READBACK_NOT_FOUND",
+                    "message": f"后台提交后回读不到包名 {package_name}（已检查 {page} 页）",
+                    "url": list_url,
+                }
+                break
+        else:
+            last_result = {
+                "ok": False,
+                "code": "BACKEND_READBACK_PAGINATION_FAILED",
+                "message": "后台列表分页超过安全上限，无法确认目标包；不会进入聚合回放",
+                "url": list_url,
+            }
         if attempt < attempts and delay_seconds > 0:
             sleep(delay_seconds)
     return last_result

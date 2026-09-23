@@ -77,6 +77,7 @@ class AutomationReportStore:
                 "task_gid": task_gid,
                 "appid": appid,
                 "mode": mode,
+                "owner_pid": os.getpid(),
                 "status": "running",
                 "started_at": _now_iso(),
                 "updated_at": _now_iso(),
@@ -88,6 +89,58 @@ class AutomationReportStore:
             }
             self._write(path, report)
             return path
+
+    @staticmethod
+    def _owner_is_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            return True
+        return True
+
+    def reconcile_interrupted(self) -> int:
+        """Close reports left running by a process that has exited.
+
+        Legacy reports have no owner PID. Only yesterday's (or older) legacy
+        reports are safe to reconcile while another tool window may be open.
+        """
+        count = 0
+        today = datetime.now().astimezone().date()
+        with self._lock:
+            if not os.path.isdir(self.directory):
+                return 0
+            for root, _dirs, files in os.walk(self.directory):
+                for filename in files:
+                    if not filename.endswith(".json"):
+                        continue
+                    path = os.path.join(root, filename)
+                    report = self.load(path)
+                    if not report or report.get("status") != "running":
+                        continue
+                    pid = report.get("owner_pid")
+                    if isinstance(pid, int) and pid > 0:
+                        if self._owner_is_alive(pid):
+                            continue
+                    else:
+                        try:
+                            updated = datetime.fromisoformat(report["updated_at"])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        if updated.astimezone().date() >= today:
+                            continue
+                    try:
+                        self.finish(
+                            path,
+                            status="interrupted",
+                            result_code="AUTOMATION_INTERRUPTED",
+                            message="执行进程已结束，未记录最终结果；需要复核",
+                        )
+                    except OSError:
+                        continue
+                    count += 1
+        return count
 
     def add_event(self, path: str, stage: str, *, message: str = "", data=None) -> dict:
         with self._lock:

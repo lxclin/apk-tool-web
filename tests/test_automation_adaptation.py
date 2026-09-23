@@ -17,6 +17,7 @@ from automation_adaptation import (
     detection_field_issue,
     format_google_play_install_count_cn,
     format_aggregation_fields,
+    format_detection_review_evidence,
     has_explicit_attribution,
     has_aggregation_type,
     is_inferred_max_aggregation_result,
@@ -29,6 +30,7 @@ from automation_adaptation import (
     submit_precheck_blacklist_via_api,
     update_asana_aggregation_notes,
     validate_backend_fields,
+    verify_backend_persisted_record,
     _get_with_system_ca_retry,
 )
 
@@ -43,6 +45,24 @@ FIELDS = {
     "af_key": "af-key",
     "SDK列表": [{"名称": "AppLovin", "key": "sdk-key"}],
 }
+
+
+def test_detection_review_evidence_explains_gaps_without_leaking_sdk_keys():
+    fields = {
+        "最终判断": "未检测到主要聚合平台",
+        "_raw_aggregation_verdict": "未检测到主要聚合平台",
+        "插屏聚合id": "inter",
+        "激励视频聚合id": "",
+        "归因平台": "AppsFlyer",
+        "SDK列表": [{"名称": "AppLovin", "key": "private-sdk-key"}],
+    }
+    evidence = format_detection_review_evidence(fields)
+
+    assert "复核缺失项：聚合类型、广告 ID、af_key" in evidence
+    assert "SDK 线索：AppLovin" in evidence
+    assert "插屏未识别、激励视频未识别" in evidence
+    assert "private-sdk-key" not in evidence
+    assert fields["最终判断"] == "未检测到主要聚合平台"
 
 
 @pytest.mark.parametrize(
@@ -1583,6 +1603,208 @@ def test_api_submit_blocks_replay_when_readback_fields_do_not_match():
     assert session.post.call_count == 4
 
 
+def test_backend_readback_finds_exact_package_on_second_page():
+    payload = build_backend_submission_payload(FIELDS, "com.demo", "rain")
+    first_page = MagicMock()
+    first_page.json.return_value = {
+        "code": 200,
+        "data": {
+            "code": 200,
+            "data": [{"package_name": f"com.other.{index}"} for index in range(999)],
+            "total": 1007,
+        },
+    }
+    second_page = MagicMock()
+    second_page.json.return_value = {
+        "code": 200,
+        "data": {
+            "code": 200,
+            "data": [{"package_name": f"com.extra.{index}"} for index in range(4)]
+            + [payload]
+            + [{"package_name": f"com.extra.{index}"} for index in range(4, 7)],
+            "total": 1007,
+        },
+    }
+    session = MagicMock()
+    session.post.side_effect = [first_page, second_page]
+
+    result = verify_backend_persisted_record(
+        session,
+        api_url="http://example.test/cp_adapt/list",
+        headers={},
+        payload=payload,
+        attempts=1,
+        delay_seconds=0,
+    )
+
+    assert result["ok"] is True
+    assert result["code"] == "BACKEND_READBACK_VERIFIED"
+    assert [call.kwargs["json"]["page"] for call in session.post.call_args_list] == [1, 2]
+
+
+def test_backend_readback_second_page_still_requires_field_match():
+    payload = build_backend_submission_payload(FIELDS, "com.demo", "rain")
+    first_page = MagicMock()
+    first_page.json.return_value = {
+        "code": 200,
+        "data": {"code": 200, "data": [
+            {"package_name": f"com.other.{index}"} for index in range(999)
+        ], "total": 1000},
+    }
+    second_page = MagicMock()
+    second_page.json.return_value = {
+        "code": 200,
+        "data": {"code": 200, "data": [
+            {**payload, "aggr_chaping_id": "wrong-id"}
+        ], "total": 1000},
+    }
+    session = MagicMock()
+    session.post.side_effect = [first_page, second_page]
+
+    result = verify_backend_persisted_record(
+        session,
+        api_url="http://example.test/cp_adapt/list",
+        headers={},
+        payload=payload,
+        attempts=1,
+        delay_seconds=0,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "BACKEND_READBACK_MISMATCH"
+    assert result["mismatches"] == ["aggr_chaping_id"]
+
+
+def test_backend_readback_rejects_repeated_page_instead_of_claiming_not_found():
+    payload = build_backend_submission_payload(FIELDS, "com.demo", "rain")
+    repeated_page = MagicMock()
+    repeated_page.json.return_value = {
+        "code": 200,
+        "data": {
+            "code": 200,
+            "data": [{"package_name": f"com.other.{index}"} for index in range(999)],
+            "total": 1007,
+        },
+    }
+    session = MagicMock()
+    session.post.return_value = repeated_page
+
+    result = verify_backend_persisted_record(
+        session,
+        api_url="http://example.test/cp_adapt/list",
+        headers={},
+        payload=payload,
+        attempts=1,
+        delay_seconds=0,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "BACKEND_READBACK_PAGINATION_FAILED"
+    assert session.post.call_count == 2
+
+
+def test_backend_readback_rejects_missing_page_when_total_says_more():
+    payload = build_backend_submission_payload(FIELDS, "com.demo", "rain")
+    first_page = MagicMock()
+    first_page.json.return_value = {
+        "code": 200,
+        "data": {
+            "code": 200,
+            "data": [{"package_name": f"com.other.{index}"} for index in range(999)],
+            "total": 1007,
+        },
+    }
+    empty_second_page = MagicMock()
+    empty_second_page.json.return_value = {
+        "code": 200,
+        "data": {"code": 200, "data": [], "total": 1007},
+    }
+    session = MagicMock()
+    session.post.side_effect = [first_page, empty_second_page]
+
+    result = verify_backend_persisted_record(
+        session,
+        api_url="http://example.test/cp_adapt/list",
+        headers={},
+        payload=payload,
+        attempts=1,
+        delay_seconds=0,
+    )
+
+    assert result["code"] == "BACKEND_READBACK_PAGINATION_FAILED"
+
+
+def test_backend_readback_checks_all_pages_before_not_found():
+    payload = build_backend_submission_payload(FIELDS, "com.demo", "rain")
+    first_page = MagicMock()
+    first_page.json.return_value = {
+        "code": 200,
+        "data": {
+            "code": 200,
+            "data": [{"package_name": f"com.other.{index}"} for index in range(999)],
+            "total": 1000,
+        },
+    }
+    second_page = MagicMock()
+    second_page.json.return_value = {
+        "code": 200,
+        "data": {"code": 200, "data": [{"package_name": "com.not-target"}], "total": 1000},
+    }
+    session = MagicMock()
+    session.post.side_effect = [first_page, second_page]
+
+    result = verify_backend_persisted_record(
+        session,
+        api_url="http://example.test/cp_adapt/list",
+        headers={},
+        payload=payload,
+        attempts=1,
+        delay_seconds=0,
+    )
+
+    assert result["code"] == "BACKEND_READBACK_NOT_FOUND"
+    assert "已检查 2 页" in result["message"]
+
+
+def test_api_submit_succeeds_when_persisted_record_is_on_second_page():
+    payload = build_backend_submission_payload(FIELDS, "com.demo", "rain")
+    submit_response = MagicMock()
+    submit_response.json.return_value = {"code": 200, "data": payload}
+    first_page = MagicMock()
+    first_page.json.return_value = {
+        "code": 200,
+        "data": {
+            "code": 200,
+            "data": [{"package_name": f"com.other.{index}"} for index in range(999)],
+            "total": 1000,
+        },
+    }
+    second_page = MagicMock()
+    second_page.json.return_value = {
+        "code": 200,
+        "data": {"code": 200, "data": [payload], "total": 1000},
+    }
+    cache_response = MagicMock()
+    cache_response.json.return_value = {"code": 200, "message": "success", "data": 1}
+    session = MagicMock()
+    session.post.side_effect = [submit_response, first_page, second_page]
+    session.get.return_value = cache_response
+
+    result = submit_backend_via_api(
+        FIELDS,
+        "com.demo",
+        api_url="http://example.test/cp_adapt/list",
+        x_token="x",
+        token="fixed",
+        session=session,
+        readback_delay_seconds=0,
+    )
+
+    assert result["ok"] is True
+    assert result["backend_readback_verified"] is True
+    assert [call.kwargs["json"]["page"] for call in session.post.call_args_list[1:]] == [1, 2]
+
+
 def test_placeholder_ad_ids_are_not_treated_as_real_parameters():
     errors = validate_backend_fields(
         {
@@ -1711,7 +1933,7 @@ def test_fetches_google_play_download_bucket_from_official_page():
                 "_google_play_installs": 99999,
                 "_google_play_installs_text": "50,000+",
             },
-            "SUSPECTED_WHITE_PACKAGE",
+            "AD_IDS_EMPTY",
         ),
         (
             {
@@ -1722,7 +1944,7 @@ def test_fetches_google_play_download_bucket_from_official_page():
                 "_google_play_installs": 100000,
                 "_google_play_installs_text": "100,000+",
             },
-            "SUSPECTED_WHITE_PACKAGE",
+            "AD_IDS_EMPTY",
         ),
     ],
 )
@@ -1739,7 +1961,7 @@ def test_white_package_180k_boundary(installs, expected):
     assert detection_field_issue(complete_fields) is None
 
 
-def test_white_package_assessment_is_note_only_terminal_outcome():
+def test_explicit_max_without_ids_is_not_mislabeled_white_package():
     fields = {
         "最终判断": "MAX聚合",
         "归因平台": "Adjust",
@@ -1751,10 +1973,23 @@ def test_white_package_assessment_is_note_only_terminal_outcome():
 
     assessment = build_aggregation_assessment(fields)
 
-    assert assessment["terminal_outcome"] == "suspected_white_package"
-    assert assessment["submit_mode"] == "note_only"
-    assert assessment["auto_submit"] is True
+    assert assessment["terminal_outcome"] == ""
+    assert assessment["auto_submit"] is False
+    assert detection_field_issue(fields)[0] == "AD_IDS_EMPTY"
     assert "Google Play下载量:10,000+" in format_aggregation_fields(fields)
+
+
+def test_low_install_with_ad_id_or_sdk_key_is_not_called_white_package():
+    base = {
+        "最终判断": "",
+        "归因平台": "Adjust",
+        "_google_play_installs": 500,
+    }
+    with_id = dict(base, **{"插屏聚合id": "inter-123"})
+    with_sdk_key = dict(base, **{"AppLovin SDK Key": "valid-sdk-key"})
+
+    assert detection_field_issue(with_id)[0] == "AGGREGATION_RESULT_INCOMPLETE"
+    assert detection_field_issue(with_sdk_key)[0] == "AGGREGATION_RESULT_INCOMPLETE"
 
 
 def test_asana_update_allows_missing_aggregation_for_white_package_terminal():

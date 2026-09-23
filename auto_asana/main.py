@@ -170,6 +170,13 @@ _AUTOMATION_CODE_STATUSES = {
     "UNSUPPORTED_ATTRIBUTION": "其他归因",
     "UNSUPPORTED_AGGREGATION": "TradPlus暂不适配",
     "SUSPECTED_WHITE_PACKAGE": "疑似白包",
+    "SUSPECTED_WHITE_PACKAGE_REVIEW": "疑似白包待复检",
+    "INFERRED_REPLAY_UNVERIFIED": "聚合推断待复检",
+    "MAX_INFERRED_REPLAY_UNVERIFIED": "MAX推断待复检",
+    "REPLAY_ENVIRONMENT_REVIEW": "回放环境待复检",
+    "LOGCAT_ENDED": "回放环境待复检",
+    "APP_RUNTIME_INJECTION_FAILED": "回放环境待复检",
+    "REPLAY_EXCEPTION": "回放环境待复检",
     "AGGREGATION_TYPE_EMPTY": "参数待确认",
     "AGGREGATION_RESULT_INCOMPLETE": "参数待确认",
     "AF_KEY_EMPTY": "af_key为空",
@@ -177,6 +184,12 @@ _AUTOMATION_CODE_STATUSES = {
     "BACKEND_VALIDATION_FAILED": "参数待确认",
     "BACKEND_SUBMIT_FAILED": "后台提交失败",
     "BACKEND_SUBMIT_TIMEOUT": "后台提交失败",
+    "BACKEND_READBACK_NOT_FOUND": "后台回读待确认",
+    "BACKEND_READBACK_MISMATCH": "后台回读待确认",
+    "BACKEND_READBACK_PAGINATION_FAILED": "后台回读待确认",
+    "BACKEND_READBACK_TIMEOUT": "后台回读待确认",
+    "BACKEND_READBACK_FAILED": "后台回读待确认",
+    "BACKEND_READBACK_REJECTED": "后台回读待确认",
     "BACKEND_CACHE_CLEAR_TIMEOUT": "缓存清除失败",
     "BACKEND_CACHE_CLEAR_FAILED": "缓存清除失败",
     "BACKEND_CACHE_CLEAR_REJECTED": "缓存清除失败",
@@ -193,6 +206,8 @@ _AUTOMATION_CODE_STATUSES = {
     "PRECHECK_BLACKLIST_READBACK_FAILED": "加黑回读失败",
     "AD_REPLAY_FAILED": "回放失败",
     "REPLAY_TIMEOUT": "回放失败",
+    "REPLAY_NOT_TRIGGERED": "广告未触发待验证",
+    "REPLAY_UNVERIFIED": "广告展示待验证",
     "APP_CRASHED": "包体闪退",
     "G99_APP_CRASHED": "包体闪退",
     # A missing process without target-specific crash evidence is reviewable;
@@ -393,6 +408,30 @@ def classify_precheck_workflow_stages(
                 aggregation_detection_status = "疑似白包"
                 backend_submission_status = "提交成功"
                 final_business_status = "疑似白包"
+            elif code == "SUSPECTED_WHITE_PACKAGE_REVIEW":
+                aggregation_detection_status = "疑似白包待复检"
+                backend_submission_status = (
+                    "临时参数已清空"
+                    if "后台：临时参数已清空" in text
+                    else "后台未修改"
+                )
+                final_business_status = ""
+            elif code in {
+                "INFERRED_REPLAY_UNVERIFIED",
+                "MAX_INFERRED_REPLAY_UNVERIFIED",
+            }:
+                aggregation_detection_status = "聚合推断待复检"
+                backend_submission_status = "临时参数已清空"
+                final_business_status = ""
+            elif code in {
+                "REPLAY_ENVIRONMENT_REVIEW",
+                "LOGCAT_ENDED",
+                "APP_RUNTIME_INJECTION_FAILED",
+                "REPLAY_EXCEPTION",
+            }:
+                interstitial_replay_status = "环境异常待复检"
+                rewarded_replay_status = "环境异常待复检"
+                final_business_status = ""
             elif code in {
                 "AGGREGATION_TYPE_EMPTY",
                 "AGGREGATION_RESULT_INCOMPLETE",
@@ -410,6 +449,35 @@ def classify_precheck_workflow_stages(
             elif code in {"AD_REPLAY_FAILED", "REPLAY_TIMEOUT"}:
                 interstitial_replay_status = "回放失败"
                 rewarded_replay_status = "回放失败"
+            elif code == "REPLAY_NOT_TRIGGERED":
+                for label, field in (
+                    ("插屏广告", "interstitial"),
+                    ("激励视频", "rewarded"),
+                ):
+                    value = (
+                        "回放成功" if f"{label}：回放成功" in text
+                        else "未触发待验证" if f"{label}：未观察到目标广告请求" in text
+                        else "未确认展示" if f"{label}：未检测到真实展示" in text
+                        else ""
+                    )
+                    if field == "interstitial":
+                        interstitial_replay_status = value
+                    else:
+                        rewarded_replay_status = value
+            elif code == "REPLAY_UNVERIFIED":
+                for label, field in (
+                    ("插屏广告", "interstitial"),
+                    ("激励视频", "rewarded"),
+                ):
+                    value = (
+                        "回放成功" if f"{label}：回放成功" in text
+                        else "未确认展示" if f"{label}：未检测到真实展示" in text
+                        else ""
+                    )
+                    if field == "interstitial":
+                        interstitial_replay_status = value
+                    else:
+                        rewarded_replay_status = value
             elif code in {
                 "APP_CRASHED",
                 "G99_APP_CRASHED",

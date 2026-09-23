@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from automation_checkpoint import (
     AutomationCheckpointStore,
     new_batch_checkpoint,
+    pending_task_indexes,
     resumable_summary,
     validate_checkpoint,
 )
@@ -54,6 +55,22 @@ def test_checkpoint_marks_interrupted_without_losing_safe_stage(tmp_path):
     assert interrupted["stage"] == "backend_verified"
     assert interrupted["last_error"] == "窗口关闭"
     assert "后台已生效" in resumable_summary(store.load())
+
+
+def test_pending_tasks_include_unstarted_and_earlier_deferred_retry():
+    checkpoint = new_batch_checkpoint(
+        [
+            ("one", _task("com.example.one")),
+            ("two", _task("com.example.two")),
+            ("three", _task("com.example.three")),
+        ],
+        replay_timeout_seconds=300,
+    )
+    checkpoint["tasks"][1]["result"] = "success"
+    checkpoint["current_index"] = 2
+
+    assert pending_task_indexes(checkpoint) == [0, 2]
+    assert "剩余 2 个" in resumable_summary(checkpoint)
 
 
 def test_invalid_or_corrupt_checkpoint_is_not_resumed(tmp_path):

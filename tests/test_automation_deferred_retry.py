@@ -29,3 +29,4 @@ def test_retry_delay_is_shorter_for_parameters_than_replay():
     assert deferred_retry_delay_seconds("APP_LAUNCH_NOT_CONFIRMED") == 120
     assert deferred_retry_delay_seconds("AD_REPLAY_FAILED") == 300
     assert deferred_retry_delay_seconds("REPLAY_TIMEOUT") == 300
+    assert deferred_retry_delay_seconds("REPLAY_UNVERIFIED") == 300

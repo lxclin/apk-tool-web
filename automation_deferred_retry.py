@@ -17,6 +17,7 @@ DEFERRED_RETRYABLE_CODES = frozenset(
         "APP_EXITED_DURING_AUTOMATION",
         "AD_REPLAY_FAILED",
         "REPLAY_TIMEOUT",
+        "REPLAY_UNVERIFIED",
     }
 )
 
@@ -24,6 +25,7 @@ REPLAY_DEFERRED_RETRY_CODES = frozenset(
     {
         "AD_REPLAY_FAILED",
         "REPLAY_TIMEOUT",
+        "REPLAY_UNVERIFIED",
     }
 )
 

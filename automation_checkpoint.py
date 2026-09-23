@@ -30,6 +30,15 @@ SAFE_RESUME_STAGES = frozenset(
 )
 
 
+def pending_task_indexes(data: dict) -> list[int]:
+    """Return every unfinished task, including tasks waiting for a retry."""
+    return [
+        index
+        for index, task in enumerate(data.get("tasks") or [])
+        if str(task.get("result") or "").strip().lower() in {"", "pending"}
+    ]
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -56,6 +65,7 @@ def task_record(item_id: str, task: Any) -> dict:
         "notes": str(getattr(task, "notes", "") or ""),
         "completed": bool(getattr(task, "completed", False)),
         "result": "pending",
+        "attempt": 0,
         "message": "",
     }
 
@@ -102,6 +112,8 @@ def validate_checkpoint(data: Any) -> dict | None:
     for task in tasks:
         if not isinstance(task, dict) or not str(task.get("package_name") or "").strip():
             return None
+    if data.get("status") in ACTIVE_STATUSES and not pending_task_indexes(data):
+        return None
     return deepcopy(data)
 
 
@@ -111,7 +123,7 @@ def resumable_summary(data: dict | None) -> str:
         return ""
     index = checkpoint["current_index"]
     task = checkpoint["tasks"][index]
-    remaining = len(checkpoint["tasks"]) - index
+    remaining = len(pending_task_indexes(checkpoint))
     stage_labels = {
         "queued": "等待开始",
         "preparing": "ADB 前置",

@@ -64,6 +64,39 @@ def test_action_only_failure_is_not_counted_as_aggregation_issue():
     assert result["aggregation_state"] == ""
 
 
+def test_untriggered_replay_is_review_not_adaptation_failure():
+    result = classify_task_comments(
+        "com.demo",
+        [DailyComment(
+            "【APK Tool 自动化适配：REPLAY_NOT_TRIGGERED】\n"
+            "目标广告请求未出现，需要人工触发验证"
+        )],
+    )
+
+    assert result["aggregation_state"] == "review"
+    assert result["aggregation_reason"] == "广告未触发，待人工验证"
+    summary = render_daily_summary(
+        date(2026, 9, 23), [],
+        [{"package_name": "com.demo", "state": "review", "reason": result["aggregation_reason"]}],
+        [],
+    )
+    assert "1个待人工验证" in summary
+    assert "com.demo：广告未触发，待人工验证" in summary
+
+
+def test_unverified_replay_is_review_not_not_adapted():
+    result = classify_task_comments(
+        "com.demo",
+        [DailyComment(
+            "【APK Tool 自动化适配：REPLAY_UNVERIFIED】\n"
+            "已观察到广告请求，但本次未确认全部真实展示；待复测"
+        )],
+    )
+
+    assert result["aggregation_state"] == "review"
+    assert result["aggregation_reason"] == "广告展示未验证，待复测"
+
+
 def test_action_success_wording_is_counted():
     result = classify_task_comments(
         "com.arrow.romantic.puzzle.goddess",
@@ -204,6 +237,22 @@ def test_later_success_supersedes_structured_terminal_failure():
 
     assert result["aggregation_state"] == "success"
     assert result["aggregation_reason"] == ""
+
+
+@pytest.mark.parametrize("code", [
+    "INFERRED_REPLAY_UNVERIFIED",
+    "MAX_INFERRED_REPLAY_UNVERIFIED",
+    "SUSPECTED_WHITE_PACKAGE_REVIEW",
+    "REPLAY_ENVIRONMENT_REVIEW",
+])
+def test_review_outcomes_do_not_count_as_not_adapted(code):
+    result = classify_task_comments(
+        "com.demo",
+        [DailyComment(
+            f"【APK Tool 自动化适配：{code}】\n原回放日志含有暂不适配旧文案"
+        )],
+    )
+    assert result["aggregation_state"] == "review"
 
 
 def test_skip_adaptation_wording_is_normalized_for_daily_report():
