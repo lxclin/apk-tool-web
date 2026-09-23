@@ -19,9 +19,11 @@ from automation_adaptation import (
     format_aggregation_fields,
     has_explicit_attribution,
     has_aggregation_type,
+    is_inferred_max_aggregation_result,
     derive_backend_list_url,
     derive_backend_submit_url,
     merge_aggregation_fields_into_notes,
+    non_game_empty_backend_note,
     clear_backend_adaptation_via_api,
     submit_backend_via_api,
     submit_precheck_blacklist_via_api,
@@ -41,6 +43,35 @@ FIELDS = {
     "af_key": "af-key",
     "SDK列表": [{"名称": "AppLovin", "key": "sdk-key"}],
 }
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        (
+            {"应用类型": "Native", "最终判断": "未检测到主要聚合平台"},
+            "聚合类型识别为空",
+        ),
+        (
+            {"应用类型": "Flutter", "最终判断": "MAX聚合"},
+            "聚合id识别为空",
+        ),
+        (
+            {"应用类型": "Unity", "最终判断": ""},
+            "",
+        ),
+        (
+            {
+                "应用类型": "ReactNative",
+                "最终判断": "AdMob聚合",
+                "插屏聚合id": "inter-1",
+            },
+            "",
+        ),
+    ],
+)
+def test_non_game_empty_backend_note(fields, expected):
+    assert non_game_empty_backend_note(fields) == expected
 
 
 @pytest.mark.parametrize(
@@ -698,6 +729,57 @@ def test_empty_verdict_with_exact_video_inter_pair_is_inferred_as_ironsource():
     assert assessment["method"] == "业务规则推断"
     assert assessment["auto_submit"] is True
     assert "AutoDetector 原始最终判断为空" in assessment["evidence"]
+
+
+def test_empty_verdict_with_applovin_key_and_ids_is_provisionally_max():
+    fields = {
+        "ok": True,
+        "最终判断": "未检测到主要聚合平台",
+        "初始Activity": "com.unity3d.player.UnityPlayerActivity",
+        "AppLovin SDK Key": "S-97vthZQs06t7HeooDap3KnwTWEmpBD",
+        "应用类型": "Unity",
+        "激励视频聚合id": "c5a7a5dc511d56ca",
+        "插屏聚合id": "01d45146cc1f9fc4",
+        "归因平台": "Adjust",
+    }
+
+    result = detect_aggregation_with_one_retry(
+        "com.fs.block",
+        MagicMock(),
+        first_fields=fields,
+        restart_app=MagicMock(),
+        wait_seconds=0,
+    )
+
+    assert result["ok"] is True
+    assert result["attempts"] == 1
+    assert result["fields"]["最终判断"].startswith("MAX聚合")
+    assert is_inferred_max_aggregation_result(result["fields"]) is True
+    assessment = build_aggregation_assessment(result["fields"])
+    assert assessment["confidence"] == "中"
+    assert assessment["auto_submit"] is True
+    assert validate_backend_fields(result["fields"], "com.fs.block") == []
+    payload = build_backend_submission_payload(
+        result["fields"], "com.fs.block", "rain"
+    )
+    assert payload["aggr_platform"] == "max"
+    assert payload["aggr_chaping_id"] == "01d45146cc1f9fc4"
+    assert payload["aggr_jilishipin_id"] == "c5a7a5dc511d56ca"
+
+
+def test_ids_without_applovin_key_do_not_infer_max():
+    fields = {
+        "最终判断": "未检测到主要聚合平台",
+        "初始Activity": "MainActivity",
+        "应用类型": "Unity",
+        "插屏聚合id": "interstitial-123",
+        "激励视频聚合id": "rewarded-123",
+        "归因平台": "Adjust",
+    }
+
+    assert has_aggregation_type(fields) is False
+    assert fields["最终判断"] == ""
+    assert fields.get("_max_aggregation_type_inferred") is not True
 
 
 def test_reconcile_stale_incomplete_result_uses_final_video_inter_fields():

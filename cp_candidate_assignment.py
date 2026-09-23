@@ -14,9 +14,11 @@ from auto_asana.main import fetch_cp_adapt_records
 from private_features import require_private_feature
 
 
-BASE_SUCCESS_RATE = 41
-RECOMMENDED_SCORE = 55
-HISTORICAL_PRIOR_SAMPLE_SIZE = 10
+BASE_SUCCESS_RATE = 58
+RECOMMENDED_SCORE = 70
+HISTORICAL_PRIOR_SAMPLE_SIZE = 20
+TOKEN_PRIOR_SAMPLE_SIZE = 15
+MIN_TOKEN_SAMPLE_SIZE = 12
 
 GAME_PATTERN = re.compile(
     r"game|puzzle|sort|match|color|arrow|mahjong|solitaire|dice|ball|"
@@ -35,13 +37,24 @@ UP2_APPID_PATTERN = re.compile(r"^(?:A2:)?[0-9a-f]{32}$", re.I)
 CP_PRIORITY_RANK = {"高": 0, "中": 1, "低": 2}
 
 FALLBACK_CATEGORY_RATES = {
-    "日本包体": 0,
-    "博彩/老虎机": 8,
-    "工具/清理": 18,
-    "游戏/益智": 59,
-    "奖励/赚钱": 50,
-    "社交/媒体": 47,
-    "普通包名": BASE_SUCCESS_RATE,
+    "日本包体": 7,
+    "博彩/老虎机": 56,
+    "工具/清理": 38,
+    "游戏/益智": 78,
+    "奖励/赚钱": 57,
+    "社交/媒体": 59,
+    "普通包名": 48,
+}
+
+PACKAGE_TOKEN_STOPWORDS = {
+    "android",
+    "app",
+    "apps",
+    "com",
+    "game",
+    "games",
+    "mobile",
+    "studio",
 }
 
 
@@ -63,23 +76,37 @@ def classify_package_category(package_name: str) -> str:
     return "普通包名"
 
 
+def classify_candidate_category(package_name: str, large_category: str = "") -> str:
+    """Prefer the backend's explicit GAME category over package-name guesses."""
+    package_category = classify_package_category(package_name)
+    if package_category == "日本包体":
+        return package_category
+    normalized = re.sub(
+        r"[^A-Z0-9]+", "_", str(large_category or "").upper()
+    ).strip("_")
+    if normalized == "GAME" or normalized.startswith("GAME_"):
+        return "游戏/益智"
+    return package_category
+
+
 def _normalized_header(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or ""))
 
 
-def build_historical_success_profile(
-    sheet_data: list[list[Any]],
-    *,
-    assignee: str = "snow",
-) -> dict[str, dict[str, Any]]:
-    """Build category success rates from resolved aggregation rows in Sheet.
+def _package_tokens(package_name: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(package_name or "").casefold())
+        if len(token) >= 3 and token not in PACKAGE_TOKEN_STOPWORDS
+    }
 
-    Only ``已适配`` is a success. ``暂不适配`` and ``A2关闭`` are resolved
-    failures. Pending/blank rows are intentionally excluded so an unfinished
-    workday cannot lower the score.
-    """
+
+def _resolved_sheet_outcomes(
+    sheet_data: list[list[Any]], assignees: Iterable[str]
+) -> list[tuple[str, bool]]:
+    """Extract resolved package outcomes from one chronological Sheet tab."""
     if not sheet_data:
-        return {}
+        return []
     header_row = next(
         (
             index
@@ -90,13 +117,13 @@ def build_historical_success_profile(
         None,
     )
     if header_row is None:
-        return {}
+        return []
     headers = [_normalized_header(value) for value in sheet_data[header_row]]
     try:
         package_col = headers.index("包名")
         owner_col = headers.index("聚合适配")
     except ValueError:
-        return {}
+        return []
     status_col = next(
         (
             index
@@ -106,65 +133,131 @@ def build_historical_success_profile(
         None,
     )
     if status_col is None:
-        return {}
+        return []
     issue_col = next(
         (index for index, header in enumerate(headers) if header == "适配所遇问题"),
         None,
     )
-
-    counts: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"success": 0, "total": 0}
-    )
-    target_assignee = str(assignee or "snow").strip().casefold()
+    allowed_assignees = {
+        str(value or "").strip().casefold()
+        for value in assignees
+        if str(value or "").strip()
+    }
+    outcomes: list[tuple[str, bool]] = []
     for row in sheet_data[header_row + 1 :]:
         owner = str(row[owner_col] if owner_col < len(row) else "").strip().casefold()
         status = str(row[status_col] if status_col < len(row) else "").strip()
-        if owner != target_assignee or status not in {"已适配", "暂不适配", "A2关闭"}:
+        if owner not in allowed_assignees or status not in {
+            "已适配",
+            "暂不适配",
+            "A2关闭",
+        }:
             continue
         issue = str(
             row[issue_col] if issue_col is not None and issue_col < len(row) else ""
         ).strip()
-        # TradPlus is supported now. Historical rows created while it was an
-        # unsupported platform are not evidence about today's success rate.
         if "tradplus" in issue.casefold() and status != "已适配":
             continue
-        package_name = str(
-            row[package_col] if package_col < len(row) else ""
-        ).strip()
-        if not package_name:
-            continue
+        package_name = str(row[package_col] if package_col < len(row) else "").strip()
+        if package_name:
+            outcomes.append((package_name, status == "已适配"))
+    return outcomes
+
+
+def _profile_from_outcomes(
+    outcomes: Iterable[tuple[str, bool]], *, assignees: Iterable[str]
+) -> dict[str, dict[str, Any]]:
+    """Build de-duplicated category and token statistics."""
+    latest_by_package: dict[str, tuple[str, bool]] = {}
+    for package_name, succeeded in outcomes:
+        latest_by_package[package_name.casefold()] = (package_name, bool(succeeded))
+    resolved = list(latest_by_package.values())
+    counts: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"success": 0, "total": 0}
+    )
+    token_counts: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"success": 0, "total": 0}
+    )
+    for package_name, succeeded in resolved:
         category = classify_package_category(package_name)
         counts[category]["total"] += 1
-        if status == "已适配":
-            counts[category]["success"] += 1
+        counts[category]["success"] += int(succeeded)
+        for token in _package_tokens(package_name):
+            token_counts[token]["total"] += 1
+            token_counts[token]["success"] += int(succeeded)
 
-    resolved_total = sum(item["total"] for item in counts.values())
-    resolved_success = sum(item["success"] for item in counts.values())
+    resolved_total = len(resolved)
+    resolved_success = sum(int(succeeded) for _, succeeded in resolved)
     base_rate = (
-        resolved_success / resolved_total if resolved_total else BASE_SUCCESS_RATE / 100
+        resolved_success / resolved_total
+        if resolved_total
+        else BASE_SUCCESS_RATE / 100
     )
     profile: dict[str, dict[str, Any]] = {}
     for category, item in counts.items():
-        total = item["total"]
-        success = item["success"]
-        # Small groups (for example a few casino packages) are shrunk toward
-        # the overall rate instead of being presented as a misleading 0/100%.
-        adjusted_rate = (
-            success + base_rate * HISTORICAL_PRIOR_SAMPLE_SIZE
-        ) / (total + HISTORICAL_PRIOR_SAMPLE_SIZE)
+        total, success = item["total"], item["success"]
+        adjusted_rate = (success + base_rate * HISTORICAL_PRIOR_SAMPLE_SIZE) / (
+            total + HISTORICAL_PRIOR_SAMPLE_SIZE
+        )
         profile[category] = {
             "success": success,
             "total": total,
-            "raw_rate": round(success * 100 / total) if total else 0,
+            "raw_rate": round(success * 100 / total),
             "score": round(adjusted_rate * 100),
         }
+    token_profile: dict[str, dict[str, Any]] = {}
+    for token, item in token_counts.items():
+        total, success = item["total"], item["success"]
+        if total < MIN_TOKEN_SAMPLE_SIZE:
+            continue
+        adjusted_rate = (success + base_rate * TOKEN_PRIOR_SAMPLE_SIZE) / (
+            total + TOKEN_PRIOR_SAMPLE_SIZE
+        )
+        token_profile[token] = {
+            "success": success,
+            "total": total,
+            "raw_rate": round(success * 100 / total),
+            "score": round(adjusted_rate * 100),
+        }
+    labels = [str(value).strip() for value in assignees if str(value).strip()]
+    profile["__tokens__"] = token_profile
     profile["__overall__"] = {
         "success": resolved_success,
         "total": resolved_total,
         "raw_rate": round(base_rate * 100),
         "score": round(base_rate * 100),
+        "assignees": "+".join(labels),
     }
     return profile
+
+
+def build_historical_success_profile(
+    sheet_data: list[list[Any]],
+    *,
+    assignee: str = "snow",
+) -> dict[str, dict[str, Any]]:
+    """Build category success rates from one Sheet tab.
+
+    Only ``已适配`` is a success. ``暂不适配`` and ``A2关闭`` are resolved
+    failures. Pending/blank rows are intentionally excluded so an unfinished
+    workday cannot lower the score.
+    """
+    assignees = (str(assignee or "snow").strip(),)
+    outcomes = _resolved_sheet_outcomes(sheet_data, assignees)
+    return _profile_from_outcomes(outcomes, assignees=assignees)
+
+
+def build_historical_success_profile_from_sheets(
+    sheet_datasets: Iterable[list[list[Any]]],
+    *,
+    assignees: Iterable[str] = ("rain", "snow"),
+) -> dict[str, dict[str, Any]]:
+    """Build one profile from all chronological tabs and both operators."""
+    assignees = tuple(assignees)
+    outcomes: list[tuple[str, bool]] = []
+    for sheet_data in sheet_datasets:
+        outcomes.extend(_resolved_sheet_outcomes(sheet_data, assignees))
+    return _profile_from_outcomes(outcomes, assignees=assignees)
 
 
 def extract_up2_appid(value: Any) -> str:
@@ -226,7 +319,7 @@ def score_cp_candidate(
     has_ads = backend_flag_enabled(record.get("contains_ads"))
     priority = normalize_cp_priority(record.get("priority"))
     reasons: list[str] = []
-    category = classify_package_category(package_name)
+    category = classify_candidate_category(package_name, large_category)
     score = FALLBACK_CATEGORY_RATES[category]
     historical = (historical_profile or {}).get(category) or {}
     if category == "日本包体":
@@ -234,12 +327,42 @@ def score_cp_candidate(
         reasons.append("jp. 前缀按现有规则不推荐适配")
     elif historical.get("total"):
         score = int(historical.get("score", score))
+        history_label = str(
+            ((historical_profile or {}).get("__overall__") or {}).get("assignees")
+            or "历史"
+        )
         reasons.append(
-            f"Snow 历史 {historical['success']}/{historical['total']} 成功"
+            f"{history_label}历史 {historical['success']}/{historical['total']} 成功"
             f"（原始 {historical.get('raw_rate', score)}%，小样本已校正）"
         )
     else:
         reasons.append(f"未读到有效历史样本，使用内置基准 {score}%")
+    if category == "游戏/益智" and large_category and not GAME_PATTERN.search(
+        package_name
+    ):
+        reasons.append(f"后台大分类 {large_category} 确认为游戏")
+
+    token_profile = (historical_profile or {}).get("__tokens__") or {}
+    token_matches = [
+        (token, token_profile[token])
+        for token in _package_tokens(package_name)
+        if token in token_profile
+    ]
+    if category != "日本包体" and token_matches:
+        strongest_token, strongest = max(
+            token_matches,
+            key=lambda item: (
+                int(item[1].get("score", 0)),
+                int(item[1].get("total", 0)),
+            ),
+        )
+        token_score = int(strongest.get("score", 0))
+        if token_score > score:
+            score = token_score
+            reasons.append(
+                f"包名词 {strongest_token} 历史 {strongest['success']}/"
+                f"{strongest['total']} 成功，校正评分 {token_score}%"
+            )
 
     eligible = True
     if not package_name:

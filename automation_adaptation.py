@@ -64,6 +64,8 @@ def is_negative_aggregation_verdict(value: Any) -> bool:
     )
     return any(marker.casefold() in compact for marker in negative_markers)
 INFERRED_AGGREGATION_FAILURE_NOTE = "未识别出聚合类型，暂不适配"
+INFERRED_MAX_VERDICT = "MAX聚合（根据 AppLovin SDK Key 与广告 ID 自动推断）"
+INFERRED_MAX_FAILURE_NOTE = "聚合类型为空，但存在广告id"
 BACKEND_CACHE_CLEAR_URL = (
     "https://a2-2.hilong.vip/a2/delete_a2_package_cache"
 )
@@ -119,7 +121,7 @@ def _get_with_system_ca_retry(http: Any, url: str, **kwargs):
 def apply_aggregation_type_fallback(
     fields: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Infer IronSource only from its exact standard placement-name pair."""
+    """Apply guarded IronSource and AppLovin MAX provisional inferences."""
     if not isinstance(fields, dict):
         return fields
     verdict = normalize_optional_parameter(fields.get("最终判断"))
@@ -127,6 +129,7 @@ def apply_aggregation_type_fallback(
         fields.setdefault("_raw_aggregation_verdict", verdict)
         fields["最终判断"] = ""
         fields.pop("_aggregation_type_inferred", None)
+        fields.pop("_max_aggregation_type_inferred", None)
         verdict = ""
     if verdict:
         # A later AutoDetector pass can replace an earlier provisional
@@ -134,12 +137,33 @@ def apply_aggregation_type_fallback(
         # stale inference marker attached to that authoritative result.
         if verdict != INFERRED_IRONSOURCE_VERDICT:
             fields.pop("_aggregation_type_inferred", None)
+        if verdict != INFERRED_MAX_VERDICT:
+            fields.pop("_max_aggregation_type_inferred", None)
         return fields
     rewarded = normalize_optional_parameter(fields.get("激励视频聚合id")).casefold()
     interstitial = normalize_optional_parameter(fields.get("插屏聚合id")).casefold()
     if rewarded == "video" and interstitial == "inter":
         fields["最终判断"] = INFERRED_IRONSOURCE_VERDICT
         fields["_aggregation_type_inferred"] = True
+        return fields
+    app_lovin_key = get_applovin_sdk_key(fields)
+    activity = normalize_optional_parameter(fields.get("初始Activity"))
+    attribution = normalize_optional_parameter(fields.get("归因平台"))
+    compact_attribution = attribution.casefold().replace(" ", "")
+    supported_attribution = (
+        "adjust" in compact_attribution or "appsflyer" in compact_attribution
+    )
+    attribution_complete = supported_attribution and (
+        "appsflyer" not in compact_attribution or bool(get_af_key(fields))
+    )
+    usable_ids = [
+        value
+        for value in (rewarded, interstitial)
+        if value and value not in INVALID_AD_ID_VALUES
+    ]
+    if app_lovin_key and activity and attribution_complete and usable_ids:
+        fields["最终判断"] = INFERRED_MAX_VERDICT
+        fields["_max_aggregation_type_inferred"] = True
     return fields
 
 
@@ -150,6 +174,30 @@ def is_inferred_aggregation_result(fields: dict[str, Any] | None) -> bool:
         normalize_optional_parameter(fields.get("最终判断"))
         == INFERRED_IRONSOURCE_VERDICT
     )
+
+
+def is_inferred_max_aggregation_result(fields: dict[str, Any] | None) -> bool:
+    """Return whether MAX was provisionally inferred from key plus ad IDs."""
+    fields = fields or {}
+    return bool(fields.get("_max_aggregation_type_inferred")) and (
+        normalize_optional_parameter(fields.get("最终判断")) == INFERRED_MAX_VERDICT
+    )
+
+
+def get_applovin_sdk_key(fields: dict[str, Any] | None) -> str:
+    """Return an AppLovin SDK key from direct or structured detector output."""
+    fields = fields or {}
+    for field_name in ("AppLovin SDK Key", "AppLovin SDK key", "applovin_sdk_key"):
+        key = normalize_optional_parameter(fields.get(field_name))
+        if key:
+            return key
+    for sdk in fields.get("SDK列表", []) or []:
+        name = str(sdk.get("名称") or "").strip().casefold().replace(" ", "")
+        if name in {"applovin", "applovinmax", "max"}:
+            key = normalize_optional_parameter(sdk.get("key"))
+            if key:
+                return key
+    return ""
 
 
 def has_aggregation_type(fields: dict[str, Any] | None) -> bool:
@@ -225,6 +273,29 @@ def has_any_ad_unit_id(fields: dict[str, Any] | None) -> bool:
         get_ad_unit_id(fields, "插屏聚合id")
         or get_ad_unit_id(fields, "激励视频聚合id")
     )
+
+
+NON_GAME_APPLICATION_TYPES = {
+    "native",
+    "flutter",
+    "reactnative",
+    "react native",
+    "capacitor",
+}
+
+
+def non_game_empty_backend_note(fields: dict[str, Any] | None) -> str:
+    """Return the terminal backend note for a non-game empty detection."""
+    app_type = re.sub(
+        r"\s+", " ", str((fields or {}).get("应用类型") or "").strip().casefold()
+    )
+    if app_type not in NON_GAME_APPLICATION_TYPES:
+        return ""
+    if not has_aggregation_type(fields):
+        return "聚合类型识别为空"
+    if not has_any_ad_unit_id(fields):
+        return "聚合id识别为空"
+    return ""
 
 
 def parse_google_play_install_count(page_text: str) -> tuple[int, str] | None:
@@ -447,6 +518,7 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
     apply_aggregation_type_fallback(fields)
     verdict = normalize_optional_parameter(fields.get("最终判断"))
     inferred = is_inferred_aggregation_result(fields)
+    inferred_max = is_inferred_max_aggregation_result(fields)
     evidence: list[str] = []
     if inferred:
         method = "业务规则推断"
@@ -456,6 +528,16 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
                 "AutoDetector 原始最终判断为空",
                 "激励视频聚合id精确为 video",
                 "插屏聚合id精确为 inter",
+            ]
+        )
+    elif inferred_max:
+        method = "业务规则推断"
+        confidence = "中"
+        evidence.extend(
+            [
+                "AutoDetector 原始最终判断为空",
+                "检测到 AppLovin SDK Key",
+                "检测到至少一个有效广告 ID，临时按 MAX 提交并要求回放验证",
             ]
         )
     elif verdict:

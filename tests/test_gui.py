@@ -787,7 +787,10 @@ class TestAppInit:
                 )
                 assert app.precheck_auto_install_var.get() is True
                 assert app.precheck_download_limit_var.get() == "6"
-                assert app._automation_batch_btn.cget("text") == "批量自动适配预检合格任务"
+                assert (
+                    app._automation_batch_btn.cget("text")
+                    == "批量自动适配（含待处理/待人工）"
+                )
         finally:
             root.destroy()
 
@@ -1848,6 +1851,145 @@ class TestAutomationBatchActions:
             "item-1", "TradPlus暂不适配"
         )
 
+    def test_g99_confirmed_crash_submits_terminal_note_and_asana_evidence(self):
+        import threading
+        from gui import APKToolApp
+
+        app = object.__new__(APKToolApp)
+        app._automation_batch_active = True
+        app._automation_batch_device_profile = {"is_g99": True, "model": "G99"}
+        app._automation_fields = {"最终判断": "", "应用类型": "Unity"}
+        app._automation_current_package_name = lambda: "com.demo.crashed"
+        app._automation_stop_event = threading.Event()
+        app._automation_precheck_item_id = "item-1"
+        app._automation_log = MagicMock()
+        app._automation_set_status = MagicMock()
+        app._set_precheck_task_status = MagicMock()
+        app._safe_after = lambda _delay, callback, *args: callback(*args)
+        app._automation_fill_asana_sync = MagicMock()
+        app._automation_comment_business_outcome = MagicMock()
+        app._automation_clear_inferred_backend_sync = MagicMock(
+            return_value={"ok": True, "message": "后台备注已生效"}
+        )
+        app._automation_mark_failed = MagicMock()
+        app._automation_comment_failure = MagicMock()
+        app._automation_write_sheet_outcome_sync = MagicMock()
+        detection = {
+            "ok": False,
+            "code": "APP_CRASHED",
+            "message": "包体在自动化检测过程中闪退，暂不适配",
+            "fields": app._automation_fields,
+            "runtime": {
+                "reason": "线程资源不足",
+                "rule_id": "THREAD_RESOURCE_EXHAUSTED",
+                "evidence_fingerprint": "fp-123",
+                "summary": "pthread_create failed: Resource temporarily unavailable",
+            },
+        }
+
+        assert app._automation_is_g99_confirmed_crash(detection) is True
+        result = app._automation_complete_g99_crash_sync(detection)
+
+        assert result is False
+        fill_call = app._automation_fill_asana_sync.call_args
+        assert fill_call.kwargs["allow_unsupported_attribution"] is True
+        assert fill_call.kwargs["allow_missing_aggregation"] is True
+        asana_detail = fill_call.kwargs["terminal_note"]
+        assert "闪退，g99也闪退，暂不适配" in asana_detail
+        assert "崩溃原因：线程资源不足" in asana_detail
+        assert "规则编号：THREAD_RESOURCE_EXHAUSTED" in asana_detail
+        assert "pthread_create failed" in asana_detail
+        app._automation_comment_business_outcome.assert_called_once_with(
+            "G99_APP_CRASHED", asana_detail
+        )
+        app._automation_clear_inferred_backend_sync.assert_called_once_with(
+            note="闪退，g99也闪退，暂不适配"
+        )
+        app._automation_write_sheet_outcome_sync.assert_called_once_with(
+            "not_adapted", "闪退，g99也闪退，暂不适配"
+        )
+        assert app._automation_task_outcome == "g99_crash_not_adapted"
+        assert app._automation_last_result_code == "G99_APP_CRASHED"
+        app._set_precheck_task_status.assert_called_once_with("item-1", "包体闪退")
+        app._automation_mark_failed.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("device_profile", "code"),
+        [
+            ({"is_g99": False}, "APP_CRASHED"),
+            ({"is_g99": True}, "APP_EXITED_DURING_AUTOMATION"),
+            ({"is_g99": True}, "APP_LAUNCH_NOT_CONFIRMED"),
+        ],
+    )
+    def test_g99_terminal_rule_rejects_non_g99_or_non_crash_results(
+        self, device_profile, code
+    ):
+        from gui import APKToolApp
+
+        app = object.__new__(APKToolApp)
+        app._automation_batch_active = True
+        app._automation_batch_device_profile = device_profile
+
+        assert app._automation_is_g99_confirmed_crash({"code": code}) is False
+
+    @pytest.mark.parametrize(
+        ("fields", "note"),
+        [
+            (
+                {
+                    "应用类型": "Native",
+                    "最终判断": "未检测到主要聚合平台",
+                    "归因平台": "Adjust",
+                },
+                "聚合类型识别为空",
+            ),
+            (
+                {
+                    "应用类型": "Flutter",
+                    "最终判断": "AdMob聚合（自动化检测确认）",
+                    "归因平台": "Adjust",
+                },
+                "聚合id识别为空",
+            ),
+        ],
+    )
+    def test_non_game_empty_detection_submits_terminal_backend_note(
+        self, fields, note
+    ):
+        import threading
+        from gui import APKToolApp
+
+        app = object.__new__(APKToolApp)
+        app._automation_fields = fields
+        app._automation_current_package_name = lambda: "com.demo.utility"
+        app._automation_stop_event = threading.Event()
+        app._automation_precheck_item_id = ""
+        app._automation_log = MagicMock()
+        app._automation_set_status = MagicMock()
+        app._safe_after = lambda _delay, callback, *args: callback(*args)
+        app._automation_fill_asana_sync = MagicMock()
+        app._automation_comment_business_outcome = MagicMock()
+        app._automation_clear_inferred_backend_sync = MagicMock(
+            return_value={"ok": True, "message": "后台备注已生效"}
+        )
+        app._automation_write_sheet_outcome_sync = MagicMock()
+
+        result = app._automation_complete_non_game_empty_detection_sync(note)
+
+        assert result is False
+        app._automation_fill_asana_sync.assert_called_once_with(
+            allow_missing_aggregation=True,
+            terminal_note=note,
+        )
+        app._automation_clear_inferred_backend_sync.assert_called_once_with(note=note)
+        app._automation_write_sheet_outcome_sync.assert_called_once_with(
+            "not_adapted", note
+        )
+        assert app._automation_task_outcome == "not_adapted"
+        app._automation_set_status.assert_called_with(
+            "非游戏参数为空，暂不适配", "#ef6c00"
+        )
+
     def test_single_extract_unknown_attribution_fills_asana_and_skips_replay(self):
         root = tk.Tk()
         try:
@@ -2196,7 +2338,14 @@ class TestAutomationBatchActions:
                     },
                 ) as clear_backend, patch.object(
                     app, "_automation_comment_failure"
-                ) as comment:
+                ) as comment, patch(
+                    "gui.fetch_google_play_install_count",
+                    return_value={
+                        "ok": True,
+                        "installs": 180000,
+                        "display": "180,000+",
+                    },
+                ):
                     result = app._automation_process_current_task_sync()
 
                 assert result is False
@@ -2654,7 +2803,8 @@ class TestAutomationBatchActions:
                 })
 
                 assert [task.package_name for _, task in ordinary] == [
-                    "com.g99.3"
+                    "com.g99.2",
+                    "com.g99.3",
                 ]
                 assert [task.package_name for _, task in g99] == [
                     "com.g99.0",
@@ -2702,6 +2852,50 @@ class TestAutomationBatchActions:
                 assert prepared is True
                 install.assert_called_once()
                 assert install.call_args.args[0] == "com.g99.install"
+        finally:
+            root.destroy()
+
+    @pytest.mark.parametrize("status", ["待处理", "待人工检查", "待人工"])
+    def test_normal_device_installs_actionable_package_before_adaptation(self, status):
+        root = tk.Tk()
+        try:
+            from auto_asana.main import AsanaPrecheckTask
+            from gui import APKToolApp
+
+            task = AsanaPrecheckTask(
+                gid="pending-install-task",
+                name="pending-install-task",
+                package_name="com.pending.install",
+                up2_appid="pending-install-appid",
+                gp_link="",
+            )
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+                app._render_today_asana_tasks({
+                    "section_name": "9.22执行",
+                    "tasks": [task],
+                })
+                item_id = app.precheck_task_tree.get_children()[0]
+                app._set_precheck_task_status(item_id, status)
+
+                with patch("gui.is_package_installed", return_value=False), \
+                     patch(
+                         "gui.download_and_install_apkcombo",
+                         return_value={"ok": True, "code": "APKCOMBO_INSTALLED"},
+                     ) as install:
+                    prepared = app._automation_prepare_g99_task_sync(
+                        item_id,
+                        task,
+                        {"is_g99": False},
+                    )
+
+                assert prepared is True
+                install.assert_called_once_with(
+                    "com.pending.install",
+                    on_progress=install.call_args.kwargs["on_progress"],
+                    force_reinstall=False,
+                )
+                assert app.precheck_task_tree.item(item_id, "values")[3] == "安装完成"
         finally:
             root.destroy()
 
@@ -3424,17 +3618,17 @@ class TestAutomationBatchActions:
                     "pending-old",
                     "pending-old-2",
                 ]
-                # "批量自动适配预检合格任务"仍不得直接接收待处理任务。
+                # 待处理任务也会直接进入自动适配候选队列。
                 assert [
                     task.gid for _item, task in app._automation_eligible_precheck_tasks(
                         {"is_g99": False}
                     )
-                ] == ["installed-old"]
+                ] == ["pending-old", "installed-old", "pending-old-2"]
                 assert [
                     task.gid for _item, task in app._automation_eligible_precheck_tasks(
                         {"is_g99": True}
                     )
-                ] == ["installed-old"]
+                ] == ["pending-old", "installed-old", "pending-old-2"]
         finally:
             root.destroy()
 
@@ -3552,6 +3746,14 @@ class TestAutomationBatchActions:
                     "pending-2",
                     "pending-3",
                 ]
+
+                with patch.object(app, "_on_start_batch_precheck") as start_batch:
+                    app._start_precheck_then_automation_from_current_list()
+
+                start_batch.assert_called_once_with(
+                    start_automation_after=True,
+                    ignore_selection=True,
+                )
         finally:
             root.destroy()
 
@@ -4846,6 +5048,26 @@ class TestSuspectedWhitePackageRule:
         assert result["code"] == "SUSPECTED_WHITE_PACKAGE"
         assert result["fields"]["_google_play_installs"] == installs
 
+    def test_non_game_empty_detection_skips_white_package_override(self):
+        app = self._app()
+        detection = {
+            "ok": False,
+            "code": "AGGREGATION_TYPE_EMPTY",
+            "message": "聚合类型识别为空",
+            "fields": {
+                "应用类型": "Native",
+                "最终判断": "未检测到主要聚合平台",
+                "归因平台": "Adjust",
+            },
+        }
+        with patch("gui.fetch_google_play_install_count") as fetch_installs:
+            result = app._automation_apply_suspected_white_package_rule_sync(
+                detection
+            )
+
+        assert result["code"] == "AGGREGATION_TYPE_EMPTY"
+        fetch_installs.assert_not_called()
+
     def test_180k_downloads_preserves_original_detection_result(self):
         app = self._app()
         detection = {
@@ -4870,6 +5092,98 @@ class TestSuspectedWhitePackageRule:
         assert result["fields"]["_google_play_installs_text"] == "180,000+"
         assert result["message"] == (
             "聚合类型识别为空\nGoogle Play下载量：18w+"
+        )
+
+    def test_failed_inferred_ironsource_rechecks_and_becomes_white_package(self):
+        app = self._app()
+        app._automation_fields = {
+            "ok": True,
+            "最终判断": "IronSource聚合（根据 video/inter 自动推断）",
+            "_raw_aggregation_verdict": "未检测到主要聚合平台",
+            "_aggregation_type_inferred": True,
+            "归因平台": "Adjust",
+            "激励视频聚合id": "video",
+            "插屏聚合id": "inter",
+        }
+        app._automation_complete_suspected_white_package_sync = MagicMock(
+            return_value=False
+        )
+        app._automation_clear_inferred_backend_sync = MagicMock()
+
+        with patch(
+            "gui.fetch_google_play_install_count",
+            return_value={"ok": True, "installs": 5, "display": "5+"},
+        ):
+            result = app._automation_handle_inferred_replay_failure_sync(
+                {"ok": False, "message": "回放监听超时"}
+            )
+
+        assert result is False
+        assert app._automation_fields["最终判断"] == ""
+        assert app._automation_fields["激励视频聚合id"] == ""
+        assert app._automation_fields["插屏聚合id"] == ""
+        assert app._automation_fields["_google_play_installs"] == 5
+        assert "_aggregation_type_inferred" not in app._automation_fields
+        terminal_message = (
+            app._automation_complete_suspected_white_package_sync.call_args.args[0]
+        )
+        assert "Google Play 下载量5+" in terminal_message
+        assert "临时 IronSource 回放结果：回放监听超时" in terminal_message
+        app._automation_clear_inferred_backend_sync.assert_not_called()
+
+    def test_failed_inferred_max_clears_backend_and_restores_empty_verdict(self):
+        import threading
+
+        app = self._app()
+        app._automation_fields = {
+            "ok": True,
+            "最终判断": "MAX聚合（根据 AppLovin SDK Key 与广告 ID 自动推断）",
+            "_raw_aggregation_verdict": "未检测到主要聚合平台",
+            "_max_aggregation_type_inferred": True,
+            "初始Activity": "com.unity3d.player.UnityPlayerActivity",
+            "AppLovin SDK Key": "sdk-key",
+            "应用类型": "Unity",
+            "归因平台": "Adjust",
+            "激励视频聚合id": "reward-123",
+            "插屏聚合id": "inter-123",
+        }
+        app._automation_stop_event = threading.Event()
+        app._automation_precheck_item_id = ""
+        app._automation_context_version = 1
+        app._automation_replay_id_candidates = {"old": ["candidate"]}
+        app._automation_render_fields = MagicMock()
+        app._automation_fill_asana_sync = MagicMock()
+        app._automation_comment_business_outcome = MagicMock()
+        app._automation_comment_failure = MagicMock()
+        app._automation_mark_failed = MagicMock()
+        app._automation_set_status = MagicMock()
+        app._automation_write_sheet_outcome_sync = MagicMock()
+        app._automation_clear_inferred_backend_sync = MagicMock(
+            return_value={"ok": True, "message": "后台参数已清空"}
+        )
+
+        result = app._automation_handle_inferred_max_replay_failure_sync(
+            {"ok": False, "message": "回放监听超时"}
+        )
+
+        assert result is False
+        assert app._automation_fields["最终判断"] == ""
+        assert app._automation_fields["激励视频聚合id"] == "reward-123"
+        assert app._automation_fields["插屏聚合id"] == "inter-123"
+        assert "_max_aggregation_type_inferred" not in app._automation_fields
+        assert app._automation_replay_id_candidates == {}
+        app._automation_clear_inferred_backend_sync.assert_called_once_with(
+            note="聚合类型为空，但存在广告id"
+        )
+        app._automation_fill_asana_sync.assert_called_once_with(
+            allow_missing_aggregation=True,
+            terminal_note="聚合类型为空，但存在广告id",
+        )
+        comment = app._automation_comment_business_outcome.call_args.args
+        assert comment[0] == "MAX_INFERRED_REPLAY_FAILED"
+        assert comment[1].startswith("聚合类型为空，但存在广告id")
+        app._automation_write_sheet_outcome_sync.assert_called_once_with(
+            "not_adapted", "聚合类型为空，但存在广告id"
         )
 
     def test_high_download_empty_aggregation_uses_w_unit_in_failure_message(self):

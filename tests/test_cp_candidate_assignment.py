@@ -7,6 +7,7 @@ import cp_candidate_assignment
 from cp_candidate_assignment import (
     assign_cp_candidate,
     build_historical_success_profile,
+    build_historical_success_profile_from_sheets,
     extract_up2_appid,
     load_cp_assignment_candidates,
     normalize_cp_priority,
@@ -48,11 +49,11 @@ def test_extract_up2_appid_supports_cp_nested_json():
 @pytest.mark.parametrize(
     ("package_name", "score", "recommended", "category"),
     [
-        ("com.demo.arrow.puzzle.game", 59, True, "游戏/益智"),
-        ("com.demo.wifi.cleaner", 18, False, "工具/清理"),
-        ("com.demo.jackpot.slots", 8, False, "博彩/老虎机"),
+        ("com.demo.arrow.puzzle.game", 78, True, "游戏/益智"),
+        ("com.demo.wifi.cleaner", 38, False, "工具/清理"),
+        ("com.demo.jackpot.slots", 56, False, "博彩/老虎机"),
         ("jp.co.demo.game", 0, False, "日本包体"),
-        ("com.demo.application", 41, False, "普通包名"),
+        ("com.demo.application", 48, False, "普通包名"),
     ],
 )
 def test_score_cp_candidate_uses_historical_package_groups(
@@ -71,6 +72,22 @@ def test_score_never_recommends_assigned_or_invalid_records():
     assert assigned["eligible"] is False
     assert invalid["recommended"] is False
     assert invalid["score"] == 0
+
+
+def test_backend_game_category_recovers_game_without_package_keywords():
+    result = score_cp_candidate(
+        record(
+            "com.blazedays.perfectcoffee",
+            categ="GAME",
+            app_name="Perfect Coffee 3D",
+            contains_ads="1",
+        )
+    )
+
+    assert result["category"] == "游戏/益智"
+    assert result["score"] == 78
+    assert result["recommended"] is True
+    assert "后台大分类 GAME" in result["reason"]
 
 
 def test_historical_profile_uses_only_resolved_snow_aggregation_rows():
@@ -108,6 +125,47 @@ def test_historical_profile_ignores_obsolete_tradplus_unsupported_failures():
     profile = build_historical_success_profile(sheet)
     assert profile["游戏/益智"]["success"] == 1
     assert profile["游戏/益智"]["total"] == 1
+
+
+def test_all_sheet_profile_uses_rain_and_snow_and_latest_package_result():
+    older = [
+        ["包名", "聚合适配", "适配进度", "适配所遇问题"],
+        ["com.demo.puzzle", "snow", "暂不适配", ""],
+        ["com.demo.color", "rain", "已适配", ""],
+    ]
+    newer = [
+        ["包名", "聚合适配", "适配进度", "适配所遇问题"],
+        ["com.demo.puzzle", "rain", "已适配", ""],
+        ["com.demo.block", "snow", "已适配", ""],
+    ]
+
+    profile = build_historical_success_profile_from_sheets([older, newer])
+
+    assert profile["__overall__"]["total"] == 3
+    assert profile["__overall__"]["success"] == 3
+    assert profile["__overall__"]["assignees"] == "rain+snow"
+
+
+def test_high_sample_package_token_can_raise_candidate_to_high_probability():
+    profile = {
+        "普通包名": {"success": 48, "total": 100, "raw_rate": 48, "score": 50},
+        "__tokens__": {
+            "story": {"success": 14, "total": 15, "raw_rate": 93, "score": 78}
+        },
+        "__overall__": {
+            "success": 58,
+            "total": 100,
+            "raw_rate": 58,
+            "score": 58,
+            "assignees": "rain+snow",
+        },
+    }
+
+    result = score_cp_candidate(record("com.publisher.story"), profile)
+
+    assert result["score"] == 78
+    assert result["recommended"] is True
+    assert "包名词 story" in result["reason"]
 
 
 def test_japanese_rule_is_not_overridden_by_historical_success():

@@ -686,6 +686,18 @@ class TestAsanaPrecheckTasks:
         assert "包体闪退，暂不适配" in comment
         assert "com.playcus.crosstitchcoloringart" in comment
 
+    def test_g99_crash_automation_comment_restores_crash_status(self):
+        stories = [
+            {
+                "text": (
+                    "【APK Tool 自动化适配：G99_APP_CRASHED】\n"
+                    "闪退，g99也闪退，暂不适配"
+                )
+            }
+        ]
+
+        assert classify_precheck_workflow_status(stories) == ("包体闪退", True)
+
     def test_adds_comment_only_once_for_same_result(self):
         client = MagicMock()
         client.stories.get_stories_for_task.return_value = []

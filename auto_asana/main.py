@@ -158,6 +158,7 @@ _PRECHECK_CODE_STATUSES = {
     # APKCombo browser-download path instead of becoming permanent terminal rows.
     "INSTALL_FAILED": "APKCombo有包",
     "APP_CRASHED": "包体闪退",
+    "G99_APP_CRASHED": "包体闪退",
     "APP_EXITED": "启动待复检",
     "LAUNCH_FAILED": "启动失败",
     "UNKNOWN": "待人工检查",
@@ -193,6 +194,7 @@ _AUTOMATION_CODE_STATUSES = {
     "AD_REPLAY_FAILED": "回放失败",
     "REPLAY_TIMEOUT": "回放失败",
     "APP_CRASHED": "包体闪退",
+    "G99_APP_CRASHED": "包体闪退",
     # A missing process without target-specific crash evidence is reviewable;
     # do not turn a clean exit or an instrumentation failure into a terminal
     # package crash.
@@ -410,6 +412,7 @@ def classify_precheck_workflow_stages(
                 rewarded_replay_status = "回放失败"
             elif code in {
                 "APP_CRASHED",
+                "G99_APP_CRASHED",
                 "APP_EXITED_DURING_AUTOMATION",
                 "APP_LAUNCH_NOT_CONFIRMED",
                 "AUTOMATION_FAILED",
@@ -1032,6 +1035,27 @@ def get_sheet_data(service, sheet_id: str, range_name: str = "A:Z") -> list[list
     return result.get("values", [])
 
 
+def get_spreadsheet_sheet_names(service, sheet_id: str) -> list[str]:
+    """Return visible grid-tab names in spreadsheet order."""
+    result = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=sheet_id,
+            fields="sheets.properties(title,sheetType,hidden)",
+        )
+        .execute()
+    )
+    names = []
+    for item in result.get("sheets", []) if isinstance(result, dict) else []:
+        properties = item.get("properties") or {}
+        if properties.get("sheetType", "GRID") != "GRID" or properties.get("hidden"):
+            continue
+        title = str(properties.get("title") or "").strip()
+        if title:
+            names.append(title)
+    return names
+
+
 def update_sheet_value(
     service,
     sheet_id: str,
@@ -1440,6 +1464,36 @@ class _SpreadsheetsResource:
 
     def values(self):
         return _ValuesResource(self._session, self._credentials)
+
+    def get(self, spreadsheetId, fields=None):
+        return _SpreadsheetGetRequest(
+            self._session, self._credentials, spreadsheetId, fields
+        )
+
+
+class _SpreadsheetGetRequest:
+    BASE = "https://sheets.googleapis.com/v4/spreadsheets"
+
+    def __init__(self, session, credentials, spreadsheet_id, fields):
+        self._session = session
+        self._credentials = credentials
+        self._spreadsheet_id = spreadsheet_id
+        self._fields = fields
+
+    def execute(self):
+        import google.auth.transport.requests as ga_requests
+
+        self._credentials.refresh(ga_requests.Request(session=self._session))
+        url = f"{self.BASE}/{self._spreadsheet_id}"
+        headers = {"Authorization": f"Bearer {self._credentials.token}"}
+        params = {"fields": self._fields} if self._fields else None
+        resp = _request_with_retries(
+            lambda: self._session.get(
+                url, headers=headers, params=params, timeout=60
+            )
+        )
+        resp.raise_for_status()
+        return resp.json()
 
 
 class _ValuesResource:
