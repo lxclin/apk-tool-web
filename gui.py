@@ -5151,10 +5151,25 @@ class APKToolApp:
             self._automation_log,
             "聚合类型或广告 ID 缺失，正在核对 Google Play 下载量",
         )
-        installs_result = fetch_google_play_install_count(package_name)
+        proxy_var = getattr(self, "proxy_url_var", None)
+        proxy_url = (
+            proxy_var.get().strip() if proxy_var is not None else DEFAULT_PROXY_URL
+        )
+        installs_result = fetch_google_play_install_count(
+            package_name, proxy_url=proxy_url
+        )
         if not installs_result.get("ok"):
             detection["_white_package_check_message"] = str(
                 installs_result.get("message") or "Google Play 下载量未核实"
+            )
+            review_reason = (
+                "Google Play 下载量读取失败"
+                if installs_result.get("code") == "GOOGLE_PLAY_INSTALLS_QUERY_FAILED"
+                else detection["_white_package_check_message"]
+            )
+            detection["message"] = (
+                f"{detection.get('message', '聚合类型识别为空')}\n"
+                f"白包复核：{review_reason}，未执行白包判定"
             )
             self._safe_after(
                 0,

@@ -1920,6 +1920,25 @@ def test_fetches_google_play_download_bucket_from_official_page():
     assert "play.google.com/store/apps/details?id=com.example.game" in result["url"]
 
 
+def test_fetches_google_play_download_bucket_through_configured_proxy():
+    from automation_adaptation import fetch_google_play_install_count
+
+    response = MagicMock(text="App details 500+ Downloads")
+    session = MagicMock()
+    session.get.return_value = response
+
+    result = fetch_google_play_install_count(
+        "com.example.game", session=session, proxy_url="http://127.0.0.1:7897"
+    )
+
+    assert result["ok"] is True
+    assert result["installs"] == 500
+    assert session.get.call_args.kwargs["proxies"] == {
+        "http": "http://127.0.0.1:7897",
+        "https": "http://127.0.0.1:7897",
+    }
+
+
 @pytest.mark.parametrize(
     ("fields", "expected_code"),
     [

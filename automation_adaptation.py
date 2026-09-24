@@ -372,6 +372,7 @@ def fetch_google_play_install_count(
     *,
     session: Any = None,
     timeout: int = 20,
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
     """Read one app's public install bucket from its official Play page."""
     package_name = str(package_name or "").strip()
@@ -387,6 +388,7 @@ def fetch_google_play_install_count(
         + "&hl=en&gl=US"
     )
     http = session or requests
+    proxy_url = str(proxy_url or "").strip()
     try:
         response = http.get(
             url,
@@ -397,6 +399,7 @@ def fetch_google_play_install_count(
                 )
             },
             timeout=max(1, int(timeout)),
+            proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
         )
         response.raise_for_status()
     except requests.RequestException as exc:

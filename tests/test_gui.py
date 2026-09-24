@@ -5029,6 +5029,29 @@ class TestSuspectedWhitePackageRule:
         app._automation_deferred_failure = None
         return app
 
+    def test_white_package_check_uses_gui_proxy_setting(self):
+        app = self._app()
+        app.proxy_url_var = MagicMock()
+        app.proxy_url_var.get.return_value = "http://127.0.0.1:7890"
+        detection = {
+            "ok": False,
+            "code": "AGGREGATION_TYPE_EMPTY",
+            "message": "聚合类型识别为空",
+            "fields": {"最终判断": "", "归因平台": "Adjust"},
+        }
+        with patch(
+            "gui.fetch_google_play_install_count",
+            return_value={"ok": True, "installs": 500, "display": "500+"},
+        ) as fetch_installs:
+            result = app._automation_apply_suspected_white_package_rule_sync(
+                detection
+            )
+
+        fetch_installs.assert_called_once_with(
+            "com.example.game", proxy_url="http://127.0.0.1:7890"
+        )
+        assert result["code"] == "SUSPECTED_WHITE_PACKAGE"
+
     @pytest.mark.parametrize("installs", [50000, 100000, 160000, 179999])
     def test_low_download_explicit_max_without_ids_is_not_white(self, installs):
         app = self._app()
@@ -5081,7 +5104,9 @@ class TestSuspectedWhitePackageRule:
 
         assert result["code"] == "SUSPECTED_WHITE_PACKAGE"
         assert result["fields"]["_google_play_installs"] == 500
-        fetch_installs.assert_called_once_with("com.example.game")
+        fetch_installs.assert_called_once_with(
+            "com.example.game", proxy_url="http://127.0.0.1:7897"
+        )
 
     def test_high_download_native_empty_detection_is_not_white_package(self):
         app = self._app()
@@ -5151,6 +5176,7 @@ class TestSuspectedWhitePackageRule:
         assert result["code"] == "AGGREGATION_TYPE_EMPTY"
         assert "_google_play_installs" not in result["fields"]
         assert result["_white_package_check_message"] == "Google Play 下载量读取失败"
+        assert "白包复核：Google Play 下载量读取失败" in result["message"]
 
     def test_inferred_replay_review_explains_unverified_install_count(self):
         app = self._app()
@@ -5282,7 +5308,9 @@ class TestSuspectedWhitePackageRule:
         assert app._automation_fields["激励视频聚合id"] == ""
         assert app._automation_fields["插屏聚合id"] == ""
         assert app._automation_fields["_google_play_installs"] == 500
-        fetch_installs.assert_called_once_with("dramahome.drama.shorts")
+        fetch_installs.assert_called_once_with(
+            "dramahome.drama.shorts", proxy_url="http://127.0.0.1:7897"
+        )
         app._automation_complete_suspected_white_package_sync.assert_called_once()
         assert app._automation_complete_suspected_white_package_sync.call_args.kwargs == {
             "clear_provisional": True
