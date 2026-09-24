@@ -2144,6 +2144,27 @@ class TestNormalizeActionDelays:
 
 
 class TestBuildBackendUrl:
+    @pytest.mark.parametrize(
+        ("verdict", "platform"),
+        [
+            ("MAX聚合", "max"),
+            ("IronSource聚合", "iron_source"),
+            ("AdMob聚合", "admob"),
+            ("TopOn聚合", "topon"),
+            ("Fyber聚合", "fyber"),
+            ("LevelPlay聚合", "level_play"),
+            ("AnyThink聚合", "topon"),
+            ("Digital Turbine聚合", "fyber"),
+        ],
+    )
+    def test_supported_platform_values_match_backend_options(self, verdict, platform):
+        from urllib.parse import parse_qs
+
+        from adb_pusher import build_backend_url
+
+        url = build_backend_url({"最终判断": verdict}, "com.demo.game")
+        assert parse_qs(url.split("?", 1)[1])["aggr_platform"] == [platform]
+
     def test_uses_hash_route_and_maps_fields(self):
         from urllib.parse import parse_qs
 

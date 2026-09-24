@@ -1239,9 +1239,17 @@ def _aggregation_platform_from_fields(fields: dict[str, Any]) -> str:
     for marker, value in (
         ("tradplus", "tradplus"),
         ("levelplay", "level_play"),
+        ("level_play", "level_play"),
         ("ironsource", "iron_source"),
+        ("iron_source", "iron_source"),
         ("admob", "admob"),
+        ("topon", "topon"),
+        ("anythink", "topon"),
+        ("fyber", "fyber"),
+        ("digital turbine", "fyber"),
+        ("digitalturbine", "fyber"),
         ("max", "max"),
+        ("applovin", "max"),
     ):
         if marker in verdict:
             return value

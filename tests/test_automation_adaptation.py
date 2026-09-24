@@ -20,6 +20,7 @@ from automation_adaptation import (
     format_detection_review_evidence,
     has_explicit_attribution,
     has_aggregation_type,
+    has_partial_aggregation_evidence,
     is_inferred_max_aggregation_result,
     derive_backend_list_url,
     derive_backend_submit_url,
@@ -33,6 +34,13 @@ from automation_adaptation import (
     verify_backend_persisted_record,
     _get_with_system_ca_retry,
 )
+
+
+@pytest.mark.parametrize("sdk_name", ["TopOn", "AnyThink", "Fyber", "Digital Turbine"])
+def test_new_platform_sdk_key_counts_as_partial_aggregation_evidence(sdk_name):
+    fields = {"SDK列表": [{"名称": sdk_name, "key": "sdk-key"}]}
+    assert has_partial_aggregation_evidence(fields)
+    assert detection_field_issue(fields)[0] == "AGGREGATION_RESULT_INCOMPLETE"
 
 
 FIELDS = {

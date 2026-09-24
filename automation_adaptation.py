@@ -466,7 +466,7 @@ def has_partial_aggregation_evidence(fields: dict[str, Any] | None) -> bool:
         return True
     aggregation_sdks = {
         "applovin", "max", "ironsource", "levelplay", "admob", "unityads",
-        "tradplus",
+        "topon", "anythink", "fyber", "digitalturbine", "tradplus",
     }
     for sdk in fields.get("SDK列表", []) or []:
         name = str(sdk.get("名称") or "").casefold().replace(" ", "")
@@ -629,6 +629,10 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
         platform_token = "AppLovin MAX"
     elif "admob" in verdict_compact:
         platform_token = "AdMob"
+    elif "topon" in verdict_compact or "anythink" in verdict_compact:
+        platform_token = "TopOn"
+    elif "fyber" in verdict_compact or "digitalturbine" in verdict_compact:
+        platform_token = "Fyber"
     elif "tradplus" in verdict_compact:
         platform_token = "TradPlus"
     if platform_token:

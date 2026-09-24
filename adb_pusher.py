@@ -2963,9 +2963,9 @@ def _canonical_aggr_name(name: str) -> str:
         return "levelplay"
     if normalized in {"admob", "googleadmob"}:
         return "admob"
-    if normalized in {"topon"}:
+    if normalized in {"topon", "anythink"}:
         return "topon"
-    if normalized in {"fyber"}:
+    if normalized in {"fyber", "digitalturbine"}:
         return "fyber"
     if normalized in {"tradplus", "tradplusads"}:
         return "tradplus"
@@ -2982,9 +2982,9 @@ def _target_aggr_from_final(final: str) -> str:
         return "max"
     if "admob" in final_lower:
         return "admob"
-    if "topon" in final_lower:
+    if "topon" in final_lower or "anythink" in final_lower:
         return "topon"
-    if "fyber" in final_lower:
+    if "fyber" in final_lower or "digital turbine" in final_lower or "digitalturbine" in final_lower:
         return "fyber"
     if "tradplus" in final_lower or "trad_plus" in final_lower:
         return "tradplus"
@@ -4777,24 +4777,20 @@ def build_backend_url(fields: dict, package_name: str) -> str:
     params = {"change": "1", "package_name": package_name}
 
     # 最终判断 → 聚合平台（映射到下拉框合法值）
-    PLATFORM_MAP = {
+    platform_map = {
         "max": "max",
         "admob": "admob",
-        "applovin": "max",  # AppLovin 聚合即 max
         "ironsource": "iron_source",
-        "iron": "iron_source",
         "topon": "topon",
         "fyber": "fyber",
         "levelplay": "level_play",
-        "level": "level_play",
     }
     final = normalize_optional_parameter(fields.get("最终判断", ""))
     if "tradplus" in final.casefold().replace(" ", "").replace("_", ""):
         raise ValueError("TradPlus聚合，暂不适配，禁止生成后台提交参数")
-    platform_match = re.match(r"^([A-Za-z_]+)", final)
-    if platform_match:
-        raw = platform_match.group(1).lower()
-        params["aggr_platform"] = PLATFORM_MAP.get(raw, raw)
+    canonical_platform = _target_aggr_from_final(final)
+    if canonical_platform in platform_map:
+        params["aggr_platform"] = platform_map[canonical_platform]
 
     # 其他直接映射字段
     field_map = {

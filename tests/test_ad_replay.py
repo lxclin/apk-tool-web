@@ -340,10 +340,28 @@ def test_platform_log_filter_matches_android_studio_and_query():
 
 
 def test_platform_log_filter_mapping_for_supported_mediation_types():
+    assert ReplayExpectation.from_values("a", "", "MAX聚合").platform_log_token == "max"
     assert ReplayExpectation.from_values("a", "", "LevelPlay聚合").platform_log_token == "level"
     assert ReplayExpectation.from_values("a", "", "IronSource聚合").platform_log_token == "iron"
     assert ReplayExpectation.from_values("a", "", "AdMob聚合").platform_log_token == "admob"
+    assert ReplayExpectation.from_values("a", "", "TopOn聚合").platform_log_token == "topon"
+    assert ReplayExpectation.from_values("a", "", "Fyber聚合").platform_log_token == "fyber"
     assert ReplayExpectation.from_values("a", "", "TradPlus聚合").platform_log_token == "tradplus"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "matching_line", "other_line"),
+    [
+        ("TopOn聚合", "ZGSDK.TopOn: loadAd", "ZGSDK.Fyber: loadAd"),
+        ("Fyber聚合", "ZGSDK.Fyber: loadAd", "ZGSDK.TopOn: loadAd"),
+    ],
+)
+def test_new_platform_replay_filter_keeps_only_matching_zgsdk_lines(
+    verdict, matching_line, other_line
+):
+    expectation = ReplayExpectation.from_values("inter-1", "", verdict)
+    assert is_replay_diagnostic_line(matching_line, expectation)
+    assert not is_replay_diagnostic_line(other_line, expectation)
 
 
 def test_in_flight_attempt_tracks_matching_session_until_terminal_status():

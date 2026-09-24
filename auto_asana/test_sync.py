@@ -9,6 +9,23 @@ from unittest.mock import MagicMock, call, patch
 from datetime import date
 
 
+@pytest.mark.parametrize(
+    ("verdict", "platform"),
+    [
+        ("MAX聚合", "max"),
+        ("IronSource聚合", "iron_source"),
+        ("AdMob聚合", "admob"),
+        ("TopOn聚合", "topon"),
+        ("Fyber聚合", "fyber"),
+        ("LevelPlay聚合", "level_play"),
+    ],
+)
+def test_aggregation_platform_from_fields_supports_backend_options(verdict, platform):
+    from auto_asana.main import _aggregation_platform_from_fields
+
+    assert _aggregation_platform_from_fields({"最终判断": verdict}) == platform
+
+
 @pytest.mark.parametrize("reset_status", ["自动化失败", "待人工检查", "待处理", ""])
 def test_reset_automation_failures_uses_fresh_status_and_keeps_business_outcomes(reset_status):
     from auto_asana.main import reset_automation_failed_tasks_for_date

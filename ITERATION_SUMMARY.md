@@ -1,6 +1,14 @@
 # APK Tool 迭代总结
 
-更新时间：2026-06-17
+更新时间：2026-09-24
+
+> 本文保留 2026-06-17 的历史迭代细节。近期改动按日期追加在 [UPDATE_NOTES_2026-09-21.md](UPDATE_NOTES_2026-09-21.md)。
+
+## 最近更新：2026-09-24 聚合平台支持
+
+- 后台、Web 跳转和自动化字段映射统一覆盖 MAX、IronSource、AdMob、TopOn、Fyber、LevelPlay 六个下拉选项。
+- MAX、IronSource、AdMob、LevelPlay 原有支持保持；本轮补齐 TopOn、Fyber 在回放过滤、Asana 状态同步和渐进式证据识别中的缺口，并兼容 AnyThink、Digital Turbine 别名。
+- 相关测试 `494 passed`，Python 编译与 Web 内联脚本语法检查通过；真实包体回放尚未逐类实测。
 
 ## 本轮迭代目标
 

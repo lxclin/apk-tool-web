@@ -2540,11 +2540,18 @@ function openBackendUrl() {
 
   // 最终判断 → 聚合平台（映射到下拉框合法值）
   const final = cleanParam(_fieldData['最终判断']);
-  const pm = final.match(/^([A-Za-z_]+)/);
+  const pm = final.match(/^([A-Za-z_ ]+)/);
   if (pm) {
-    const raw = pm[1].toLowerCase();
-    const map = {applovin:'max',iron:'iron_source',ironsource:'iron_source',levelplay:'level_play'};
-    params.aggr_platform = map[raw] || raw;
+    const raw = pm[1].toLowerCase().replace(/[^a-z0-9]/g, '');
+    const platformMap = {
+      max:'max', applovin:'max', applovinmax:'max',
+      iron:'iron_source', ironsource:'iron_source',
+      admob:'admob', googleadmob:'admob',
+      topon:'topon', anythink:'topon',
+      fyber:'fyber', digitalturbine:'fyber',
+      level:'level_play', levelplay:'level_play'
+    };
+    if (platformMap[raw]) params.aggr_platform = platformMap[raw];
   }
 
   // 直接映射

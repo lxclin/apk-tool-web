@@ -134,3 +134,11 @@
 
 - 修复 `Native` 应用因“非游戏空参数”规则提前返回，跳过 Google Play 下载量核验的问题。以 `dramahome.drama.shorts` 的临时 IronSource 推断回放未触发为回归样本：撤销临时类型和占位广告 ID 后，先检查官方下载量与剩余聚合线索；低于阈值且无线索时转“疑似白包待复检”，同时清空本轮临时后台参数。
 - 明确 MAX、真实广告 ID 或聚合 SDK Key 仍能阻止白包误判；官方下载量读取失败时不会凭空推断为白包。
+
+## 16. 9 月 24 日聚合平台选项支持整理
+
+- 后台聚合平台字段统一使用六个合法值：`max`、`iron_source`、`admob`、`topon`、`fyber`、`level_play`；同步更新参数映射说明和 Web 后台跳转映射。
+- MAX、IronSource、AdMob、LevelPlay 原有识别、参数提交和回放支持保持不变。
+- TopOn 与 Fyber 原有日志识别、广告 ID 提取及后台参数映射已存在；本轮补齐 Asana 结果状态映射、回放日志过滤和渐进式 SDK 证据识别，纳入完整自动化处理链路。
+- 兼容历史/别名名称 AnyThink → TopOn、Digital Turbine → Fyber，防止别名被当作未知聚合值提交。
+- 验证：相关定向测试 `494 passed`；Python 编译和 Web 内联脚本语法检查通过。尚未使用六类真实包体逐一验证广告回放。

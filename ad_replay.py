@@ -106,6 +106,10 @@ def replay_platform_log_token(aggregation_verdict: str | None) -> str:
         return "iron"
     if "admob" in verdict:
         return "admob"
+    if "topon" in verdict or "anythink" in verdict:
+        return "topon"
+    if "fyber" in verdict or "digital turbine" in verdict or "digitalturbine" in verdict:
+        return "fyber"
     if "max" in verdict or "applovin" in verdict:
         return "max"
     if "tradplus" in verdict or "trad_plus" in verdict:
