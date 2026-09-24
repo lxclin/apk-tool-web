@@ -78,7 +78,7 @@ def test_detection_review_evidence_explains_gaps_without_leaking_sdk_keys():
     [
         (
             {"应用类型": "Native", "最终判断": "未检测到主要聚合平台"},
-            "聚合类型识别为空",
+            "聚合类型识别为空，暂不适配",
         ),
         (
             {"应用类型": "Flutter", "最终判断": "MAX聚合"},
@@ -2016,8 +2016,8 @@ def test_asana_update_allows_missing_aggregation_for_white_package_terminal():
         fields,
         allow_unsupported_attribution=True,
         allow_missing_aggregation=True,
-        terminal_note="疑似白包，暂不适配",
+        terminal_note="疑似白包，暂不适配（待复检）",
     )
 
-    assert "适配结论:疑似白包，暂不适配" in merged
+    assert "适配结论:疑似白包，暂不适配（待复检）" in merged
     client.tasks.update_task.assert_called_once()

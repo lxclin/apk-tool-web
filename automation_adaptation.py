@@ -335,7 +335,7 @@ def non_game_empty_backend_note(fields: dict[str, Any] | None) -> str:
     if app_type not in NON_GAME_APPLICATION_TYPES:
         return ""
     if not has_aggregation_type(fields):
-        return "聚合类型识别为空"
+        return "聚合类型识别为空，暂不适配"
     if not has_any_ad_unit_id(fields):
         return "聚合id识别为空"
     return ""

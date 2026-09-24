@@ -1941,7 +1941,7 @@ class TestAutomationBatchActions:
                     "最终判断": "未检测到主要聚合平台",
                     "归因平台": "Adjust",
                 },
-                "聚合类型识别为空",
+                "聚合类型识别为空，暂不适配",
             ),
             (
                 {
@@ -1982,6 +1982,7 @@ class TestAutomationBatchActions:
             terminal_note=note,
         )
         app._automation_clear_inferred_backend_sync.assert_called_once_with(note=note)
+        assert app._automation_comment_business_outcome.call_args.args[1].startswith(note)
         app._automation_write_sheet_outcome_sync.assert_called_once_with(
             "not_adapted", note
         )
@@ -5366,7 +5367,7 @@ class TestSuspectedWhitePackageRule:
             "聚合类型识别为空\nGoogle Play下载量：50000w+"
         )
 
-    def test_white_package_review_preserves_backend_without_terminal_sheet(self):
+    def test_white_package_submits_backend_note_and_keeps_review_state(self):
         import threading
 
         app = self._app()
@@ -5392,13 +5393,17 @@ class TestSuspectedWhitePackageRule:
         app._automation_fill_asana_sync.assert_called_once_with(
             allow_unsupported_attribution=True,
             allow_missing_aggregation=True,
-            terminal_note="疑似白包，聚合证据不足，待人工复检",
+            terminal_note="疑似白包，暂不适配（待复检）",
         )
         assert app._automation_comment_review.call_args.args[0] == (
             "SUSPECTED_WHITE_PACKAGE_REVIEW"
         )
-        app._automation_clear_inferred_backend_sync.assert_not_called()
-        assert "后台：未修改" in app._automation_comment_review.call_args.args[1]
+        app._automation_clear_inferred_backend_sync.assert_called_once_with(
+            note="疑似白包，暂不适配"
+        )
+        comment = app._automation_comment_review.call_args.args[1]
+        assert comment.startswith("疑似白包，暂不适配（待复检）\n")
+        assert "后台：已提交“疑似白包，暂不适配”并回读确认" in comment
         app._automation_write_sheet_outcome_sync.assert_not_called()
 
     def test_inferred_ironsource_timeout_is_review_not_business_rejection(self):
@@ -5499,9 +5504,9 @@ class TestSuspectedWhitePackageRule:
             "疑似白包，待复检", clear_provisional=True
         ) is False
         app._automation_clear_inferred_backend_sync.assert_called_once_with(
-            note="疑似白包，聚合证据不足，待人工复检"
+            note="疑似白包，暂不适配"
         )
-        assert "后台：临时参数已清空" in (
+        assert "后台：已提交“疑似白包，暂不适配”并回读确认" in (
             app._automation_comment_review.call_args.args[1]
         )
 

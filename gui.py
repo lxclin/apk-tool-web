@@ -196,7 +196,8 @@ REPLAY_ENVIRONMENT_FAILURE_CODES = frozenset(
 )
 INFERRED_AGGREGATION_REVIEW_NOTE = "聚合类型未确认，待人工触发广告复检"
 INFERRED_MAX_REVIEW_NOTE = "MAX聚合推断未验证，待人工触发广告复检"
-WHITE_PACKAGE_REVIEW_NOTE = "疑似白包，聚合证据不足，待人工复检"
+WHITE_PACKAGE_BACKEND_NOTE = "疑似白包，暂不适配"
+WHITE_PACKAGE_REVIEW_NOTE = "疑似白包，暂不适配（待复检）"
 G99_CRASH_RESULT_CODE = "G99_APP_CRASHED"
 G99_CRASH_TERMINAL_NOTE = "闪退，g99也闪退，暂不适配"
 
@@ -6277,31 +6278,30 @@ class APKToolApp:
     def _automation_complete_suspected_white_package_sync(
         self, message: str, *, clear_provisional: bool = False
     ) -> bool:
-        """Review low-install packages; undo only this run's provisional submit."""
+        """Submit a note-only backend result and retain manual review in Asana."""
         package_name = self._automation_current_package_name()
         review_note = WHITE_PACKAGE_REVIEW_NOTE
-        message = str(message or "").replace("疑似白包，暂不适配", "疑似白包，待复检")
+        message = str(message or "").strip()
         if self._automation_stop_event.is_set():
             return False
-        backend_message = "未修改（仅证据不足）"
-        if clear_provisional:
-            self._safe_after(
-                0,
-                self._automation_log,
-                "[疑似白包 1/2] 清空本轮临时参数并回读校验",
+        self._safe_after(
+            0,
+            self._automation_log,
+            f"[疑似白包 1/2] 清空适配参数并提交备注“{WHITE_PACKAGE_BACKEND_NOTE}”",
+        )
+        submit = self._automation_clear_inferred_backend_sync(
+            note=WHITE_PACKAGE_BACKEND_NOTE
+        )
+        self._safe_after(0, self._automation_log, submit.get("message", ""))
+        if not submit.get("ok"):
+            submit_message = submit.get("message", "后台备注提交失败")
+            self._automation_mark_failed(submit_message)
+            self._automation_comment_failure(
+                submit.get("code", "BACKEND_CLEAR_FAILED"), submit_message
             )
-            submit = self._automation_clear_inferred_backend_sync(note=review_note)
-            self._safe_after(0, self._automation_log, submit.get("message", ""))
-            if not submit.get("ok"):
-                submit_message = submit.get("message", "后台临时参数清空失败")
-                self._automation_mark_failed(submit_message)
-                self._automation_comment_failure(
-                    submit.get("code", "BACKEND_CLEAR_FAILED"), submit_message
-                )
-                if self._automation_batch_active:
-                    self._automation_stop_event.set()
-                return False
-            backend_message = "临时参数已清空并回读确认"
+            if self._automation_batch_active:
+                self._automation_stop_event.set()
+            return False
         self._safe_after(
             0,
             self._automation_log,
@@ -6322,8 +6322,8 @@ class APKToolApp:
                 f"疑似白包检测结果回填 Asana 描述失败：{exc}",
             )
         review_message = (
-            f"{message}\n包名：{package_name}\n"
-            f"后台：{backend_message}"
+            f"{review_note}\n{message}\n包名：{package_name}\n"
+            f"后台：已提交“{WHITE_PACKAGE_BACKEND_NOTE}”并回读确认"
         )
         if asana_error:
             review_message += f"\nAsana 描述回填失败，请人工补录：{asana_error}"
@@ -6332,15 +6332,7 @@ class APKToolApp:
             review_message,
             "疑似白包待复检",
         )
-        self._safe_after(
-            0,
-            self._automation_log,
-            (
-                "本轮临时参数已清空；疑似白包转人工复检"
-                if clear_provisional else
-                "疑似白包转人工复检；未触碰已有后台配置"
-            ),
-        )
+        self._safe_after(0, self._automation_log, "疑似白包备注已提交；转人工复检")
         return False
 
     def _automation_complete_unsupported_attribution_sync(
@@ -6430,7 +6422,7 @@ class APKToolApp:
         )
         self._automation_comment_business_outcome(
             "NON_GAME_AGGREGATION_EMPTY",
-            f"{message}\n接口提交备注：{terminal_note}\n包名：{package_name}",
+            f"{terminal_note}\n检测结果：{message}\n接口提交备注：{terminal_note}\n包名：{package_name}",
         )
         if self._automation_stop_event.is_set():
             return False
