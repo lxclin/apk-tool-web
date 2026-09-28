@@ -31,6 +31,7 @@ MIN_REPLAY_TIMEOUT_SECONDS = 10
 MAX_REPLAY_TIMEOUT_SECONDS = 600
 REPLAY_LOG_QUEUE_POLL_SECONDS = 0.25
 REPLAY_IN_FLIGHT_GRACE_SECONDS = 30
+REPLAY_TERMINAL_FAILURE_GRACE_SECONDS = 20
 REPLAY_LOG_DRAIN_BATCH_SIZE = 512
 REPLAY_PROGRESS_HEARTBEAT_SECONDS = 30
 
@@ -239,6 +240,8 @@ class AdReplayEvaluator:
         }
         self._sessions: dict[str, tuple[str, str]] = {}
         self._active_attempts: set[tuple[str, str, str]] = set()
+        self._terminal_failures: set[str] = set()
+        self._last_terminal_failure_at: float | None = None
         self.action_success_patterns = tuple(
             re.compile(item, re.I) if isinstance(item, str) else item
             for item in action_success_patterns
@@ -258,6 +261,21 @@ class AdReplayEvaluator:
     def has_in_flight_attempt(self) -> bool:
         """Whether a configured ad request has started but not yet terminated."""
         return bool(self._active_attempts)
+
+    @property
+    def terminal_failure_settled(self) -> bool:
+        """Every required type either displayed or ended with a final failure."""
+        unresolved = {
+            item for item in self.expectation.required_types
+            if not self.states[item].displayed
+        }
+        return bool(unresolved) and unresolved <= self._terminal_failures and not any(
+            item[1] in unresolved for item in self._active_attempts
+        )
+
+    @property
+    def last_terminal_failure_at(self) -> float | None:
+        return self._last_terminal_failure_at
 
     def feed(self, line: str) -> bool:
         """Consume one line and return True once either success route completes."""
@@ -288,10 +306,22 @@ class AdReplayEvaluator:
             ad_type = ad_type or session_type
             ad_unit_id = ad_unit_id or session_ad_unit
 
-        if (
+        matches_expected_ad = (
             ad_type in self.expectation.required_types
             and ad_unit_id in self.expectation.ids_for(ad_type)
-        ):
+        )
+        if matches_expected_ad:
+            if not inference_only and "zgsdk.mediationevent" in line.casefold():
+                if status in {"load_failed", "display_failed"}:
+                    # This is the app-facing result for the ad unit. A single
+                    # mediated network's No Fill can still lead to a fill from
+                    # another network in the same MAX waterfall.
+                    self._terminal_failures.add(ad_type)
+                    self._last_terminal_failure_at = time.monotonic()
+                elif status in {
+                    "load_start", "load_success", "display_start", "display_success"
+                }:
+                    self._terminal_failures.discard(ad_type)
             if not inference_only and (
                 status in {
                     "load_start", "load_success", "load_failed",
@@ -322,15 +352,11 @@ class AdReplayEvaluator:
                 }
 
         for pattern, message in self._ERROR_RULES:
-            if pattern.search(line):
-                targets = [ad_type] if ad_type else list(self.expectation.required_types)
-                for target in targets:
-                    if target and message not in self.states[target].errors:
-                        self.states[target].errors.append(message)
+            if matches_expected_ad and pattern.search(line):
+                if message not in self.states[ad_type].errors:
+                    self.states[ad_type].errors.append(message)
 
-        if inference_only or not ad_type or ad_type not in self.expectation.required_types:
-            return self.complete
-        if not ad_unit_id or ad_unit_id not in self.expectation.ids_for(ad_type):
+        if inference_only or not matches_expected_ad:
             return self.complete
 
         is_display = any(marker.lower() in line.lower() for marker in self._DISPLAY_MARKERS)
@@ -606,6 +632,7 @@ def run_ad_replay_check(
         autodetector_lines: list[str] = []
         deferred_success: dict | None = None
         last_progress_at = 0.0
+        terminal_failure_announced = False
         aggregation_change_grace_seconds = max(
             0,
             min(int(aggregation_change_grace_seconds), timeout_seconds),
@@ -741,6 +768,36 @@ def run_ad_replay_check(
                 and elapsed >= aggregation_change_grace_seconds
             ):
                 return deferred_success
+            terminal_failure_settled = evaluator.terminal_failure_settled
+            if terminal_failure_settled and not terminal_failure_announced:
+                terminal_failure_announced = True
+                if on_progress:
+                    on_progress(
+                        "目标广告位已返回最终失败，观察 "
+                        f"{REPLAY_TERMINAL_FAILURE_GRACE_SECONDS} 秒是否重试"
+                    )
+            elif not terminal_failure_settled:
+                terminal_failure_announced = False
+            terminal_failure_at = evaluator.last_terminal_failure_at
+            if (
+                terminal_failure_settled
+                and deferred_success is None
+                and terminal_failure_at is not None
+                and time.monotonic() - terminal_failure_at
+                >= REPLAY_TERMINAL_FAILURE_GRACE_SECONDS
+                and (
+                    aggregation_change_detector is None
+                    or elapsed >= aggregation_change_grace_seconds
+                )
+            ):
+                result = evaluator.result(timed_out=True, elapsed_seconds=elapsed)
+                result["message"] = (
+                    "目标广告位明确加载或展示失败，观察后未重试，提前结束本轮"
+                )
+                result["early_terminal_failure"] = True
+                if on_progress:
+                    on_progress(result["message"])
+                return result
             if elapsed >= timeout_seconds:
                 if (
                     evaluator.has_in_flight_attempt

@@ -248,6 +248,28 @@ def test_matching_error_is_evidence_of_attempted_request():
     assert result["interstitial"]["request_observed"] is True
 
 
+def test_unrelated_waterfall_errors_do_not_trigger_target_retries():
+    evaluator = AdReplayEvaluator(
+        ReplayExpectation.from_values("inter-1", "reward-1", "MAX聚合")
+    )
+    evaluator.feed(
+        "AppLovinSdk: No Fill adUnitId=banner-1 format=BANNER"
+    )
+    evaluator.feed(
+        "AppLovinSdk: No Fill adUnitId=other-inter format=INTER"
+    )
+    assert evaluator.states["interstitial"].errors == []
+    assert evaluator.states["rewarded"].errors == []
+
+    evaluator.feed(
+        "AppLovinSdk: No Fill adUnitId=inter-1 format=INTER"
+    )
+    assert evaluator.states["interstitial"].errors == [
+        "No Fill：本次请求无广告填充"
+    ]
+    assert evaluator.states["rewarded"].errors == []
+
+
 def test_timeout_comment_keeps_nonterminal_injection_warning():
     evaluator = AdReplayEvaluator(ReplayExpectation.from_values("inter-1", ""))
     result = evaluator.result(timed_out=True, elapsed_seconds=300)
@@ -380,6 +402,66 @@ def test_in_flight_attempt_tracks_matching_session_until_terminal_status():
         '"adUnitId":"reward-1","adType":"reward","session_id":"s-1"}'
     )
     assert evaluator.has_in_flight_attempt is False
+
+
+def test_final_ad_unit_failure_settles_after_other_type_displayed():
+    evaluator = AdReplayEvaluator(
+        ReplayExpectation.from_values("inter-1", "reward-1", "MAX聚合")
+    )
+    evaluator.feed(
+        'ZGSDK.mediationEvent: {"status":"display_success",'
+        '"adUnitId":"reward-1","adType":"reward"}'
+    )
+    evaluator.feed(
+        "AppLovinSdk: mediated network No Fill "
+        "adUnitId=inter-1 format=INTER"
+    )
+    assert evaluator.terminal_failure_settled is False
+
+    evaluator.feed(
+        'ZGSDK.MediationEvent: {"status":"load_failed",'
+        '"adUnitId":"inter-1","adType":"interstitial",'
+        '"session_id":"s-1"}'
+    )
+    assert evaluator.terminal_failure_settled is True
+
+    evaluator.feed(
+        'ZGSDK.mediationEvent: {"status":"load_start",'
+        '"adUnitId":"inter-1","adType":"interstitial",'
+        '"session_id":"s-2"}'
+    )
+    assert evaluator.terminal_failure_settled is False
+
+
+@patch("ad_replay.REPLAY_TERMINAL_FAILURE_GRACE_SECONDS", 0)
+@patch("ad_replay.stop_logcat_stream")
+@patch("ad_replay.subprocess.run")
+@patch("ad_replay.force_stop_app", return_value=(True, "ok"))
+@patch("ad_replay.PackageRuntimeMonitor")
+@patch("ad_replay.start_logcat_stream")
+def test_final_ad_unit_failure_ends_replay_before_full_timeout(
+    start_stream, runtime_monitor, _force_stop, launch, _stop_stream
+):
+    proc = MagicMock()
+    proc.stdout = io.StringIO(
+        'ZGSDK.mediationEvent: {"status":"load_failed",'
+        '"adUnitId":"inter-1","adType":"interstitial",'
+        '"session_id":"s-1"}\n'
+    )
+    proc.poll.return_value = None
+    start_stream.return_value = proc
+    runtime_monitor.return_value.poll.return_value = {"ok": True}
+    launch.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+    result = run_ad_replay_check(
+        "com.demo", "10250", ReplayExpectation.from_values("inter-1", ""),
+        timeout_seconds=300,
+    )
+
+    assert result["code"] == "REPLAY_TIMEOUT"
+    assert result["early_terminal_failure"] is True
+    assert result["elapsed_seconds"] < 5
+    assert result["interstitial"]["request_observed"] is True
 
 
 def test_ad_load_timeout_is_recorded_as_transient_error():
