@@ -5477,12 +5477,38 @@ class APKToolApp:
         self, code: str, message: str
     ) -> bool:
         """Keep usable detection evidence in Asana without backend submission."""
-        if code not in {"AF_KEY_EMPTY", "AD_IDS_EMPTY", "AGGREGATION_RESULT_INCOMPLETE"}:
+        if code not in {
+            "AF_KEY_EMPTY",
+            "AD_IDS_EMPTY",
+            "AGGREGATION_RESULT_INCOMPLETE",
+            "AGGREGATION_TYPE_EMPTY",
+        }:
             return False
-        if not has_aggregation_type(self._automation_fields):
+        missing_aggregation = not has_aggregation_type(self._automation_fields)
+        if missing_aggregation and code not in {
+            "AGGREGATION_RESULT_INCOMPLETE",
+            "AGGREGATION_TYPE_EMPTY",
+        }:
             return False
+        if not self._automation_fields:
+            # A completed detection can have no extracted fields at all. Keep
+            # the empty parameter block and conclusion in Asana in that case.
+            self._automation_fields = {"最终判断": ""}
         try:
-            self._automation_fill_asana_sync()
+            if missing_aggregation:
+                terminal_note = str(message or "聚合类型识别为空").splitlines()[0]
+                review_evidence = format_detection_review_evidence(
+                    self._automation_fields
+                )
+                if review_evidence:
+                    terminal_note += "\n" + review_evidence
+                self._automation_fill_asana_sync(
+                    allow_unsupported_attribution=True,
+                    allow_missing_aggregation=True,
+                    terminal_note=terminal_note,
+                )
+            else:
+                self._automation_fill_asana_sync()
         except Exception as exc:
             self._safe_after(
                 0,

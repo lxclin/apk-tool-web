@@ -4948,6 +4948,130 @@ class TestActionDelayTool:
             root.destroy()
 
 
+class TestEmptyAggregationAsanaBackfill:
+    def test_empty_aggregation_writes_detected_fields_and_result_to_description(self):
+        from gui import APKToolApp
+
+        app = object.__new__(APKToolApp)
+        app._automation_fields = {
+            "最终判断": "",
+            "初始Activity": "",
+            "应用类型": "",
+            "插屏聚合id": "",
+            "激励视频聚合id": "",
+            "归因平台": "",
+            "_google_play_installs_text": "10000w+",
+        }
+        app._automation_task_notes = (
+            "包名：br.com.brainweb.ifood\n"
+            "UP2 appid：demo\n"
+            "GP链接：https://play.google.com/store/apps/details?id=br.com.brainweb.ifood\n\n"
+            "最终判断:旧的MAX聚合\n"
+        )
+        app._automation_set_batch_stage = MagicMock()
+        app._automation_current_task_gid = lambda: "task-1"
+        app._automation_log = MagicMock()
+        app._safe_after = lambda _delay, callback, *args: callback(*args)
+        client = MagicMock()
+        app._automation_asana_client = lambda: client
+
+        with patch("gui.private_feature_enabled", return_value=True):
+            persisted = app._automation_persist_detected_failure_fields_sync(
+                "AGGREGATION_TYPE_EMPTY",
+                "聚合类型识别为空\nGoogle Play下载量：10000w+",
+            )
+
+        assert persisted is True
+        notes = client.tasks.update_task.call_args.args[1]["notes"]
+        assert "包名：br.com.brainweb.ifood" in notes
+        assert "UP2 appid：demo" in notes
+        assert "最终判断:" in notes
+        assert "初始Activity:" in notes
+        assert "插屏聚合id:" in notes
+        assert "激励视频聚合id:" in notes
+        assert "归因平台:" in notes
+        assert "Google Play下载量:10000w+" in notes
+        assert "适配结论:聚合类型识别为空" in notes
+        assert "复核缺失项：聚合类型、广告 ID" in notes
+        assert "广告 ID 线索：插屏未识别、激励视频未识别" in notes
+        assert "旧的MAX聚合" not in notes
+
+    def test_no_extracted_fields_still_writes_explicit_empty_result(self):
+        from gui import APKToolApp
+
+        app = object.__new__(APKToolApp)
+        app._automation_fields = {}
+        app._automation_task_notes = "包名：br.com.brainweb.ifood\nGP链接：https://example.test"
+        app._automation_set_batch_stage = MagicMock()
+        app._automation_current_task_gid = lambda: "task-1"
+        app._automation_log = MagicMock()
+        app._safe_after = lambda _delay, callback, *args: callback(*args)
+        client = MagicMock()
+        app._automation_asana_client = lambda: client
+
+        with patch("gui.private_feature_enabled", return_value=True):
+            persisted = app._automation_persist_detected_failure_fields_sync(
+                "AGGREGATION_TYPE_EMPTY", "聚合类型识别为空"
+            )
+
+        assert persisted is True
+        notes = client.tasks.update_task.call_args.args[1]["notes"]
+        assert "最终判断:\n" in notes
+        assert "适配结论:聚合类型识别为空" in notes
+        assert "复核缺失项：聚合类型、广告 ID" in notes
+
+    def test_batch_empty_detection_backfills_before_recording_failure(self):
+        import threading
+        from gui import APKToolApp
+
+        app = object.__new__(APKToolApp)
+        app._automation_context_version = 1
+        app._automation_current_package_name = lambda: "br.com.brainweb.ifood"
+        app._automation_current_task_gid = lambda: "task-1"
+        app._automation_task_notes = (
+            "包名：br.com.brainweb.ifood\nGP链接：https://example.test"
+        )
+        app._automation_batch_active = True
+        app._automation_batch_device_profile = {}
+        app._automation_stop_event = threading.Event()
+        app._automation_save_checkpoint = MagicMock()
+        app._automation_set_batch_stage = MagicMock()
+        app._automation_prepare_detection_sync = MagicMock(return_value={})
+        app._automation_apply_manifest_attribution_fallback_sync = lambda result: result
+        app._automation_apply_suspected_white_package_rule_sync = lambda result: result
+        app._automation_render_fields = MagicMock()
+        app._automation_log = MagicMock()
+        app._safe_after = lambda _delay, callback, *args: callback(*args)
+        app._automation_mark_failed = MagicMock()
+        app._automation_comment_failure = MagicMock()
+        app._automation_submit_backend_sync = MagicMock()
+        client = MagicMock()
+        app._automation_asana_client = lambda: client
+        detection = {
+            "ok": False,
+            "code": "AGGREGATION_TYPE_EMPTY",
+            "message": "聚合类型识别为空\nGoogle Play下载量：10000w+",
+            "fields": {
+                "最终判断": "",
+                "_google_play_installs_text": "10000w+",
+            },
+        }
+
+        with patch("gui.PackageRuntimeMonitor"), patch(
+            "gui.detect_aggregation_with_one_retry", return_value=detection
+        ), patch("gui.reconcile_detection_result", side_effect=lambda result: result), patch(
+            "gui.private_feature_enabled", return_value=True
+        ):
+            assert app._automation_process_current_task_sync() is False
+
+        notes = client.tasks.update_task.call_args.args[1]["notes"]
+        assert "Google Play下载量:10000w+" in notes
+        assert "适配结论:聚合类型识别为空" in notes
+        assert "复核缺失项：聚合类型、广告 ID" in notes
+        app._automation_submit_backend_sync.assert_not_called()
+        app._automation_comment_failure.assert_called_once()
+
+
 class TestManifestAttributionFallback:
     @staticmethod
     def _app():
