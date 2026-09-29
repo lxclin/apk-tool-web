@@ -205,7 +205,6 @@ REPLAY_ENVIRONMENT_FAILURE_CODES = frozenset(
 INFERRED_AGGREGATION_REVIEW_NOTE = "聚合类型未确认，待人工触发广告复检"
 INFERRED_MAX_REVIEW_NOTE = "MAX聚合推断未验证，待人工触发广告复检"
 WHITE_PACKAGE_BACKEND_NOTE = "疑似白包，暂不适配"
-WHITE_PACKAGE_REVIEW_NOTE = "疑似白包，暂不适配（待复检）"
 G99_CRASH_RESULT_CODE = "G99_APP_CRASHED"
 G99_CRASH_TERMINAL_NOTE = "闪退，g99也闪退，暂不适配"
 
@@ -5224,7 +5223,7 @@ class APKToolApp:
             self._safe_after(
                 0,
                 self._automation_log,
-                f"下载量为 {fields['_google_play_installs_text']}，疑似白包，转人工复检",
+                f"下载量为 {fields['_google_play_installs_text']}，疑似白包，暂不适配",
             )
         else:
             self._safe_after(
@@ -5754,10 +5753,10 @@ class APKToolApp:
             self._safe_after(
                 0,
                 self._automation_log,
-                "临时 IronSource 尚未验证；低下载量且缺少证据，转人工复检",
+                "临时 IronSource 尚未验证；低下载量且缺少证据，疑似白包，暂不适配",
             )
             result = self._automation_complete_suspected_white_package_sync(
-                f"{white_package_detection.get('message', '疑似白包，待复检')}"
+                f"{white_package_detection.get('message', WHITE_PACKAGE_BACKEND_NOTE)}"
                 f"\n临时 IronSource 回放结果：{replay_message}",
                 clear_provisional=True,
             )
@@ -6385,9 +6384,9 @@ class APKToolApp:
     def _automation_complete_suspected_white_package_sync(
         self, message: str, *, clear_provisional: bool = False
     ) -> bool:
-        """Submit a note-only backend result and retain manual review in Asana."""
+        """Submit the suspected white-package outcome across backend and records."""
         package_name = self._automation_current_package_name()
-        review_note = WHITE_PACKAGE_REVIEW_NOTE
+        terminal_note = WHITE_PACKAGE_BACKEND_NOTE
         message = str(message or "").strip()
         if self._automation_stop_event.is_set():
             return False
@@ -6412,14 +6411,14 @@ class APKToolApp:
         self._safe_after(
             0,
             self._automation_log,
-            "[疑似白包 2/2] 回填检测依据与待复检结论",
+            "[疑似白包 2/2] 回填检测依据与暂不适配结论",
         )
         asana_error = ""
         try:
             self._automation_fill_asana_sync(
                 allow_unsupported_attribution=True,
                 allow_missing_aggregation=True,
-                terminal_note=review_note,
+                terminal_note=terminal_note,
             )
         except Exception as exc:
             asana_error = str(exc)
@@ -6428,18 +6427,27 @@ class APKToolApp:
                 self._automation_log,
                 f"疑似白包检测结果回填 Asana 描述失败：{exc}",
             )
-        review_message = (
-            f"{review_note}\n{message}\n包名：{package_name}\n"
+        evidence = message.removeprefix(terminal_note).strip()
+        comment_message = (
+            f"{terminal_note}\n"
+            + (f"{evidence}\n" if evidence else "")
+            + f"包名：{package_name}\n"
             f"后台：已提交“{WHITE_PACKAGE_BACKEND_NOTE}”并回读确认"
         )
         if asana_error:
-            review_message += f"\nAsana 描述回填失败，请人工补录：{asana_error}"
-        self._automation_comment_review(
-            "SUSPECTED_WHITE_PACKAGE_REVIEW",
-            review_message,
-            "疑似白包待复检",
+            comment_message += f"\nAsana 描述回填失败，请人工补录：{asana_error}"
+        self._automation_comment_business_outcome(
+            "SUSPECTED_WHITE_PACKAGE", comment_message
         )
-        self._safe_after(0, self._automation_log, "疑似白包备注已提交；转人工复检")
+        self._automation_task_outcome = "not_adapted"
+        self._safe_after(0, self._automation_set_status, terminal_note, "#ef6c00")
+        if self._automation_precheck_item_id:
+            self._safe_after(
+                0, self._set_precheck_task_status,
+                self._automation_precheck_item_id, terminal_note,
+            )
+        self._automation_write_sheet_outcome_sync("not_adapted", terminal_note)
+        self._safe_after(0, self._automation_log, "疑似白包，暂不适配；已提交后台并回填")
         return False
 
     def _automation_complete_unsupported_attribution_sync(

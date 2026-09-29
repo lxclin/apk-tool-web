@@ -242,7 +242,6 @@ def test_later_success_supersedes_structured_terminal_failure():
 @pytest.mark.parametrize("code", [
     "INFERRED_REPLAY_UNVERIFIED",
     "MAX_INFERRED_REPLAY_UNVERIFIED",
-    "SUSPECTED_WHITE_PACKAGE_REVIEW",
     "REPLAY_ENVIRONMENT_REVIEW",
 ])
 def test_review_outcomes_do_not_count_as_not_adapted(code):
@@ -253,6 +252,17 @@ def test_review_outcomes_do_not_count_as_not_adapted(code):
         )],
     )
     assert result["aggregation_state"] == "review"
+
+
+@pytest.mark.parametrize("code", ["SUSPECTED_WHITE_PACKAGE", "SUSPECTED_WHITE_PACKAGE_REVIEW"])
+def test_suspected_white_package_uses_canonical_not_adapted_result(code):
+    result = classify_task_comments(
+        "com.demo",
+        [DailyComment(f"【APK Tool 自动化适配：{code}】\n疑似白包，暂不适配")],
+    )
+
+    assert result["aggregation_state"] == "not_adapted"
+    assert result["aggregation_reason"] == "疑似白包，暂不适配"
 
 
 def test_skip_adaptation_wording_is_normalized_for_daily_report():

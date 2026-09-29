@@ -50,7 +50,6 @@ REVIEW_AUTOMATION_CODES = frozenset({
     "REPLAY_UNVERIFIED",
     "INFERRED_REPLAY_UNVERIFIED",
     "MAX_INFERRED_REPLAY_UNVERIFIED",
-    "SUSPECTED_WHITE_PACKAGE_REVIEW",
     "REPLAY_ENVIRONMENT_REVIEW",
 })
 URL_RE = re.compile(r"https?://\S+")
@@ -60,6 +59,8 @@ URL_RE = re.compile(r"https?://\S+")
 # comment did not explicitly include the words "暂不适配".
 STRUCTURED_AUTOMATION_ISSUES = {
     "AF_KEY_EMPTY": "af_key为空，暂不适配",
+    "SUSPECTED_WHITE_PACKAGE": "疑似白包，暂不适配",
+    "SUSPECTED_WHITE_PACKAGE_REVIEW": "疑似白包，暂不适配",
     "LOGCAT_ENDED": "聚合回放失败（Logcat监听提前结束），暂不适配",
     "AUTOMATION_FAILED": "自动化适配失败，暂不适配",
 }
@@ -405,7 +406,6 @@ def classify_task_comments(
                     "REPLAY_UNVERIFIED": "广告展示未验证，待复测",
                     "INFERRED_REPLAY_UNVERIFIED": "聚合推断未验证，待人工复检",
                     "MAX_INFERRED_REPLAY_UNVERIFIED": "MAX推断未验证，待人工复检",
-                    "SUSPECTED_WHITE_PACKAGE_REVIEW": "疑似白包，待人工复检",
                     "REPLAY_ENVIRONMENT_REVIEW": "回放环境异常，待复检",
                 }[code]
                 continue

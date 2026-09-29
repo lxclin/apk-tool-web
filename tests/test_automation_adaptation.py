@@ -2040,6 +2040,20 @@ def test_white_package_180k_boundary(installs, expected):
     assert detection_field_issue(complete_fields) is None
 
 
+def test_suspected_white_package_uses_canonical_conclusion():
+    fields = {
+        "最终判断": "未检测到主要聚合平台",
+        "归因平台": "Adjust",
+        "_google_play_installs": 10000,
+        "_google_play_installs_text": "10,000+",
+    }
+
+    assert detection_field_issue(fields) == (
+        "SUSPECTED_WHITE_PACKAGE",
+        "疑似白包，暂不适配\nGoogle Play 下载量10,000+，且未发现可用聚合线索",
+    )
+
+
 def test_explicit_max_without_ids_is_not_mislabeled_white_package():
     fields = {
         "最终判断": "MAX聚合",
@@ -2087,8 +2101,8 @@ def test_asana_update_allows_missing_aggregation_for_white_package_terminal():
         fields,
         allow_unsupported_attribution=True,
         allow_missing_aggregation=True,
-        terminal_note="疑似白包，暂不适配（待复检）",
+        terminal_note="疑似白包，暂不适配",
     )
 
-    assert "适配结论:疑似白包，暂不适配（待复检）" in merged
+    assert "适配结论:疑似白包，暂不适配" in merged
     client.tasks.update_task.assert_called_once()

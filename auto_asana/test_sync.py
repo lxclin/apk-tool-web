@@ -283,7 +283,7 @@ class TestAsanaPrecheckTasks:
     @pytest.mark.parametrize("code, expected", [
         ("INFERRED_REPLAY_UNVERIFIED", "聚合推断待复检"),
         ("MAX_INFERRED_REPLAY_UNVERIFIED", "MAX推断待复检"),
-        ("SUSPECTED_WHITE_PACKAGE_REVIEW", "疑似白包待复检"),
+        ("SUSPECTED_WHITE_PACKAGE_REVIEW", "疑似白包，暂不适配"),
         ("REPLAY_ENVIRONMENT_REVIEW", "回放环境待复检"),
     ])
     def test_review_comment_supersedes_old_terminal_status(self, code, expected):
@@ -293,7 +293,10 @@ class TestAsanaPrecheckTasks:
         ]
         stages = classify_precheck_workflow_stages(stories)
         assert stages.workflow_status == expected
-        assert stages.final_business_status == ""
+        assert stages.final_business_status == (
+            "疑似白包，暂不适配"
+            if code == "SUSPECTED_WHITE_PACKAGE_REVIEW" else ""
+        )
 
     def test_white_package_review_records_whether_backend_was_changed(self):
         direct = classify_precheck_workflow_stages([{
@@ -526,7 +529,7 @@ class TestAsanaPrecheckTasks:
             ("Singular归因，暂不适配", "其他归因"),
             (
                 "【APK Tool 自动化适配：SUSPECTED_WHITE_PACKAGE】\n疑似白包，暂不适配",
-                "疑似白包",
+                "疑似白包，暂不适配",
             ),
             ("【APK Tool 自动化适配：AF_KEY_EMPTY】\naf_key为空", "af_key为空"),
             ("人工检查：af_key未找到", "af_key为空"),

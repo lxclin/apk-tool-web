@@ -5522,7 +5522,7 @@ class TestSuspectedWhitePackageRule:
             "聚合类型识别为空\nGoogle Play下载量：50000w+"
         )
 
-    def test_white_package_submits_backend_note_and_keeps_review_state(self):
+    def test_white_package_submits_backend_note_and_marks_not_adapted(self):
         import threading
 
         app = self._app()
@@ -5534,7 +5534,7 @@ class TestSuspectedWhitePackageRule:
         app._automation_stop_event = threading.Event()
         app._automation_precheck_item_id = ""
         app._automation_fill_asana_sync = MagicMock()
-        app._automation_comment_review = MagicMock()
+        app._automation_comment_business_outcome = MagicMock()
         app._automation_clear_inferred_backend_sync = MagicMock(
             return_value={"ok": True, "message": "提交并刷新成功"}
         )
@@ -5548,18 +5548,21 @@ class TestSuspectedWhitePackageRule:
         app._automation_fill_asana_sync.assert_called_once_with(
             allow_unsupported_attribution=True,
             allow_missing_aggregation=True,
-            terminal_note="疑似白包，暂不适配（待复检）",
+            terminal_note="疑似白包，暂不适配",
         )
-        assert app._automation_comment_review.call_args.args[0] == (
-            "SUSPECTED_WHITE_PACKAGE_REVIEW"
+        assert app._automation_comment_business_outcome.call_args.args[0] == (
+            "SUSPECTED_WHITE_PACKAGE"
         )
         app._automation_clear_inferred_backend_sync.assert_called_once_with(
             note="疑似白包，暂不适配"
         )
-        comment = app._automation_comment_review.call_args.args[1]
-        assert comment.startswith("疑似白包，暂不适配（待复检）\n")
+        comment = app._automation_comment_business_outcome.call_args.args[1]
+        assert comment.startswith("疑似白包，暂不适配\n")
         assert "后台：已提交“疑似白包，暂不适配”并回读确认" in comment
-        app._automation_write_sheet_outcome_sync.assert_not_called()
+        assert app._automation_task_outcome == "not_adapted"
+        app._automation_write_sheet_outcome_sync.assert_called_once_with(
+            "not_adapted", "疑似白包，暂不适配"
+        )
 
     def test_inferred_ironsource_timeout_is_review_not_business_rejection(self):
         app = self._app()
@@ -5630,7 +5633,7 @@ class TestSuspectedWhitePackageRule:
         app = self._app()
         app._automation_batch_active = True
         app._automation_fill_asana_sync = MagicMock()
-        app._automation_comment_review = MagicMock()
+        app._automation_comment_business_outcome = MagicMock()
         app._automation_comment_failure = MagicMock()
         app._automation_mark_failed = MagicMock()
         app._automation_clear_inferred_backend_sync = MagicMock(
@@ -5638,10 +5641,10 @@ class TestSuspectedWhitePackageRule:
         )
 
         assert app._automation_complete_suspected_white_package_sync(
-            "疑似白包，待复检", clear_provisional=True
+            "疑似白包，暂不适配", clear_provisional=True
         ) is False
         app._automation_fill_asana_sync.assert_not_called()
-        app._automation_comment_review.assert_not_called()
+        app._automation_comment_business_outcome.assert_not_called()
         assert app._automation_comment_failure.call_args.args[0] == (
             "BACKEND_CLEAR_FAILED"
         )
@@ -5650,19 +5653,20 @@ class TestSuspectedWhitePackageRule:
     def test_white_package_after_provisional_submit_clears_only_that_submit(self):
         app = self._app()
         app._automation_fill_asana_sync = MagicMock()
-        app._automation_comment_review = MagicMock()
+        app._automation_comment_business_outcome = MagicMock()
+        app._automation_write_sheet_outcome_sync = MagicMock()
         app._automation_clear_inferred_backend_sync = MagicMock(
             return_value={"ok": True, "message": "已清空并回读"}
         )
 
         assert app._automation_complete_suspected_white_package_sync(
-            "疑似白包，待复检", clear_provisional=True
+            "疑似白包，暂不适配", clear_provisional=True
         ) is False
         app._automation_clear_inferred_backend_sync.assert_called_once_with(
             note="疑似白包，暂不适配"
         )
         assert "后台：已提交“疑似白包，暂不适配”并回读确认" in (
-            app._automation_comment_review.call_args.args[1]
+            app._automation_comment_business_outcome.call_args.args[1]
         )
 
     def test_inferred_max_logcat_failure_stops_after_safe_rollback(self):

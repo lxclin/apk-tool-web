@@ -499,7 +499,7 @@ def detection_field_issue(fields: dict[str, Any] | None) -> tuple[str, str] | No
         display = str((fields or {}).get("_google_play_installs_text") or "").strip()
         return (
             "SUSPECTED_WHITE_PACKAGE",
-            f"Google Play 下载量{display or '少于18万'}，且未发现可用聚合线索，疑似白包，待复检",
+            f"疑似白包，暂不适配\nGoogle Play 下载量{display or '少于18万'}，且未发现可用聚合线索",
         )
     if not has_aggregation_type(fields):
         if has_partial_aggregation_evidence(fields):

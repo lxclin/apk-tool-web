@@ -169,8 +169,8 @@ _AUTOMATION_CODE_STATUSES = {
     "AGGREGATION_REPLAY_SUCCESS": "聚合适配成功",
     "UNSUPPORTED_ATTRIBUTION": "其他归因",
     "UNSUPPORTED_AGGREGATION": "TradPlus暂不适配",
-    "SUSPECTED_WHITE_PACKAGE": "疑似白包",
-    "SUSPECTED_WHITE_PACKAGE_REVIEW": "疑似白包待复检",
+    "SUSPECTED_WHITE_PACKAGE": "疑似白包，暂不适配",
+    "SUSPECTED_WHITE_PACKAGE_REVIEW": "疑似白包，暂不适配",
     "INFERRED_REPLAY_UNVERIFIED": "聚合推断待复检",
     "MAX_INFERRED_REPLAY_UNVERIFIED": "MAX推断待复检",
     "REPLAY_ENVIRONMENT_REVIEW": "回放环境待复检",
@@ -405,17 +405,17 @@ def classify_precheck_workflow_stages(
                 backend_submission_status = "参数已清空"
                 final_business_status = "TradPlus暂不适配"
             elif code == "SUSPECTED_WHITE_PACKAGE":
-                aggregation_detection_status = "疑似白包"
+                aggregation_detection_status = "疑似白包，暂不适配"
                 backend_submission_status = "提交成功"
-                final_business_status = "疑似白包"
+                final_business_status = "疑似白包，暂不适配"
             elif code == "SUSPECTED_WHITE_PACKAGE_REVIEW":
-                aggregation_detection_status = "疑似白包待复检"
+                aggregation_detection_status = "疑似白包，暂不适配"
                 backend_submission_status = (
                     "临时参数已清空"
                     if "后台：临时参数已清空" in text
                     else "后台未修改"
                 )
-                final_business_status = ""
+                final_business_status = "疑似白包，暂不适配"
             elif code in {
                 "INFERRED_REPLAY_UNVERIFIED",
                 "MAX_INFERRED_REPLAY_UNVERIFIED",
