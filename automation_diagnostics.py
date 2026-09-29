@@ -169,6 +169,12 @@ def analyze_reports(reports: list[dict], *, now: datetime | None = None) -> dict
             if failures:
                 add(package, "PERSISTENCE_STEP_FAILED", "high", [item],
                     "Asana 或后台写入失败，需核对最终任务状态")
+            cleanup_failures = [event for event in item.get("events") or []
+                                if event.get("stage") == "process_cleanup"
+                                and (event.get("data") or {}).get("status") == "failed"]
+            if cleanup_failures:
+                add(package, "PROCESS_CLEANUP_FAILED", "high", [item],
+                    "适配后未能确认目标应用进程退出，需检查设备与后续任务")
 
     findings.sort(key=lambda item: ({"high": 0, "medium": 1, "low": 2}[item["severity"]], item["package_name"], item["code"]))
     latest_counts = Counter(history[-1].get("status", "unknown") for history in by_package.values())

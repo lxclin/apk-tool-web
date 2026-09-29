@@ -1531,7 +1531,9 @@ class TestAutomationBatchActions:
                     return_value={"ok": True, "code": "OK", "message": "ok"},
                 ) as submit, patch.object(
                     app, "_automation_run_command_sync", return_value="Success"
-                ) as run_command:
+                ) as run_command, patch.object(
+                    app, "_automation_package_processes_sync", return_value=[]
+                ):
                     result = app._automation_submit_backend_sync()
                     cleaned = app._automation_cleanup_current_app_sync("done")
 
@@ -2582,7 +2584,8 @@ class TestAutomationBatchActions:
                 app = APKToolApp(root)
                 app.automation_package_var.set("com.finished.game")
                 with patch.object(app, "_automation_stop_active_logcat") as stop_logcat, \
-                     patch.object(app, "_automation_run_command_sync") as run_command:
+                     patch.object(app, "_automation_run_command_sync") as run_command, \
+                     patch.object(app, "_automation_package_processes_sync", return_value=[]):
                     cleaned = app._automation_cleanup_current_app_sync(
                         "聚合回放检查结束"
                     )

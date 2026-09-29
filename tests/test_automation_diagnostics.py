@@ -91,6 +91,15 @@ def test_running_report_without_heartbeat_and_many_replay_rounds():
     }
 
 
+def test_cleanup_failure_is_visible_even_if_older_report_says_success():
+    report = _report(
+        "com.example", "success", "AGGREGATION_REPLAY_SUCCESS", 1,
+        events=[{"stage": "process_cleanup", "data": {"status": "failed"}}],
+    )
+    findings = analyze_reports([report])["findings"]
+    assert [item["code"] for item in findings] == ["PROCESS_CLEANUP_FAILED"]
+
+
 def test_gui_report_event_accepts_retry_details_without_tk_window():
     from gui import APKToolApp
 

@@ -134,6 +134,7 @@ from automation_checkpoint import (
     resumable_summary,
 )
 from automation_report import AutomationReportStore
+from automation_process import matching_package_processes
 from automation_diagnostics import (
     analyze_reports,
     field_snapshot,
@@ -6132,6 +6133,21 @@ class APKToolApp:
         except Exception as exc:
             self._safe_after(0, self._automation_log, f"Asana 成功评论写入失败: {exc}")
 
+    def _automation_confirm_cleanup_after_replay_sync(self) -> bool:
+        """Do not publish a completed outcome while the tested app is alive."""
+        if self._automation_cleanup_current_app_sync("回放成功，提交结论前"):
+            return True
+        package_name = self._automation_current_package_name()
+        self._automation_comment_review(
+            "PROCESS_CLEANUP_UNCONFIRMED",
+            f"广告回放已成功，但未能确认检测应用进程停止；包名：{package_name}。"
+            "请检查 ADB 连接及应用进程后继续处理。",
+            "进程清理待确认",
+        )
+        if self._automation_batch_active:
+            self._automation_stop_event.set()
+        return False
+
     def _automation_write_sheet_outcome_sync(
         self,
         outcome: str,
@@ -7038,6 +7054,8 @@ class APKToolApp:
                 if result.get("code") == "AGGREGATION_TYPE_CHANGED_DURING_REPLAY":
                     self._automation_handle_replay_type_change_sync(result)
                 elif result.get("ok"):
+                    if not self._automation_confirm_cleanup_after_replay_sync():
+                        return
                     self._automation_comment_success(result)
                     self._safe_after(0, self._automation_handle_replay_result, result)
                 elif self._automation_fields.get("_max_aggregation_type_inferred"):
@@ -7143,6 +7161,8 @@ class APKToolApp:
         if replay.get("code") == "AGGREGATION_TYPE_CHANGED_DURING_REPLAY":
             return self._automation_handle_replay_type_change_sync(replay)
         if replay.get("ok"):
+            if not self._automation_confirm_cleanup_after_replay_sync():
+                return False
             self._automation_comment_success(replay)
         elif self._automation_fields.get("_max_aggregation_type_inferred"):
             return self._automation_handle_inferred_max_replay_failure_sync(replay)
@@ -7605,25 +7625,54 @@ class APKToolApp:
         self._automation_stop_active_logcat(reason or "当前包体检查结束")
         if not package_name:
             return False
-        try:
-            self._automation_run_command_sync(
-                build_force_stop_cmd(package_name),
-                timeout=15,
-                respect_control=False,
-            )
-            self._safe_after(
-                0,
-                self._automation_log,
-                f"ADB | 检查完成，已停止应用后台进程: {package_name}",
-            )
-            return True
-        except Exception as exc:
-            self._safe_after(
-                0,
-                self._automation_log,
-                f"ADB | 检查完成，但停止应用后台进程失败: {exc}",
-            )
-            return False
+        last_error = ""
+        for stop_attempt in range(2):
+            try:
+                self._automation_run_command_sync(
+                    build_force_stop_cmd(package_name),
+                    timeout=15,
+                    respect_control=False,
+                )
+                for poll in range(3):
+                    processes = self._automation_package_processes_sync(package_name)
+                    if not processes:
+                        self._automation_report_event(
+                            "process_cleanup", status="success",
+                            details={"force_stop_attempts": stop_attempt + 1},
+                        )
+                        self._safe_after(
+                            0, self._automation_log,
+                            f"ADB | 已停止并确认应用进程退出: {package_name}",
+                        )
+                        return True
+                    last_error = "仍在运行：" + ", ".join(processes)
+                    if poll < 2:
+                        time.sleep(0.4)
+            except Exception as exc:
+                last_error = str(exc)
+            if stop_attempt == 0:
+                time.sleep(0.5)
+        self._automation_report_event(
+            "process_cleanup", status="failed",
+            details={"reason": last_error[:160]},
+        )
+        self._safe_after(
+            0, self._automation_log,
+            f"ADB | 停止应用进程未获确认: {package_name}；{last_error}",
+        )
+        return False
+
+    @staticmethod
+    def _automation_package_processes_sync(package_name: str) -> list[str]:
+        """Read all app processes quietly; a failed ADB query is not success."""
+        result = subprocess.run(
+            [get_adb_path(), "shell", "ps", "-A"],
+            capture_output=True, text=True, timeout=8,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "ADB 进程列表读取失败").strip()
+            raise RuntimeError(detail[:240])
+        return matching_package_processes(result.stdout, package_name)
 
     def _write_automation_task_config(
         self,
@@ -8284,6 +8333,8 @@ class APKToolApp:
         if replay.get("code") == "AGGREGATION_TYPE_CHANGED_DURING_REPLAY":
             return self._automation_handle_replay_type_change_sync(replay)
         if replay.get("ok"):
+            if not self._automation_confirm_cleanup_after_replay_sync():
+                return False
             self._automation_comment_success(replay)
             self._safe_after(
                 0, self._automation_log, replay.get("message", "聚合广告回放成功")
