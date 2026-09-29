@@ -6,6 +6,7 @@ import cp_candidate_assignment
 
 from cp_candidate_assignment import (
     assign_cp_candidate,
+    assign_cp_candidates,
     build_historical_success_profile,
     build_historical_success_profile_from_sheets,
     extract_up2_appid,
@@ -346,3 +347,110 @@ def test_assign_candidate_rejects_unconfirmed_readback():
             token="fixed",
             session=session,
         )
+
+
+def test_batch_reconciles_one_stale_readback_among_fourteen_assignments():
+    packages = [f"com.demo.{index}" for index in range(14)]
+    session = Mock()
+    responses = []
+    for index, package_name in enumerate(packages):
+        responses.append(response({"code": 200, "data": {}}))
+        rows = [] if index == 13 else [record(package_name, assign="rain")]
+        responses.append(response({"code": 200, "data": {"data": rows}}))
+    responses.append(response({
+        "code": 200,
+        "data": {
+            "total": 14,
+            "data": [record(package_name, assign="rain") for package_name in packages],
+        },
+    }))
+    session.post.side_effect = responses
+
+    result = assign_cp_candidates(
+        packages,
+        api_url="http://example.test/cp_adapt/list",
+        x_token="x",
+        token="fixed",
+        session=session,
+    )
+
+    assert result["ok"] is True
+    assert result["success_count"] == 14
+    assert result["failure_count"] == 0
+    assert result["results"][-1]["verified_by"] == "batch_readback"
+    assert session.post.call_args.kwargs["json"]["assign"] == "rain"
+
+
+def test_batch_rechecks_eventually_visible_assignment_without_resubmitting(monkeypatch):
+    monkeypatch.setattr(cp_candidate_assignment.time, "sleep", lambda _seconds: None)
+    session = Mock()
+    session.post.side_effect = [
+        response({"code": 200, "data": {}}),
+        response({"code": 200, "data": {"data": []}}),
+        response({"code": 200, "data": {"total": 0, "data": []}}),
+        response({
+            "code": 200,
+            "data": {"total": 1, "data": [record("com.demo", assign="rain")]},
+        }),
+    ]
+
+    result = assign_cp_candidates(
+        ["com.demo"],
+        api_url="http://example.test/cp_adapt/list",
+        x_token="x",
+        token="fixed",
+        session=session,
+    )
+
+    assert result["success_count"] == 1
+    assert result["failure_count"] == 0
+    assert sum(call.args[0].endswith("/s10_package_info") for call in session.post.call_args_list) == 1
+
+
+def test_batch_reconciliation_reads_later_backend_pages():
+    session = Mock()
+    session.post.side_effect = [
+        response({"code": 200, "data": {}}),
+        response({"code": 200, "data": {"data": []}}),
+        response({
+            "code": 200,
+            "data": {"total": 2, "data": [record("com.other", assign="rain")]},
+        }),
+        response({
+            "code": 200,
+            "data": {"total": 2, "data": [record("com.demo", assign="rain")]},
+        }),
+    ]
+
+    result = assign_cp_candidates(
+        ["com.demo"],
+        api_url="http://example.test/cp_adapt/list",
+        x_token="x",
+        token="fixed",
+        session=session,
+    )
+
+    assert result["success_count"] == 1
+    assert session.post.call_args.kwargs["json"]["page"] == 2
+
+
+def test_batch_keeps_unconfirmed_assignment_as_failure(monkeypatch):
+    monkeypatch.setattr(cp_candidate_assignment.time, "sleep", lambda _seconds: None)
+    session = Mock()
+    session.post.side_effect = [
+        response({"code": 200, "data": {}}),
+        response({"code": 200, "data": {"data": []}}),
+        *(response({"code": 200, "data": {"total": 0, "data": []}}) for _ in range(4)),
+    ]
+
+    result = assign_cp_candidates(
+        ["com.demo"],
+        api_url="http://example.test/cp_adapt/list",
+        x_token="x",
+        token="fixed",
+        session=session,
+    )
+
+    assert result["success_count"] == 0
+    assert result["failure_count"] == 1
+    assert "回读未确认" in result["results"][0]["error"]

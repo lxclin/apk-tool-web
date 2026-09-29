@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.parse
 from collections import defaultdict
 from typing import Any, Iterable
@@ -35,6 +36,7 @@ REWARD_PATTERN = re.compile(r"reward|earn|cash|coin|money|withdraw", re.I)
 SOCIAL_PATTERN = re.compile(r"social|chat|video|music|photo|story|reels", re.I)
 UP2_APPID_PATTERN = re.compile(r"^(?:A2:)?[0-9a-f]{32}$", re.I)
 CP_PRIORITY_RANK = {"高": 0, "中": 1, "低": 2}
+ASSIGNMENT_RECHECK_DELAYS_SECONDS = (0, 1, 2, 3)
 
 FALLBACK_CATEGORY_RATES = {
     "日本包体": 7,
@@ -600,28 +602,120 @@ def assign_cp_candidate(
     }
 
 
+def _confirm_batch_assignments(
+    package_names: set[str],
+    *,
+    api_url: str,
+    x_token: str,
+    token: str,
+    assignee: str,
+    timeout_seconds: int,
+    session: Any,
+) -> set[str]:
+    """Read the assignee's complete backend list after all writes have settled."""
+    if not package_names:
+        return set()
+    confirmed: set[str] = set()
+    limit = 999
+    scanned = 0
+    for page in range(1, 101):
+        response = session.post(
+            _derive_list_url(api_url),
+            headers=_headers(x_token, token),
+            json={
+                "is_adapted": "all",
+                "hide_remarked": False,
+                "hide_no_up2_appid": False,
+                "assign": assignee,
+                "limit": limit,
+                "page": page,
+            },
+            timeout=max(10, min(int(timeout_seconds), 120)),
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict) or body.get("code") != 200:
+            raise RuntimeError("后台批量回读失败")
+        data = body.get("data")
+        records = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(records, list):
+            raise RuntimeError("后台批量回读数据格式异常")
+        scanned += len(records)
+        confirmed.update(
+            str(item.get("package_name") or "").strip()
+            for item in records
+            if isinstance(item, dict)
+            and str(item.get("assign") or "").strip() == assignee
+        )
+        if package_names <= confirmed or not records:
+            break
+        try:
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if (total and scanned >= total) or (not total and len(records) < limit):
+            break
+    return confirmed & package_names
+
+
 def assign_cp_candidates(
     package_names: Iterable[str],
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Assign selected packages independently and return per-package results."""
+    """Assign packages, then reconcile uncertain results against backend state."""
+    require_private_feature("cp_candidate_assignment")
     results = []
     seen: set[str] = set()
-    for raw_name in package_names:
-        package_name = str(raw_name or "").strip()
-        if not package_name or package_name in seen:
-            continue
-        seen.add(package_name)
-        try:
-            results.append(assign_cp_candidate(package_name, **kwargs))
-        except Exception as exc:  # Keep the remaining selected packages moving.
-            results.append(
-                {
-                    "ok": False,
-                    "package_name": package_name,
-                    "error": str(exc),
-                }
-            )
+    assignment_kwargs = dict(kwargs)
+    http = assignment_kwargs.get("session")
+    owned_session = http is None
+    if owned_session:
+        http = requests.Session()
+    assignment_kwargs["session"] = http
+    try:
+        for raw_name in package_names:
+            package_name = str(raw_name or "").strip()
+            if not package_name or package_name in seen:
+                continue
+            seen.add(package_name)
+            try:
+                results.append(assign_cp_candidate(package_name, **assignment_kwargs))
+            except Exception as exc:  # Keep the remaining selected packages moving.
+                results.append(
+                    {
+                        "ok": False,
+                        "package_name": package_name,
+                        "error": str(exc),
+                    }
+                )
+
+        pending = {item["package_name"] for item in results if not item["ok"]}
+        for delay in ASSIGNMENT_RECHECK_DELAYS_SECONDS:
+            if not pending:
+                break
+            if delay:
+                time.sleep(delay)
+            try:
+                confirmed = _confirm_batch_assignments(
+                    pending,
+                    api_url=assignment_kwargs["api_url"],
+                    x_token=assignment_kwargs["x_token"],
+                    token=assignment_kwargs["token"],
+                    assignee=str(assignment_kwargs.get("assignee") or "rain").strip(),
+                    timeout_seconds=assignment_kwargs.get("timeout_seconds", 60),
+                    session=http,
+                )
+            except Exception:
+                continue
+            for item in results:
+                if not item["ok"] and item["package_name"] in confirmed:
+                    item.update(ok=True, assign=assignment_kwargs.get("assignee", "rain"))
+                    item["verified_by"] = "batch_readback"
+                    item.pop("error", None)
+            pending -= confirmed
+    finally:
+        if owned_session:
+            http.close()
     return {
         "ok": all(item.get("ok") for item in results),
         "success_count": sum(bool(item.get("ok")) for item in results),
