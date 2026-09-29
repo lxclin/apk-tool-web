@@ -1028,6 +1028,58 @@ def test_backend_requires_af_key_only_for_appsflyer_attribution():
     )
 
 
+def test_mixed_adjust_appsflyer_max_can_submit_without_af_key():
+    fields = {
+        "最终判断": "MAX聚合（强关系证据确认）",
+        "初始Activity": "com.bubble.crush.stick.magicgames.MainActivity",
+        "应用类型": "Unity",
+        "归因平台": "AppsFlyer, Adjust",
+        "af_key": "",
+        "激励视频聚合id": "2ed22aa6d089678a",
+        "插屏聚合id": "",
+        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
+    }
+
+    assert detection_field_issue(fields) is None
+    assert validate_backend_fields(fields, "com.bubble.crush.stick.magicgames") == []
+    assert build_aggregation_assessment(fields)["auto_submit"] is True
+    payload = build_backend_submission_payload(fields, "com.bubble.crush.stick.magicgames")
+    assert payload["attribution_platform"] == "AppsFlyer, Adjust"
+    assert payload["af_key"] is None
+    assert payload["manual_applovin_sdk_key"] == "test-sdk-key"
+    assert payload["aggr_jilishipin_id"] == "2ed22aa6d089678a"
+    assert payload["aggr_chaping_id"] is None
+
+    restart = MagicMock()
+    extract = MagicMock()
+    result = detect_aggregation_with_one_retry(
+        "com.bubble.crush.stick.magicgames",
+        extract,
+        first_fields={"ok": True, **fields},
+        restart_app=restart,
+        wait_seconds=0,
+    )
+    assert result["ok"] is True
+    assert result["attempts"] == 1
+    restart.assert_not_called()
+    extract.assert_not_called()
+
+
+def test_mixed_adjust_appsflyer_allows_max_type_fallback_without_af_key():
+    fields = {
+        "最终判断": "",
+        "初始Activity": "com.demo.MainActivity",
+        "归因平台": "AppsFlyer, Adjust",
+        "激励视频聚合id": "reward-1",
+        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
+    }
+
+    apply_aggregation_type_fallback(fields)
+
+    assert fields["最终判断"] == "MAX聚合（根据 AppLovin SDK Key 与广告 ID 自动推断）"
+    assert fields["_max_aggregation_type_inferred"] is True
+
+
 @pytest.mark.parametrize(
     "attribution",
     ["Adjust", "AppsFlyer", "Adjust, AppMetrica", "AppsFlyer, Singular"],

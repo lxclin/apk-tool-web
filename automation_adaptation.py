@@ -156,7 +156,7 @@ def apply_aggregation_type_fallback(
         "adjust" in compact_attribution or "appsflyer" in compact_attribution
     )
     attribution_complete = supported_attribution and (
-        "appsflyer" not in compact_attribution or bool(get_af_key(fields))
+        not requires_af_key(fields) or bool(get_af_key(fields))
     )
     usable_ids = [
         value
@@ -224,9 +224,10 @@ def get_af_key(fields: dict[str, Any] | None) -> str:
 
 
 def requires_af_key(fields: dict[str, Any] | None) -> bool:
-    """AppsFlyer attribution requires af_key before backend submission."""
+    """Require af_key when AppsFlyer is the only supported attribution route."""
     attribution = normalize_optional_parameter((fields or {}).get("归因平台"))
-    return "appsflyer" in attribution.casefold().replace(" ", "")
+    compact = attribution.casefold().replace(" ", "")
+    return "appsflyer" in compact and "adjust" not in compact
 
 
 def has_explicit_attribution(fields: dict[str, Any] | None) -> bool:
