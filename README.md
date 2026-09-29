@@ -4,6 +4,16 @@
 
 完整迭代索引：[APK Tool 迭代总结](ITERATION_SUMMARY.md)（含 8 月完整历史和 6–9 月更新索引）。
 
+## 自动适配异常诊断
+
+自动适配会在 `automation_reports/YYYY-MM-DD/` 为每次执行保存 JSON 报告。诊断最近 7 天：
+
+```bash
+python3 automation_diagnostics.py --days 7
+```
+
+也可以在桌面工具的自动化适配页点击“查看近7天异常”；添加 `--json` 可从命令行输出结构化结果。诊断识别复检后字段未变化、早期暂不适配或待复检结论被后续成功覆盖、超过 15 分钟无新事件的运行中报告，以及单次执行回放轮次过多。每条线索给出包名和本地报告路径；结果只代表自动执行历史，人工处理和 Asana 后续评论需另行核对。诊断摘要不输出广告 ID、af_key 或完整 Logcat。
+
 桌面标题和 `GET /api/version` 会明确显示版本及 `source/packaged` 运行方式，便于区分源码启动与旧打包应用。发布前运行 `python3 release_check.py`，确认版本清单、MAX Share 接收器和桌面/Web 打包入口完整。
 
 敏感凭证不写入源代码：Asana PAT 和后台固定 Token 可在工具界面填写，也可分别通过 `ASANA_PAT`、`CP_ADAPT_TOKEN` 环境变量提供；Google Service Account JSON 路径使用 `APK_TOOL_SA_FILE`。请勿把凭证文件或 Token 提交到 Git。

@@ -148,17 +148,22 @@ class AutomationReportStore:
             if not report:
                 return {}
             report["updated_at"] = _now_iso()
+            event_data = dict(data or {}) if isinstance(data, dict) else {}
+            # Keep the latest full extraction once at report level. Repeating
+            # it in every replay heartbeat makes reports huge and obscures the
+            # state transitions that diagnostics need to inspect.
+            fields = event_data.pop("fields", None)
+            if isinstance(fields, dict):
+                report["fields"] = _safe(fields)
             report["events"].append(
                 {
                     "at": report["updated_at"],
                     "stage": str(stage or ""),
                     "message": str(message or ""),
-                    "data": _safe(data or {}),
+                    "data": _safe(event_data),
                 }
             )
             report["events"] = report["events"][-300:]
-            if isinstance(data, dict) and isinstance(data.get("fields"), dict):
-                report["fields"] = _safe(data["fields"])
             self._write(path, report)
             return deepcopy(report)
 

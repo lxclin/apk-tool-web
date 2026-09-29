@@ -134,6 +134,13 @@ from automation_checkpoint import (
     resumable_summary,
 )
 from automation_report import AutomationReportStore
+from automation_diagnostics import (
+    analyze_reports,
+    field_snapshot,
+    load_reports,
+    render_text,
+    replay_snapshot,
+)
 from device_health import run_device_health_check
 from retry_policy import is_transient_automation_error, run_with_retry
 from workflow_engine import (
@@ -4482,6 +4489,11 @@ class APKToolApp:
             recovery, text="没有未完成的自动化队列", foreground="gray"
         )
         self._automation_checkpoint_status.pack(side=tk.LEFT)
+        ttk.Button(
+            recovery,
+            text="查看近7天异常",
+            command=self._automation_show_recent_diagnostics,
+        ).pack(side=tk.RIGHT, padx=(0, 6))
         self._automation_discard_checkpoint_btn = ttk.Button(
             recovery,
             text="放弃恢复记录",
@@ -4613,15 +4625,30 @@ class APKToolApp:
             message="开始自动化适配",
         )
 
-    def _automation_report_event(self, stage: str, message: str = "") -> None:
-        if not self._automation_report_path:
+    def _automation_report_event(
+        self,
+        stage: str,
+        message: str = "",
+        *,
+        status: str = "",
+        details: dict | None = None,
+    ) -> None:
+        if not getattr(self, "_automation_report_path", ""):
             return
         try:
+            fields = dict(self._automation_fields or {})
+            event_data = {"diagnostic": field_snapshot(fields)}
+            if status:
+                event_data["status"] = status
+            if details:
+                event_data["details"] = details
+            if stage in {"fields_detected", "backend_verified", "detection_result"}:
+                event_data["fields"] = fields
             self._automation_report_store.add_event(
                 self._automation_report_path,
                 stage,
                 message=message,
-                data={"fields": dict(self._automation_fields or {})},
+                data=event_data,
             )
         except OSError as exc:
             self._safe_after(0, self._automation_log, f"执行报告写入失败: {exc}")
@@ -4725,6 +4752,11 @@ class APKToolApp:
         state = tk.NORMAL if enabled else tk.DISABLED
         self._automation_resume_btn.configure(state=state)
         self._automation_discard_checkpoint_btn.configure(state=state)
+
+    def _automation_show_recent_diagnostics(self) -> None:
+        """Show local execution anomalies without modifying any task state."""
+        result = analyze_reports(load_reports(AUTOMATION_REPORT_DIR, days=7))
+        self._automation_log(render_text(result))
 
     def _automation_save_checkpoint(
         self,
@@ -5461,16 +5493,24 @@ class APKToolApp:
             raise ValueError("聚合类型识别为空，不能回填 Asana 描述")
         task_gid = self._automation_current_task_gid()
         client = self._automation_asana_client()
-        merged = update_asana_aggregation_notes(
-            client,
-            task_gid,
-            self._automation_task_notes,
-            self._automation_fields,
-            allow_unsupported_attribution=allow_unsupported_attribution,
-            allow_missing_aggregation=allow_missing_aggregation,
-            terminal_note=terminal_note,
-        )
+        try:
+            merged = update_asana_aggregation_notes(
+                client,
+                task_gid,
+                self._automation_task_notes,
+                self._automation_fields,
+                allow_unsupported_attribution=allow_unsupported_attribution,
+                allow_missing_aggregation=allow_missing_aggregation,
+                terminal_note=terminal_note,
+            )
+        except Exception:
+            self._automation_report_event("asana_notes_written", status="failed")
+            raise
         self._automation_task_notes = merged
+        self._automation_report_event(
+            "asana_notes_written", status="success",
+            details={"allow_missing_aggregation": allow_missing_aggregation},
+        )
         return merged
 
     def _automation_persist_detected_failure_fields_sync(
@@ -5590,15 +5630,25 @@ class APKToolApp:
             )
 
         try:
-            return run_with_retry(
+            submitted = run_with_retry(
                 _submit,
                 attempts=3,
                 delays=(2.0, 4.0),
                 on_retry=_on_retry,
                 stop_event=self._automation_stop_event,
             )
+            self._automation_report_event(
+                "backend_submitted",
+                status="success" if submitted.get("ok") else "failed",
+                details={"code": str(submitted.get("code") or "")[:80]},
+            )
+            return submitted
         except RuntimeError:
             if last_result:
+                self._automation_report_event(
+                    "backend_submitted", status="failed",
+                    details={"code": str(last_result.get("code") or "")[:80]},
+                )
                 return last_result
             raise
 
@@ -6780,6 +6830,11 @@ class APKToolApp:
                     )
                 result = self._automation_replay_sync(**replay_kwargs)
             last_result = result
+            self._automation_report_event(
+                "replay_attempt",
+                status="success" if result.get("ok") else "failed",
+                details=replay_snapshot(result, round_number=attempts),
+            )
 
             for ad_type in configured:
                 state = result.get(ad_type) or {}
@@ -7969,6 +8024,14 @@ class APKToolApp:
             )
             return False
         self._automation_fields = detection.get("fields") or {}
+        self._automation_report_event(
+            "detection_result",
+            status="success" if detection.get("ok") else "failed",
+            details={
+                "code": str(detection.get("code") or "")[:80],
+                "attempts": int(detection.get("attempts") or 0),
+            },
+        )
         if self._automation_fields:
             self._safe_after(
                 0,
@@ -8652,6 +8715,14 @@ class APKToolApp:
                                     f"延迟重试断点保存失败: {exc}",
                                 )
                         pending.append(retry_entry)
+                        self._automation_report_event(
+                            "retry_queued", status="retrying",
+                            details={
+                                "code": str(deferred_failure.get("code") or "")[:80],
+                                "attempt": attempt + 1,
+                                "delay_seconds": retry_delay_seconds,
+                            },
+                        )
                         retried += 1
                         wait_minutes = max(
                             1, (retry_delay_seconds + 59) // 60

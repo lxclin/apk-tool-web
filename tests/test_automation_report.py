@@ -27,6 +27,7 @@ def test_report_tracks_stages_fields_and_result(tmp_path):
 
     assert final["status"] == "success"
     assert final["fields"]["最终判断"] == "MAX聚合"
+    assert "fields" not in final["events"][0]["data"]
     assert [event["stage"] for event in final["events"]] == [
         "fields_detected",
         "finished",
