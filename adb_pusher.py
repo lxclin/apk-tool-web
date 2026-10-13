@@ -3049,6 +3049,32 @@ def _target_aggr_from_final(final: str) -> str:
     return ""
 
 
+def prioritized_ad_unit_ids(value, aggregation_verdict: str, field_name: str) -> tuple[str, ...]:
+    """Concrete units replace symbolic IronSource placements for the same format."""
+    placeholders = {"video", "reward", "rewarded", "rewarded_video", "inter", "interstitial"}
+    tokens = []
+    for item in re.split(r"[,，\s]+", str(value or "")):
+        item = normalize_optional_parameter(item)
+        if item and item not in tokens:
+            tokens.append(item)
+    concrete = tuple(item for item in tokens if item.casefold() not in placeholders)
+    if concrete:
+        return concrete
+    platform = _target_aggr_from_final(normalize_optional_parameter(aggregation_verdict))
+    allowed = {"激励视频聚合id": "video", "插屏聚合id": "inter"}.get(field_name)
+    if (platform in {"ironsource", "levelplay"} or not platform) and allowed:
+        return tuple(item for item in tokens if item.casefold() == allowed)
+    return ()
+
+
+def normalize_detected_ad_unit_ids(fields: dict) -> dict:
+    verdict = normalize_optional_parameter(fields.get("最终判断"))
+    for name in ("插屏聚合id", "激励视频聚合id"):
+        if name in fields:
+            fields[name] = ", ".join(prioritized_ad_unit_ids(fields[name], verdict, name))
+    return fields
+
+
 def _clean_detected_value(value: str) -> str:
     cleaned = value.strip().strip("[]").strip()
     if cleaned == "未找到":
@@ -3526,7 +3552,7 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
         fields["_aggregation_platform_corrected"] = "max_to_admob_runtime"
         target_sdk = "admob"
     selected_ids = sdk_ids.get(target_sdk, {}) if target_sdk else {}
-    if not selected_ids:
+    if not selected_ids and not target_sdk:
         for sdk_key in sdk_order:
             candidate = sdk_ids.get(sdk_key, {})
             if candidate.get("reward") or candidate.get("interstitial"):
@@ -3573,7 +3599,7 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
         dict.fromkeys(tag_lines[-50:] + runtime_ids["evidence"][-20:])
     )
     fields["完整日志"] = "\n".join(retained_logs)
-    return fields
+    return normalize_detected_ad_unit_ids(fields)
 
 
 def set_adb_path(path: str):
@@ -4932,7 +4958,8 @@ def build_backend_url(fields: dict, package_name: str) -> str:
     for src, dst in single_value_field_map.items():
         val = normalize_optional_parameter(fields.get(src, ""))
         if val:
-            first_value = first_csv_value(val)
+            candidates = prioritized_ad_unit_ids(val, final, src)
+            first_value = candidates[0] if candidates else ""
             if first_value:
                 params[dst] = first_value
 

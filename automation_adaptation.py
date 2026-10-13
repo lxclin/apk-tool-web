@@ -26,6 +26,7 @@ from adb_pusher import (
     get_adb_path,
     launch_app_with_fallback,
     normalize_optional_parameter,
+    prioritized_ad_unit_ids, normalize_detected_ad_unit_ids,
 )
 
 
@@ -143,7 +144,7 @@ def apply_aggregation_type_fallback(
             fields.pop("_aggregation_type_inferred", None)
         if verdict != INFERRED_MAX_VERDICT:
             fields.pop("_max_aggregation_type_inferred", None)
-        return fields
+        return normalize_detected_ad_unit_ids(fields)
     rewarded = normalize_optional_parameter(fields.get("激励视频聚合id")).casefold()
     interstitial = normalize_optional_parameter(fields.get("插屏聚合id")).casefold()
     if rewarded == "video" and interstitial == "inter":
@@ -301,18 +302,41 @@ def aggregation_gate_issue(fields: dict[str, Any] | None) -> tuple[str, str] | N
 
 
 def get_ad_unit_id(fields: dict[str, Any] | None, field_name: str) -> str:
-    """Return one usable ad ID, including IronSource symbolic placements."""
+    """Prefer concrete units; symbolic placements are last-resort family values."""
     fields = fields or {}
     apply_aggregation_type_fallback(fields)
-    value = normalize_optional_parameter(fields.get(field_name))
-    first = value.split(",", 1)[0].strip() if value else ""
-    if first.casefold() in INVALID_AD_ID_VALUES:
-        final = normalize_optional_parameter(fields.get("最终判断")).casefold()
-        is_ironsource_family = "ironsource" in final or "levelplay" in final
-        allowed = SYMBOLIC_AD_IDS_BY_FIELD.get(field_name, frozenset())
-        if not is_ironsource_family or first.casefold() not in allowed:
+    candidates = prioritized_ad_unit_ids(fields.get(field_name), fields.get("最终判断", ""), field_name)
+    if candidates and candidates[0].casefold() in INVALID_AD_ID_VALUES:
+        verdict = str(fields.get("最终判断") or "").casefold().replace("_", "")
+        if "ironsource" not in verdict and "levelplay" not in verdict:
             return ""
-    return first
+    return candidates[0] if candidates else ""
+
+
+def is_authoritative_aggregation_upgrade(current: dict, detected: dict) -> bool:
+    """Promote IronSource placeholders to a complete MAX/LevelPlay result."""
+    old = str(current.get("最终判断") or "").casefold().replace("_", "")
+    new = str(detected.get("最终判断") or "").casefold().replace("_", "")
+    if not any(token in old for token in ("ironsource", "levelplay")):
+        return False
+    new_max = "max" in new or "applovin" in new
+    new_level = "levelplay" in new
+    if not (new_max or new_level):
+        return False
+    assessment = build_aggregation_assessment(detected)
+    if assessment["confidence"] != "高" or not assessment["auto_submit"]:
+        return False
+    if new_max:
+        return True
+    concrete = any(get_ad_unit_id(detected, name).casefold() not in INVALID_AD_ID_VALUES
+                   and get_ad_unit_id(detected, name) for name in ("插屏聚合id", "激励视频聚合id"))
+    if not concrete:
+        return False
+    if "ironsource" in old:
+        return True
+    # Same-platform late results only supersede an all-placeholder configuration.
+    return not any(get_ad_unit_id(current, name).casefold() not in INVALID_AD_ID_VALUES
+                   and get_ad_unit_id(current, name) for name in ("插屏聚合id", "激励视频聚合id"))
 
 
 def has_any_ad_unit_id(fields: dict[str, Any] | None) -> bool:

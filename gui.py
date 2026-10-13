@@ -62,7 +62,7 @@ from adb_pusher import (
     extract_google_play_package, is_apk_download_url,
     build_apkcombo_search_url, resolve_google_play_package,
     normalize_action_script_text,
-    normalize_optional_parameter,
+    normalize_optional_parameter, normalize_detected_ad_unit_ids,
     DEFAULT_FOLLOWING_ACTION_MIN_DELAY_MS,
     DEFAULT_KEEP_THIRD_PARTY_PACKAGES,
     cancel_zygotehole_injection,
@@ -101,7 +101,7 @@ from automation_adaptation import (
     aggregation_gate_issue,
     applovin_key_gate_issue,
     attribution_gate_issue,
-    build_aggregation_assessment,
+    build_aggregation_assessment, is_authoritative_aggregation_upgrade,
     clear_backend_adaptation_via_api,
     detect_aggregation_with_one_retry,
     detection_field_issue,
@@ -5957,12 +5957,13 @@ class APKToolApp:
         )
 
     def _automation_handle_replay_type_change_sync(self, replay: dict) -> bool:
-        """Replace provisional IronSource data with authoritative MAX data."""
+        """Replace provisional placements with authoritative platform-owned units."""
         detected_fields = dict(replay.get("detected_fields") or {})
         verdict = normalize_optional_parameter(detected_fields.get("最终判断"))
         assessment = build_aggregation_assessment(detected_fields)
+        label = "LevelPlay" if "levelplay" in verdict.casefold() else "MAX"
         if (
-            "max" not in verdict.casefold()
+            not is_authoritative_aggregation_upgrade(self._automation_fields, detected_fields)
             or assessment.get("confidence") != "高"
             or not assessment.get("auto_submit")
         ):
@@ -5971,15 +5972,15 @@ class APKToolApp:
         self._safe_after(
             0,
             self._automation_log,
-            "回放期间明确识别为 MAX；正在先清空临时 IronSource 参数",
+            f"回放期间明确识别为 {label}；正在先清空临时 IronSource 参数",
         )
         cleared = self._automation_clear_inferred_backend_sync(
-            note="回放检测到 MAX，清理临时 IronSource 参数"
+            note=f"回放检测到 {label}，清理临时 IronSource 参数"
         )
         self._safe_after(0, self._automation_log, cleared.get("message", ""))
         if not cleared.get("ok"):
             message = (
-                "检测到聚合类型变为 MAX，但清空旧 IronSource 参数失败；"
+                f"检测到聚合类型变为 {label}，但清空旧 IronSource 参数失败；"
                 "为避免混合配置，已停止自动化"
             )
             self._automation_mark_failed(message)
@@ -5992,7 +5993,7 @@ class APKToolApp:
         detected_fields["_aggregation_type_changed_during_replay"] = True
         detected_fields.pop("_aggregation_type_inferred", None)
         self._automation_fields = detected_fields
-        # The authoritative MAX result owns a different set of ad-unit
+        # The authoritative result owns a different set of ad-unit
         # candidates.  Never reuse the provisional IronSource candidate state.
         self._automation_replay_id_candidates = {}
         self._safe_after(
@@ -6004,10 +6005,10 @@ class APKToolApp:
         self._safe_after(
             0,
             self._automation_log,
-            "旧 IronSource 参数已置空；改用回放期间检测到的 MAX 参数",
+            f"旧 IronSource 参数已置空；改用回放期间检测到的 {label} 参数",
         )
-        # Reuse the standard tail: replace Asana data, submit MAX through the
-        # API, clear/read back cache, then start a fresh MAX replay.
+        # Reuse the standard tail: replace Asana data, submit new platform fields,
+        # clear/read back cache, then start a fresh platform-owned replay.
         return self._automation_execute_post_detection_sync()
 
     def _automation_handle_inferred_replay_failure_sync(
@@ -6980,6 +6981,7 @@ class APKToolApp:
         description and backend payload from showing a comma-separated list
         that was never actually replayed.
         """
+        normalize_detected_ad_unit_ids(self._automation_fields)
         candidates = {
             INTERSTITIAL: split_ad_unit_ids(
                 self._automation_fields.get("插屏聚合id", "")
@@ -7036,27 +7038,19 @@ class APKToolApp:
             raise RuntimeError(uid)
         self._safe_after(0, self._set_uid, uid)
 
-        def _higher_priority_max_detected(fields: dict) -> bool:
-            verdict = normalize_optional_parameter(fields.get("最终判断"))
-            if "max" not in verdict.casefold():
-                return False
-            assessment = build_aggregation_assessment(fields)
-            return bool(
-                assessment.get("confidence") == "高"
-                and assessment.get("auto_submit")
-            )
+        def _higher_priority_aggregation_detected(fields: dict) -> bool:
+            return is_authoritative_aggregation_upgrade(self._automation_fields, fields)
 
         current_verdict = normalize_optional_parameter(
             self._automation_fields.get("最终判断")
         ).casefold()
-        # MAX is authoritative over both an explicit IronSource result and the
-        # provisional video/inter business-rule inference.  Keep watching the
-        # same UID during the first replay so a later complete AutoDetector MAX
-        # result can replace the already-submitted IronSource configuration.
+        # Observe later complete MAX/LevelPlay results on the same UID so
+        # symbolic IronSource placements cannot mask authoritative new units.
         watch_type_change = bool(
             is_inferred_aggregation_result(self._automation_fields)
             or "ironsource" in current_verdict
             or "iron_source" in current_verdict
+            or "levelplay" in current_verdict
         )
 
         def _replay_progress(message: str) -> None:
@@ -7079,7 +7073,7 @@ class APKToolApp:
             dismiss_interrupting_dialog=dismiss_safe_interrupting_dialog,
             trigger_rewarded_entry=trigger_visible_rewarded_ad,
             aggregation_change_detector=(
-                _higher_priority_max_detected if watch_type_change else None
+                _higher_priority_aggregation_detected if watch_type_change else None
             ),
             aggregation_change_grace_seconds=90,
         )

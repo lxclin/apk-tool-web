@@ -21,6 +21,7 @@ from adb_pusher import (
     force_stop_app,
     normalize_optional_parameter,
     parse_autodetector_fields,
+    prioritized_ad_unit_ids,
     start_logcat_stream,
     stop_logcat_stream,
 )
@@ -82,6 +83,9 @@ class ReplayExpectation:
         rewarded_ids: str | Iterable[str] | None,
         aggregation_verdict: str | None = None,
     ) -> "ReplayExpectation":
+        if aggregation_verdict:
+            interstitial_ids = prioritized_ad_unit_ids(", ".join(split_ad_unit_ids(interstitial_ids)), aggregation_verdict, "插屏聚合id")
+            rewarded_ids = prioritized_ad_unit_ids(", ".join(split_ad_unit_ids(rewarded_ids)), aggregation_verdict, "激励视频聚合id")
         return cls(
             interstitial_ids=split_ad_unit_ids(interstitial_ids),
             rewarded_ids=split_ad_unit_ids(rewarded_ids),

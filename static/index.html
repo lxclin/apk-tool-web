@@ -2115,9 +2115,11 @@ function automationGetAfKey(data) {
 
 function automationGetAdId(data, fieldName) {
   const value = automationCleanDetectedValue((data || {})[fieldName]);
-  const first = value ? value.split(',', 1)[0].trim() : '';
+  const values = value.split(/[,，\s]+/).map(automationCleanDetectedValue).filter(Boolean);
   const labels = new Set(['video','reward','rewarded','rewarded_video','inter','interstitial']);
-  if (!labels.has(first.toLowerCase())) return first;
+  const concrete = values.filter(item => !labels.has(item.toLowerCase()));
+  if (concrete.length) return concrete[0];
+  const first = values[0] || '';
   const verdict = automationCleanDetectedValue((data || {})['最终判断']).toLowerCase();
   const ironFamily = verdict.includes('ironsource') || verdict.includes('levelplay');
   const validSymbol = (fieldName === '激励视频聚合id' && first.toLowerCase() === 'video')
@@ -2575,7 +2577,7 @@ function openBackendUrl() {
     '激励视频聚合id': 'aggr_jilishipin_id'
   };
   for (const [k, v] of Object.entries(singleValueMap)) {
-    const value = firstCsvValue(_fieldData[k]);
+    const value = automationGetAdId(_fieldData, k);
     if (value) params[v] = value;
   }
 
