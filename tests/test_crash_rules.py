@@ -186,3 +186,136 @@ def test_precheck_comment_deduplicates_by_evidence_not_only_status():
     client.stories.get_stories_for_task.return_value = [{"text": first_comment}]
     assert add_precheck_comment_once(client, "task-1", missing_result) is False
     assert add_precheck_comment_once(client, "task-1", native_result) is True
+
+
+def test_target_task_removal_does_not_adopt_another_process_fatal_exception():
+    log = '''10-12 10:45:51.000 2292 2328 I wm_task_removed: com.example.game/.Main
+10-12 10:45:51.100 19598 5053 E AndroidRuntime: FATAL EXCEPTION: main
+10-12 10:45:51.101 19598 5053 E AndroidRuntime: Process: com.google.android.gms, PID: 19598
+10-12 10:45:51.102 19598 5053 E AndroidRuntime: java.lang.SecurityException: alarm permission
+10-12 10:45:51.103 18570 18589 W System.err: java.lang.ClassNotFoundException: com.android.zygotehole.ZygoteHoleImpl'''
+    r = classify_crash_log(log, 'com.example.game')
+    assert not r['crashed']
+    assert r['rule_id'] == 'TASK_REMOVED'
+    assert 'SecurityException' not in r['summary']
+    assert 'ZygoteHoleImpl' not in r['root_cause']
+
+
+def test_target_java_crash_does_not_adopt_system_server_missing_class():
+    log = '''10-12 14:20:13.000 8743 8743 E AndroidRuntime: FATAL EXCEPTION: main
+10-12 14:20:13.001 8743 8743 E AndroidRuntime: Process: com.example.game, PID: 8743
+10-12 14:20:13.002 18570 18589 W System.err: java.lang.ClassNotFoundException: com.android.zygotehole.ZygoteHoleImpl
+10-12 14:20:13.003 8743 8743 E AndroidRuntime: java.lang.IllegalStateException: target failure
+10-12 14:20:13.004 18570 18589 I am_crash: [8743,0,com.example.game,0,java.lang.IllegalStateException,target failure,unknown,0]'''
+    r = classify_crash_log(log, 'com.example.game')
+    assert r['crashed']
+    assert r['rule_id'] == 'JAVA_CRASH_UNKNOWN'
+    assert not r['missing_class']
+    assert 'ZygoteHoleImpl' not in r['summary']
+    assert 'IllegalStateException' in r['root_cause']
+
+
+def test_native_event_is_not_reclassified_as_java_missing_class_from_nearby_noise():
+    log = '''10-12 14:21:47.000 18570 18589 W System.err: java.lang.ClassNotFoundException: com.android.zygotehole.ZygoteHoleImpl
+10-12 14:21:47.781 18570 9720 I am_crash: [9653,0,com.example.game,553172548,Native crash,Aborted,unknown,0]
+10-12 14:21:48.020 23957 24168 E AlarmManager: java.lang.SecurityException: Caller com.google.android.gms needs permission'''
+    r = classify_crash_log(log, 'com.example.game')
+    assert r['crashed'] and r['rule_id'] == 'NATIVE_SIGNAL'
+    assert not r['missing_class']
+    assert 'SecurityException' not in r['root_cause']
+
+
+def test_interleaved_android_runtime_processes_keep_their_own_exceptions():
+    log = '''10-12 10:00:00.000 1234 1234 E AndroidRuntime: FATAL EXCEPTION: main
+10-12 10:00:00.001 1234 1234 E AndroidRuntime: Process: com.example.game, PID: 1234
+10-12 10:00:00.002 5678 5678 E AndroidRuntime: FATAL EXCEPTION: main
+10-12 10:00:00.003 5678 5678 E AndroidRuntime: Process: com.other.game, PID: 5678
+10-12 10:00:00.004 5678 5678 E AndroidRuntime: java.lang.ClassNotFoundException: ForeignMissingClass
+10-12 10:00:00.005 1234 1234 E AndroidRuntime: java.lang.NoSuchMethodError: targetMethod'''
+    r = classify_crash_log(log, 'com.example.game')
+    assert r['crashed'] and r['rule_id'] == 'JAVA_BINARY_INCOMPATIBILITY'
+    assert 'ForeignMissingClass' not in r['summary']
+
+
+def test_untimestamped_sequential_java_crashes_are_separate_blocks():
+    log = '''E AndroidRuntime: FATAL EXCEPTION: main
+E AndroidRuntime: Process: com.other.game, PID: 9876
+E AndroidRuntime: java.lang.ClassNotFoundException: ForeignMissingClass
+E AndroidRuntime: FATAL EXCEPTION: main
+E AndroidRuntime: Process: com.example.game, PID: 1234
+E AndroidRuntime: java.lang.SecurityException: target permission'''
+    r = classify_crash_log(log, 'com.example.game')
+    assert r['rule_id'] == 'JAVA_SECURITY_EXCEPTION'
+    assert 'ForeignMissingClass' not in r['summary']
+
+
+def test_target_native_dump_stops_at_other_package_dump():
+    log = '''10-12 10:00:00.000 9000 9000 F DEBUG: >>> com.example.game <<<
+10-12 10:00:00.001 9000 9000 F DEBUG: backtrace:
+10-12 10:00:00.002 9000 9000 F DEBUG: #00 pc 123 libtarget.so
+10-12 10:00:00.003 9000 9000 F DEBUG: >>> com.other.game <<<
+10-12 10:00:00.004 9000 9000 F DEBUG: Abort message: ClassNotFoundException ForeignMissingClass'''
+    r = classify_crash_log(log, 'com.example.game')
+    assert r['crashed'] and r['rule_id'] == 'NATIVE_SIGNAL'
+    assert 'ForeignMissingClass' not in r['summary']
+
+
+def test_foreign_native_crash_plus_target_lifecycle_does_not_confirm_target_crash():
+    log = '''I wm_task_removed: com.example.game/.Main
+F libc: Fatal signal 11 (SIGSEGV) in pid 9876 (com.other.game)
+F DEBUG: >>> com.other.game <<<
+F DEBUG: backtrace:'''
+    r = classify_crash_log(log, 'com.example.game')
+    assert not r['crashed'] and r['rule_id'] == 'TASK_REMOVED'
+
+
+def test_fatal_signal_naming_target_process_is_sufficient_evidence():
+    r = classify_crash_log('F libc: Fatal signal 11 (SIGSEGV) in pid 1234 (com.example.game)', 'com.example.game')
+    assert r['crashed'] and r['rule_id'] == 'NATIVE_SIGNAL'
+
+
+def test_process_name_prefix_is_not_a_target_match():
+    for name in ['com.example.game2', 'com.example.game.clone']:
+        log = f'I am_crash: [123,0,{name},0,Native crash,Aborted,unknown,0]'
+        assert not classify_crash_log(log, 'com.example.game')['crashed']
+
+
+def test_secondary_process_crash_is_still_owned_by_target_package():
+    log = '''E AndroidRuntime: FATAL EXCEPTION: main
+E AndroidRuntime: Process: com.example.game:remote, PID: 1234
+E AndroidRuntime: java.lang.ClassNotFoundException: OwnedMissingClass'''
+    r = classify_crash_log(log, 'com.example.game')
+    assert r['crashed'] and r['rule_id'] == 'JAVA_MISSING_CLASS'
+
+
+def test_foreign_am_crash_mentioning_target_in_exception_is_ignored():
+    log = 'I am_crash: [123,0,com.other.game,0,ClassNotFoundException,com.example.game,unknown,0]'
+    assert not classify_crash_log(log, 'com.example.game')['crashed']
+
+
+def test_long_crash_summary_keeps_package_and_fatal_marker():
+    log = '''E AndroidRuntime: FATAL EXCEPTION: main
+E AndroidRuntime: Process: com.example.game, PID: 1234
+E AndroidRuntime: java.lang.NoClassDefFoundError: MissingClass
+''' + '\n'.join(f'E AndroidRuntime: Caused by: java.lang.Exception: cause{i}' for i in range(40))
+    r = classify_crash_log(log, 'com.example.game')
+    assert r['crashed']
+    assert 'FATAL EXCEPTION' in r['summary'] and 'Process: com.example.game' in r['summary']
+
+
+def test_target_tombstone_signal_without_backtrace_is_still_a_crash():
+    log = '''F DEBUG: >>> com.example.game <<<
+F DEBUG: signal 6 (SIGABRT), code -1 (SI_QUEUE), fault addr --------'''
+    r = classify_crash_log(log, 'com.example.game')
+    assert r['crashed'] and r['rule_id'] == 'NATIVE_SIGNAL'
+    assert '>>>' in r['summary'] and 'SIGABRT' in r['summary']
+
+
+def test_real_target_security_crash_is_preserved_despite_foreign_missing_class():
+    log = '''10-12 10:00:00.000 1234 1234 E AndroidRuntime: FATAL EXCEPTION: main
+10-12 10:00:00.001 1234 1234 E AndroidRuntime: Process: com.example.game, PID: 1234
+10-12 10:00:00.002 18570 18589 W System.err: java.lang.ClassNotFoundException: com.android.zygotehole.ZygoteHoleImpl
+10-12 10:00:00.003 1234 1234 E AndroidRuntime: java.lang.SecurityException: target permission'''
+    r = classify_crash_log(log, 'com.example.game')
+    assert r['crashed'] and r['rule_id'] == 'JAVA_SECURITY_EXCEPTION'
+    assert 'ZygoteHoleImpl' not in r['root_cause']

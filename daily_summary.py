@@ -59,6 +59,7 @@ URL_RE = re.compile(r"https?://\S+")
 # comment did not explicitly include the words "暂不适配".
 STRUCTURED_AUTOMATION_ISSUES = {
     "AF_KEY_EMPTY": "af_key为空，暂不适配",
+    "APPLOVIN_SDK_KEY_EMPTY": "AppLovin SDK Key为空，暂不适配",
     "SUSPECTED_WHITE_PACKAGE": "疑似白包，暂不适配",
     "SUSPECTED_WHITE_PACKAGE_REVIEW": "疑似白包，暂不适配",
     "LOGCAT_ENDED": "聚合回放失败（Logcat监听提前结束），暂不适配",
@@ -68,6 +69,14 @@ STRUCTURED_AUTOMATION_ISSUES = {
 # Ordered from the most specific outcome to broader symptoms so every task is
 # counted once even when a comment contains several related phrases.
 ISSUE_REASON_RULES = (
+    (
+        "applovin_sdk_key_missing",
+        "AppLovin SDK Key为空",
+        re.compile(
+            r"AppLovin\s*SDK\s*Key.{0,12}(?:为空|未找到|未提取到|缺失)",
+            re.I,
+        ),
+    ),
     (
         "no_package",
         "全网无包",

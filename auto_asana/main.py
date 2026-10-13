@@ -148,6 +148,10 @@ _PRECHECK_CODE_STATUSES = {
     "ALL_NETWORK_NO_PACKAGE": "全网无包",
     "APKCOMBO_AVAILABLE": "APKCombo有包",
     "APKCOMBO_CHECK_FAILED": "APKCombo待确认",
+    "APKPURE_AVAILABLE": "APKPure待确认",
+    "APKPURE_CHECK_FAILED": "APKPure待确认",
+    "THIRD_PARTY_DOWNLOAD": "第三方下载待确认",
+    "THIRD_PARTY_CHECK_FAILED": "第三方下载待确认",
     "IAP_ONLY": "已加黑",
     "JAPANESE_PACKAGE": "已加黑",
     "GOOGLE_LOGIN_REQUIRED": "已加黑",
@@ -165,8 +169,12 @@ _PRECHECK_CODE_STATUSES = {
 }
 
 _AUTOMATION_CODE_STATUSES = {
+    "THIRD_PARTY_CHECK_FAILED": "第三方下载待确认",
+    "APKPURE_CHECK_FAILED": "APKPure待确认",
     "RECHECK_REQUESTED": "待处理",
     "AGGREGATION_REPLAY_SUCCESS": "聚合适配成功",
+    "AGGREGATION_REPLAY_PARTIAL_SUCCESS": "聚合适配成功",
+    "NON_GAME_AGGREGATION_EMPTY": "非游戏参数为空",
     "UNSUPPORTED_ATTRIBUTION": "其他归因",
     "UNSUPPORTED_AGGREGATION": "TradPlus暂不适配",
     "SUSPECTED_WHITE_PACKAGE": "疑似白包，暂不适配",
@@ -180,6 +188,7 @@ _AUTOMATION_CODE_STATUSES = {
     "AGGREGATION_TYPE_EMPTY": "参数待确认",
     "AGGREGATION_RESULT_INCOMPLETE": "参数待确认",
     "AF_KEY_EMPTY": "af_key为空",
+    "APPLOVIN_SDK_KEY_EMPTY": "AppLovin SDK Key为空，暂不适配",
     "AD_IDS_EMPTY": "参数待确认",
     "BACKEND_VALIDATION_FAILED": "参数待确认",
     "BACKEND_SUBMIT_FAILED": "后台提交失败",
@@ -221,6 +230,14 @@ _AUTOMATION_CODE_STATUSES = {
 _REPROCESSABLE_PRECHECK_STATUSES = frozenset({"待人工检查"})
 
 
+def _non_game_empty_status(text: str) -> str:
+    if "聚合类型识别为空" in text:
+        return "聚合类型识别为空，暂不适配"
+    if "聚合id识别为空" in text:
+        return "聚合id识别为空"
+    return "非游戏参数为空"
+
+
 def _classify_precheck_workflow_status_compact(
     stories: list[dict[str, Any]],
 ) -> tuple[str, bool]:
@@ -237,6 +254,7 @@ def _classify_precheck_workflow_status_compact(
     latest_status = ""
     latest_automation_status = ""
     latest_status_source = ""
+    blacklist_locked = False
     for _index, story in ordered:
         subtype = str(story.get("resource_subtype") or "")
         story_type = str(story.get("type") or "")
@@ -253,14 +271,26 @@ def _classify_precheck_workflow_status_compact(
             code = precheck_match.group(1).upper()
             status = _PRECHECK_CODE_STATUSES.get(code)
             if status:
-                latest_status = status
-                latest_status_source = "precheck"
+                if not blacklist_locked or status == "已加黑":
+                    latest_status = status
+                    latest_status_source = "precheck"
+                    blacklist_locked = status == "已加黑"
                 continue
 
         automation_match = _AUTOMATION_COMMENT_CODE_RE.search(text)
         if automation_match:
             code = automation_match.group(1).upper()
-            status = _AUTOMATION_CODE_STATUSES.get(code)
+            if code == "RECHECK_REQUESTED":
+                blacklist_locked = False
+            elif blacklist_locked and code not in {"AGGREGATION_REPLAY_SUCCESS", "AGGREGATION_REPLAY_PARTIAL_SUCCESS"}:
+                continue
+            elif blacklist_locked:
+                blacklist_locked = False
+            status = (
+                _non_game_empty_status(text)
+                if code == "NON_GAME_AGGREGATION_EMPTY"
+                else _AUTOMATION_CODE_STATUSES.get(code)
+            )
             if status:
                 latest_status = status
                 latest_automation_status = status
@@ -269,6 +299,8 @@ def _classify_precheck_workflow_status_compact(
 
         # Manual comments used before the structured APK Tool markers existed.
         normalized = re.sub(r"\s+", "", text)
+        if blacklist_locked and not re.search(r"聚合(?:适配|测试)?(?:验证)?(?:已)?(?:成功|通过|完成)", normalized):
+            continue
         # Action adaptation is a separate downstream stage.  Its success or
         # failure must not overwrite a completed aggregation result.
         if "动作适配" in normalized and "聚合" not in normalized:
@@ -276,11 +308,13 @@ def _classify_precheck_workflow_status_compact(
         if re.search(r"聚合(?:适配|测试)?(?:验证)?(?:已)?(?:成功|通过|完成)", normalized):
             latest_status = "聚合适配成功"
             latest_status_source = "manual"
+            blacklist_locked = False
         elif ("加黑" in normalized or "黑名单" in normalized) and not re.search(
             r"(?:不|未|无需|不能|不要|避免).{0,6}加黑", normalized
         ):
             latest_status = "已加黑"
             latest_status_source = "manual"
+            blacklist_locked = True
         elif "google无包" in normalized.lower() or "谷歌无包" in normalized:
             latest_status = "google无包"
             latest_status_source = "manual"
@@ -317,7 +351,7 @@ def _classify_precheck_workflow_status_compact(
     if (
         latest_automation_status
         and latest_status_source == "precheck"
-        and latest_status in {"APKCombo有包", "APKCombo待确认", "待人工检查", "启动待复检", "待处理"}
+        and latest_status in {"APKCombo有包", "APKCombo待确认", "APKPure待确认", "第三方下载待确认", "待人工检查", "启动待复检", "待处理"}
     ):
         latest_status = latest_automation_status
 
@@ -333,6 +367,9 @@ def _classify_precheck_workflow_status_compact(
     # and install that package automatically.
     terminal = bool(latest_status) and latest_status not in {
         "APKCombo有包",
+        "APKCombo待确认",
+        "APKPure待确认",
+        "第三方下载待确认",
         "启动待复检",
         "待处理",
     }
@@ -374,7 +411,7 @@ def classify_precheck_workflow_stages(
             status = _PRECHECK_CODE_STATUSES.get(code)
             if status:
                 precheck_status = status
-                if status not in {"APKCombo有包", "APKCombo待确认", "待人工检查", "启动待复检", "待处理"}:
+                if status not in {"APKCombo有包", "APKCombo待确认", "APKPure待确认", "第三方下载待确认", "待人工检查", "启动待复检", "待处理"}:
                     final_business_status = status
             continue
 
@@ -390,12 +427,38 @@ def classify_precheck_workflow_stages(
                 action_adaptation_status = ""
                 final_business_status = ""
                 continue
-            if code == "AGGREGATION_REPLAY_SUCCESS":
+            if code in {"APKPURE_CHECK_FAILED", "THIRD_PARTY_CHECK_FAILED"}:
+                precheck_status = _AUTOMATION_CODE_STATUSES[code]
+                continue
+            if code in {
+                "AGGREGATION_REPLAY_SUCCESS",
+                "AGGREGATION_REPLAY_PARTIAL_SUCCESS",
+            }:
                 aggregation_detection_status = "参数已确认"
                 backend_submission_status = "提交成功"
-                interstitial_replay_status = "回放成功"
-                rewarded_replay_status = "回放成功"
+                if code == "AGGREGATION_REPLAY_SUCCESS":
+                    interstitial_replay_status = "回放成功"
+                    rewarded_replay_status = "回放成功"
+                else:
+                    for label, field in (
+                        ("插屏广告", "interstitial"),
+                        ("激励视频", "rewarded"),
+                    ):
+                        value = (
+                            "回放成功" if f"{label}：回放成功" in text
+                            else "未配置" if f"{label}：未配置" in text
+                            else "未触发待验证" if f"{label}：未观察到目标广告请求" in text
+                            else "未确认展示" if f"{label}：未确认展示" in text
+                            else ""
+                        )
+                        if field == "interstitial":
+                            interstitial_replay_status = value
+                        else:
+                            rewarded_replay_status = value
                 final_business_status = "聚合适配成功"
+            elif code == "NON_GAME_AGGREGATION_EMPTY":
+                aggregation_detection_status = _non_game_empty_status(text)
+                final_business_status = aggregation_detection_status
             elif code == "UNSUPPORTED_ATTRIBUTION":
                 aggregation_detection_status = "参数已识别"
                 backend_submission_status = "提交成功"
@@ -404,6 +467,12 @@ def classify_precheck_workflow_stages(
                 aggregation_detection_status = "TradPlus暂不适配"
                 backend_submission_status = "参数已清空"
                 final_business_status = "TradPlus暂不适配"
+            elif code == "APPLOVIN_SDK_KEY_EMPTY":
+                aggregation_detection_status = _AUTOMATION_CODE_STATUSES[code]
+                final_business_status = _AUTOMATION_CODE_STATUSES[code]
+                backend_submission_status = "本次未提交"
+                interstitial_replay_status = "未执行"
+                rewarded_replay_status = "未执行"
             elif code == "SUSPECTED_WHITE_PACKAGE":
                 aggregation_detection_status = "疑似白包，暂不适配"
                 backend_submission_status = "提交成功"
@@ -442,7 +511,7 @@ def classify_precheck_workflow_stages(
                 aggregation_detection_status = _AUTOMATION_CODE_STATUSES.get(
                     code, "参数待确认"
                 )
-            elif code.startswith("BACKEND_"):
+            elif code.startswith(("BACKEND_", "PRECHECK_BLACKLIST_")):
                 backend_submission_status = _AUTOMATION_CODE_STATUSES.get(
                     code, "后台提交失败"
                 )
@@ -515,6 +584,10 @@ def classify_precheck_workflow_stages(
         elif "回放" in normalized and ("失败" in normalized or "未确认" in normalized):
             interstitial_replay_status = "回放失败"
             rewarded_replay_status = "回放失败"
+
+    if workflow_status == "已加黑":
+        precheck_status = "已加黑"
+        final_business_status = "已加黑"
 
     return WorkflowStageStatuses(
         workflow_status=workflow_status,
@@ -2001,6 +2074,10 @@ def build_precheck_asana_comment(result: dict) -> str:
         "ALL_NETWORK_NO_PACKAGE": "全网无包，暂不适配",
         "APKCOMBO_AVAILABLE": "Google Play 无法下载，但 APKCombo 存在包体，等待第三方下载",
         "APKCOMBO_CHECK_FAILED": "APKCombo 自动核验失败，需要人工确认",
+        "APKPURE_AVAILABLE": "APKCombo 异常任务已尝试 APKPure 下载",
+        "APKPURE_CHECK_FAILED": "APKPure 下载或安装未成功，保留待确认",
+        "THIRD_PARTY_DOWNLOAD": "按所选策略尝试第三方下载",
+        "THIRD_PARTY_CHECK_FAILED": "第三方下载或安装未成功，保留待确认",
         "IAP_ONLY": "应用内购，无广告，加黑",
         "JAPANESE_PACKAGE": "日本包体，加黑",
         "NO_ADS_OR_IAP": "未发现广告或应用内购标识，继续下载安装并自动适配（不加黑）",
@@ -2035,7 +2112,16 @@ def build_precheck_asana_comment(result: dict) -> str:
     return "\n".join(lines)
 
 
-RESETTABLE_PRECHECK_STATUSES = frozenset({"自动化失败", "待人工检查", "待处理"})
+RESETTABLE_PRECHECK_STATUSES = frozenset({
+    "自动化失败", "待人工检查", "待人工", "待处理", "第三方下载待确认",
+    "APKCombo有包", "APKCombo待确认", "APKPure待确认",
+    "包体闪退", "启动失败", "启动待复检", "安装失败", "回放失败",
+    "参数待确认", "聚合id识别为空", "聚合类型识别为空", "非游戏参数为空",
+    "af_key为空", "AppLovin SDK Key为空，暂不适配",
+    "后台提交失败", "后台回读待确认", "缓存清除失败",
+    "广告未触发待验证", "广告展示待验证", "回放环境待复检",
+    "聚合推断待复检", "MAX推断待复检", "TradPlus暂不适配",
+})
 
 
 def reset_automation_failed_tasks_for_date(
@@ -2044,14 +2130,18 @@ def reset_automation_failed_tasks_for_date(
     """Reset fresh unfinished failed/review/pending tasks; retain history."""
     result = get_asana_tasks_for_date(client, project_gid, today=today)
     reset_gids = set()
-    errors = []
+    errors = [{"task_gid": str(item.get("task_gid") or ""),
+               "error": "最新评论读取失败，未重置：" + str(item.get("error") or "未知错误")}
+              for item in result.get("comment_status_errors", [])
+              if str(item.get("task_gid") or "") in task_gids]
+    unreadable_gids = {item["task_gid"] for item in errors}
     updated_tasks = []
     for task in result.get("tasks", []):
         current_status = task.workflow_status or (
             "待处理" if not task.workflow_terminal else ""
         )
         if (
-            task.gid in task_gids and not task.completed
+            task.gid in task_gids and task.gid not in unreadable_gids and not task.completed
             and current_status in RESETTABLE_PRECHECK_STATUSES
         ):
             try:
@@ -2195,26 +2285,32 @@ def find_matching_adaptation_parent_task(
                     parents[parsed.gid] = parsed
         return parents
 
-    candidates = _collect(_search(search_text))
-    exact_matches = {
-        gid: item for gid, item in candidates.items()
-        if item.start_date <= target_date <= item.end_date
-    }
+    def _current_parent(parents: dict[str, AsanaDateParent]) -> Optional[AsanaDateParent]:
+        matches = [
+            item for item in parents.values()
+            if item.start_date <= target_date <= item.end_date
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            choices = "、".join(f"{item.name}（{item.gid}）" for item in matches)
+            raise RuntimeError(
+                f"Asana 日期父表检查中止：{expected_name} 存在多个当期父表：{choices}。"
+                "请保留一个后再同步。"
+            )
+        return None
 
-    if len(exact_matches) == 1:
-        return next(iter(exact_matches.values()))
-    if len(exact_matches) > 1:
-        choices = "、".join(
-            f"{item.name}（{item.gid}）" for item in exact_matches.values()
-        )
-        raise RuntimeError(
-            f"Asana 日期父表检查中止：{expected_name} 存在多个当期父表：{choices}。"
-            "请保留一个后再同步。"
-        )
+    candidates = _collect(_search(search_text))
+    current = _current_parent(candidates)
+    if current:
+        return current
 
     # The date-specific search intentionally stays fast for the normal case.
     # Only perform the broader lookup when no current parent was found.
     candidates.update(_collect(_search("聚合/动作适配")))
+    current = _current_parent(candidates)
+    if current:
+        return current
     historical = [
         item for item in candidates.values()
         if item.end_date < target_date

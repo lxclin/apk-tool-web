@@ -4,6 +4,38 @@ import subprocess
 import json
 
 
+def test_rewarded_entry_clicks_only_explicit_ad_control():
+    from adb_pusher import trigger_visible_rewarded_ad
+
+    nodes = [
+        {"text": "Play", "clickable": True, "enabled": True, "bounds": "[0,0][100,50]"},
+        {"text": "观看广告", "clickable": True, "enabled": True, "bounds": "[0,50][100,100]"},
+    ]
+    with patch("adb_pusher.collect_device_ui_nodes", return_value=nodes), \
+         patch("adb_pusher._tap_ui_node", return_value=True) as tap:
+        result = trigger_visible_rewarded_ad()
+    assert result["triggered"] is True
+    tap.assert_called_once_with(nodes[1])
+
+
+def test_rewarded_entry_skips_unlabelled_and_purchase_screens():
+    from adb_pusher import trigger_visible_rewarded_ad
+
+    watch = {"text": "Watch ad", "clickable": True, "enabled": True,
+             "bounds": "[0,0][100,50]"}
+    with patch("adb_pusher.collect_device_ui_nodes", return_value=[watch, {"text": "Subscribe"}]), \
+         patch("adb_pusher._tap_ui_node") as tap:
+        result = trigger_visible_rewarded_ad()
+    assert result["code"] == "SENSITIVE_SCREEN_SKIPPED"
+    tap.assert_not_called()
+
+    with patch("adb_pusher.collect_device_ui_nodes", return_value=[{"text": "Reward", "clickable": True}]), \
+         patch("adb_pusher._tap_ui_node") as tap:
+        result = trigger_visible_rewarded_ad()
+    assert result["code"] == "REWARDED_ENTRY_NOT_VISIBLE"
+    tap.assert_not_called()
+
+
 class TestClashVPNPrerequisite:
     CONNECTED = "Current Networks:\n  NetworkAgentInfo{ ni{VPN CONNECTED extra: VPN} nc{[ Transports: VPN OwnerUid: 1002 ]}}\nNetwork Requests:\n"
 
@@ -2211,20 +2243,19 @@ class TestBuildBackendUrl:
         params = parse_qs(url.removeprefix(prefix))
         assert params["af_key"] == ["af-key-123"]
 
-    def test_tradplus_backend_url_is_blocked(self):
+    def test_tradplus_backend_url_uses_normal_platform_and_ad_units(self):
+        from urllib.parse import parse_qs
         from adb_pusher import build_backend_url
-
-        with pytest.raises(ValueError, match="TradPlus聚合，暂不适配"):
-            build_backend_url(
-                {
-                    "最终判断": "TradPlus聚合（自动化检测确认）",
-                    "归因平台": "Adjust",
-                    "插屏聚合id": "tradplus-inter",
-                    "激励视频聚合id": "tradplus-reward",
-                    "初始Activity": "com.demo.MainActivity",
-                },
-                "com.demo.tradplus",
-            )
+        url = build_backend_url({
+            "最终判断": "TradPlus聚合（自动化检测确认）",
+            "归因平台": "Adjust", "插屏聚合id": "tradplus-inter",
+            "激励视频聚合id": "tradplus-reward",
+            "初始Activity": "com.demo.MainActivity",
+        }, "com.demo.tradplus")
+        params = parse_qs(url.split("?", 1)[1])
+        assert params["aggr_platform"] == ["tradplus"]
+        assert params["aggr_chaping_id"] == ["tradplus-inter"]
+        assert params["aggr_jilishipin_id"] == ["tradplus-reward"]
 
     def test_backend_url_uses_appsflyer_sdk_key_as_af_key(self):
         from urllib.parse import parse_qs
@@ -2390,6 +2421,107 @@ class TestExtractAfKey:
 
 
 class TestParseAutodetectorFields:
+    def test_prefers_active_admob_over_initialized_max_without_ad_units(self):
+        from urllib.parse import parse_qs, urlparse
+
+        from adb_pusher import build_backend_url, parse_autodetector_fields
+
+        rewarded = "ca-app-pub-6149202861008113/2723389305"
+        interstitial = "ca-app-pub-6149202861008113/7263756772"
+        fields = parse_autodetector_fields([
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 最终判断: MAX聚合（强关系证据确认）",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: AppLovin:",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   SDK Key: max-key",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   激励视频聚合id: 未找到",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   插屏聚合id: 未找到",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: AdMob:",
+            f"09-30 11:48:20 I ZGSDK.AutoDetector:   激励视频聚合id: [{rewarded}]",
+            f"09-30 11:48:20 I ZGSDK.AutoDetector:   插屏聚合id: [{interstitial}]",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 归因平台: Adjust",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 额外信息: {AppLovinPreferencesMaxRuntimeEvidence=false}",
+            f"09-30 11:48:21 W Ads     : Empty activity context at preloading: {rewarded}",
+            f"09-30 11:48:22 W Ads     : Empty activity context at preloading: {interstitial}",
+        ])
+
+        assert fields["最终判断"] == "AdMob聚合（运行期广告请求确认）"
+        assert fields["_raw_aggregation_verdict"].startswith("MAX聚合")
+        assert fields["激励视频聚合id"] == rewarded
+        assert fields["插屏聚合id"] == interstitial
+        url = build_backend_url(fields, "com.merge.horse")
+        params = parse_qs(urlparse(url).fragment.split("?", 1)[1])
+        assert params["aggr_platform"] == ["admob"]
+        assert params["aggr_jilishipin_id"] == [rewarded]
+        assert params["aggr_chaping_id"] == [interstitial]
+
+    def test_keeps_max_when_admob_ids_have_no_runtime_request(self):
+        from adb_pusher import parse_autodetector_fields
+
+        fields = parse_autodetector_fields([
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 最终判断: MAX聚合",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: AppLovin:",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   激励视频聚合id: 未找到",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: AdMob:",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   激励视频聚合id: [ca-app-pub-1/2]",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   插屏聚合id: [ca-app-pub-1/3]",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 额外信息: {AppLovinPreferencesMaxRuntimeEvidence=false}",
+        ])
+
+        assert fields["最终判断"] == "MAX聚合"
+        assert "_aggregation_platform_corrected" not in fields
+
+    def test_corrects_max_when_only_one_admob_unit_is_actively_loaded(self):
+        from adb_pusher import parse_autodetector_fields
+
+        fields = parse_autodetector_fields([
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 最终判断: MAX聚合",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: AppLovin:",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   插屏聚合id: 未找到",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: AdMob:",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   激励视频聚合id: 未找到",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   插屏聚合id: [ca-app-pub-1/3]",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 额外信息: {AppLovinPreferencesMaxRuntimeEvidence=false}",
+            "09-30 11:48:21 W Ads     : Empty activity context at preloading: ca-app-pub-1/3",
+        ])
+
+        assert fields["最终判断"] == "AdMob聚合（运行期广告请求确认）"
+        assert fields["激励视频聚合id"] == ""
+        assert fields["插屏聚合id"] == "ca-app-pub-1/3"
+
+    def test_keeps_max_when_its_ad_unit_is_present(self):
+        from adb_pusher import parse_autodetector_fields
+
+        fields = parse_autodetector_fields([
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 最终判断: MAX聚合",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: AppLovin:",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   插屏聚合id: [max-inter-123]",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: AdMob:",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   激励视频聚合id: [ca-app-pub-1/2]",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   插屏聚合id: [ca-app-pub-1/3]",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 额外信息: {AppLovinPreferencesMaxRuntimeEvidence=false}",
+            "09-30 11:48:21 W Ads     : Empty activity context at preloading: ca-app-pub-1/3",
+        ])
+
+        assert fields["最终判断"] == "MAX聚合"
+        assert fields["插屏聚合id"] == "max-inter-123"
+
+    def test_keeps_max_when_its_runtime_lifecycle_is_observed(self):
+        from adb_pusher import parse_autodetector_fields
+
+        fields = parse_autodetector_fields([
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 最终判断: MAX聚合",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: AppLovin:",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   插屏聚合id: 未找到",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: AdMob:",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   激励视频聚合id: [ca-app-pub-1/2]",
+            "09-30 11:48:20 I ZGSDK.AutoDetector:   插屏聚合id: [ca-app-pub-1/3]",
+            "09-30 11:48:20 I ZGSDK.AutoDetector: 额外信息: {AppLovinPreferencesMaxRuntimeEvidence=false}",
+            "09-30 11:48:21 W Ads     : Empty activity context at preloading: ca-app-pub-1/3",
+            '09-30 11:48:22 D ZGSDK.mediationEvent: {"platform":"MAX","status":"load_start"}',
+        ])
+
+        assert fields["最终判断"] == "MAX聚合"
+        assert "_aggregation_platform_corrected" not in fields
+
     def test_af_key_is_displayed_as_appsflyer_sdk_key(self):
         from adb_pusher import parse_autodetector_fields
 
@@ -2835,3 +2967,34 @@ class TestManifestAttributionFallback:
         )
 
         assert result == {"platforms": [], "evidence": []}
+
+
+def test_tradplus_fullwidth_app_id_and_sdk_version_are_preserved():
+    from adb_pusher import parse_autodetector_fields
+    text = """最终判断: TradPlus聚合（日志与配置综合分析确认）
+初始页面Activity: com.demo.EntryLaunchPage
+归因平台: Adjust
+IronSource:
+  激励视频聚合id: video
+  插屏聚合id: inter
+TradPlus:
+  SDK版本：16.3.0.1
+  APP ID：8A52FE0EF90E9109088F111CE218EC11
+  激励视频聚合id: 未找到
+  插屏聚合id: 未找到"""
+    fields = parse_autodetector_fields(["10-13 10:10:02.248 4233 4265 I [ZG:I] : ZGSDK.AutoDetector: " + line for line in text.splitlines()])
+    assert fields["TradPlus APP ID"] == "8A52FE0EF90E9109088F111CE218EC11"
+    assert fields["TradPlus SDK版本"] == "16.3.0.1"
+    assert fields["SDK列表"][-1]["app_id"] == fields["TradPlus APP ID"]
+    assert fields["激励视频聚合id"] == fields["插屏聚合id"] == ""
+
+
+def test_tradplus_runtime_ids_require_platform_and_ad_type_evidence():
+    from adb_pusher import parse_autodetector_fields
+    prefix = ["ZGSDK.AutoDetector: 最终判断: TradPlus聚合", "ZGSDK.AutoDetector: 归因平台: Adjust", "ZGSDK.AutoDetector: TradPlus:"]
+    unrelated = ["AppLovin: interstitial adUnitId=max-other", "TradPlus: adUnitId=untyped"]
+    fields = parse_autodetector_fields(prefix + unrelated)
+    assert fields["插屏聚合id"] == fields["激励视频聚合id"] == ""
+    fields = parse_autodetector_fields(prefix + unrelated + ["TradPlus: interstitial adUnitId=tp-inter", "TradPlus: rewarded adUnitId=tp-reward"])
+    assert fields["插屏聚合id"] == "tp-inter"
+    assert fields["激励视频聚合id"] == "tp-reward"

@@ -2170,6 +2170,9 @@ function renderAutomationFields(data, assessment=null) {
   lines.push('激励视频聚合id:' + (data['激励视频聚合id'] || ''));
   lines.push('插屏聚合id:' + (data['插屏聚合id'] || ''));
   lines.push('归因平台:' + (data['归因平台'] || ''));
+  for (const field of ['TradPlus APP ID', 'TradPlus SDK版本']) {
+    if (data[field]) lines.push(field + ':' + data[field]);
+  }
   el.textContent = lines.join('\n');
   const confidence = (assessment || {}).confidence || '低';
   const policy = (assessment || {}).policy || '禁止自动提交';
@@ -2476,6 +2479,8 @@ function showFieldModal(data) {
     ['插屏聚合id', data['插屏聚合id']],
     ['归因平台', data['归因平台']],
     ['af_key', data['af_key']],
+    ['TradPlus APP ID', data['TradPlus APP ID']],
+    ['TradPlus SDK版本', data['TradPlus SDK版本']],
   ];
 
   let html = '';
@@ -2549,7 +2554,7 @@ function openBackendUrl() {
       admob:'admob', googleadmob:'admob',
       topon:'topon', anythink:'topon',
       fyber:'fyber', digitalturbine:'fyber',
-      level:'level_play', levelplay:'level_play'
+      level:'level_play', levelplay:'level_play', tradplus:'tradplus'
     };
     if (platformMap[raw]) params.aggr_platform = platformMap[raw];
   }
@@ -2593,6 +2598,9 @@ function copyAllFields() {
     '最终判断:' + (_fieldData['最终判断'] || ''),
     '初始Activity:' + (_fieldData['初始Activity'] || ''),
   ];
+  for (const field of ['TradPlus APP ID', 'TradPlus SDK版本']) {
+    if (_fieldData[field]) lines.push(field + ':' + _fieldData[field]);
+  }
   const sdkList = _fieldData['SDK列表'] || [];
   for (const sdk of sdkList) {
     const name = sdk['名称'] || '未知';

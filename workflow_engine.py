@@ -17,11 +17,23 @@ BACKEND_TERMINAL_PRECHECK_CODES = frozenset(
     }
 )
 INSTALLABLE_PRECHECK_CODES = frozenset(
-    {"HAS_ADS", "NO_ADS_OR_IAP", "APKCOMBO_AVAILABLE"}
+    {"HAS_ADS", "NO_ADS_OR_IAP", "APKCOMBO_AVAILABLE", "APKPURE_AVAILABLE", "THIRD_PARTY_DOWNLOAD"}
 )
 DEFERRED_INSTALL_CODES = frozenset(
     {"DOWNLOAD_LIMIT_REACHED", "DOWNLOAD_DEFERRED", "DOWNLOAD_PAUSED", "DOWNLOAD_STARTED"}
 )
+
+
+def is_blacklisted_task(task, status="") -> bool:
+    """Business blacklist is independent of backend submission success."""
+    return any(
+        str(value or "").startswith("已加黑")
+        for value in (
+            status, getattr(task, "workflow_status", ""),
+            getattr(task, "precheck_status", ""),
+            getattr(task, "final_business_status", ""),
+        )
+    )
 
 
 def needs_precheck_backend_submission(result: dict) -> bool:
@@ -69,7 +81,14 @@ def precheck_comment_result(result: dict) -> dict:
         and not install_result.get("ok")
     ):
         return {
-            "code": "INSTALL_FAILED",
+            "code": (
+                "THIRD_PARTY_CHECK_FAILED"
+                if install_result.get("code") == "THIRD_PARTY_CHECK_FAILED"
+                or result.get("code") == "THIRD_PARTY_DOWNLOAD"
+                else "APKPURE_CHECK_FAILED"
+                if result.get("code") == "APKPURE_AVAILABLE"
+                else "INSTALL_FAILED"
+            ),
             "package_name": result.get("package_name", ""),
             "detail": install_result.get("message", "自动下载安装失败"),
         }
@@ -110,12 +129,18 @@ def precheck_task_status(result: dict) -> str:
             return "后台下载中"
         if install_result.get("ok"):
             return "已安装" if install_code == "ALREADY_INSTALLED" else "安装完成"
+        if install_code == "THIRD_PARTY_CHECK_FAILED" or code == "THIRD_PARTY_DOWNLOAD":
+            return "第三方下载待确认"
+        if code == "APKPURE_AVAILABLE":
+            return "APKPure待确认"
         return "安装失败"
 
     return {
         "HAS_ADS": "有广告", "GOOGLE_NO_PACKAGE": "google无包",
         "ALL_NETWORK_NO_PACKAGE": "全网无包", "APKCOMBO_AVAILABLE": "APKCombo有包",
         "APKCOMBO_CHECK_FAILED": "APKCombo待确认", "IAP_ONLY": "已加黑",
+        "APKPURE_AVAILABLE": "APKPure待确认", "APKPURE_CHECK_FAILED": "APKPure待确认",
+        "THIRD_PARTY_DOWNLOAD": "第三方下载待确认", "THIRD_PARTY_CHECK_FAILED": "第三方下载待确认",
         "JAPANESE_PACKAGE": "已加黑", "NO_ADS_OR_IAP": "待处理",
         "GOOGLE_LOGIN_REQUIRED": "已加黑",
         "DEVICE_UNSUPPORTED": "设备不支持", "COUNTRY_UNSUPPORTED": "地区不支持",

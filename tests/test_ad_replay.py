@@ -1,4 +1,5 @@
 import io
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from ad_replay import (
     AdReplayEvaluator,
     ReplayExpectation,
+    accept_single_format_replay,
     build_replay_failure_comment,
     is_replay_diagnostic_line,
     run_ad_replay_check,
@@ -14,6 +16,87 @@ from ad_replay import (
     REPLAY_LOG_DRAIN_BATCH_SIZE,
     _drain_logcat_queue,
 )
+
+
+def test_one_verified_format_accepts_aggregation_without_falsifying_other_type():
+    replay = {
+        "ok": False,
+        "code": "REPLAY_NOT_TRIGGERED",
+        "interstitial": {"required": True, "displayed": True, "request_observed": True},
+        "rewarded": {"required": True, "displayed": False, "request_observed": False},
+    }
+
+    accepted = accept_single_format_replay(replay)
+
+    assert accepted["ok"] is True
+    assert accepted["code"] == "AGGREGATION_REPLAY_PARTIAL_SUCCESS"
+    assert accepted["rewarded"]["displayed"] is False
+    assert "激励视频未观察到请求" in accepted["message"]
+    assert replay["ok"] is False
+
+
+def test_partial_replay_rule_requires_real_display_and_normal_observation_end():
+    replay = {
+        "ok": False,
+        "code": "REPLAY_NOT_TRIGGERED",
+        "interstitial": {"required": True, "displayed": False},
+        "rewarded": {"required": True, "displayed": False},
+    }
+    assert accept_single_format_replay(replay) is replay
+    replay["interstitial"]["displayed"] = True
+    replay["code"] = "APP_EXITED_DURING_AUTOMATION"
+    assert accept_single_format_replay(replay) is replay
+
+
+def test_rewarded_display_alone_also_accepts_aggregation():
+    result = accept_single_format_replay({
+        "ok": False,
+        "code": "REPLAY_TIMEOUT",
+        "interstitial": {
+            "required": True, "displayed": False, "request_observed": True,
+        },
+        "rewarded": {
+            "required": True, "displayed": True, "request_observed": True,
+        },
+    })
+
+    assert result["ok"] is True
+    assert result["code"] == "AGGREGATION_REPLAY_PARTIAL_SUCCESS"
+    assert "激励视频回放成功" in result["message"]
+    assert "插屏广告未确认展示" in result["message"]
+
+
+@patch("ad_replay.REWARDED_ENTRY_FIRST_CHECK_SECONDS", 0)
+@patch("ad_replay.stop_logcat_stream")
+@patch("ad_replay.subprocess.run")
+@patch("ad_replay.force_stop_app", return_value=(True, "ok"))
+@patch("ad_replay.PackageRuntimeMonitor")
+@patch("ad_replay.start_logcat_stream")
+def test_replay_can_try_explicit_rewarded_entry_after_launch(
+    start_stream, runtime_monitor, _force_stop, launch, _stop_stream
+):
+    proc = MagicMock()
+    proc.stdout = io.StringIO("")
+    proc.poll.return_value = None
+    start_stream.return_value = proc
+    runtime_monitor.return_value.poll.return_value = {"ok": True}
+    launch.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    stop = threading.Event()
+    trigger = MagicMock(side_effect=lambda: (stop.set() or {
+        "triggered": False,
+        "message": "未找到激励入口",
+    }))
+    progress = []
+
+    result = run_ad_replay_check(
+        "com.demo", "10250", ReplayExpectation.from_values("", "reward-1"),
+        timeout_seconds=10, stop_event=stop, on_progress=progress.append,
+        trigger_rewarded_entry=trigger,
+    )
+
+    assert result["code"] == "REPLAY_CANCELLED"
+    trigger.assert_called_once_with()
+    assert "未找到激励入口" in progress
 
 
 def test_split_ad_unit_ids_accepts_chinese_commas_and_deduplicates():
@@ -684,3 +767,14 @@ def test_replay_does_not_upgrade_on_generic_max_sdk_logs(
 
     assert result["ok"] is True
     assert result["code"] == "AGGREGATION_REPLAY_SUCCESS"
+
+
+def test_tradplus_requires_actual_display_for_all_configured_ad_types():
+    evaluator = AdReplayEvaluator(ReplayExpectation.from_values("tp-inter", "tp-reward", "TradPlus聚合"))
+    evaluator.feed('ZGSDK.mediationEvent: {"status":"load_success","platform":"TradPlus","adUnitId":"tp-inter","adType":"interstitial"}')
+    assert not evaluator.complete
+    evaluator.feed('ZGSDK.mediationEvent: {"status":"display_success","platform":"TradPlus","adUnitId":"tp-inter","adType":"interstitial"}')
+    assert not evaluator.complete
+    evaluator.feed('ZGSDK.mediationEvent: {"status":"display_success","platform":"TradPlus","adUnitId":"tp-reward","adType":"reward"}')
+    assert evaluator.complete
+    assert evaluator.result()["code"] == "AGGREGATION_REPLAY_SUCCESS"

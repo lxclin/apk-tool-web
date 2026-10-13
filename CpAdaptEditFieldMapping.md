@@ -25,7 +25,7 @@ POST /admin/gd_web/overseas/s10_package_info
 | 修改页面显示字段 | URL query字段 | API请求字段 | 说明 |
 | --- | --- | --- | --- |
 | 包名 | `package_name` | `package_name` | 必填；URL 自动打开修改弹窗时必须携带 |
-| 聚合平台 | `aggr_platform` | `aggr_platform` | 支持 `max`、`iron_source`、`admob`、`topon`、`fyber`、`level_play`；TradPlus 暂不适配 |
+| 聚合平台 | `aggr_platform` | `aggr_platform` | 支持 `max`、`iron_source`、`admob`、`topon`、`fyber`、`level_play`、`tradplus` |
 | 归因平台 | `attribution_platform` | `attribution_platform` | 文本输入 |
 | 聚合id-插屏 | `aggr_chaping_id` | `aggr_chaping_id` | 文本输入 |
 | 聚合id-激励视频 | `aggr_jilishipin_id` | `aggr_jilishipin_id` | 文本输入 |
@@ -51,3 +51,7 @@ POST /admin/gd_web/overseas/s10_package_info
 | 适配人员 | `assign` | 选择下拉框后立即提交 |
 | A2是否开启 | `a2_open` | 切换开关后立即提交；未选择适配人员时会提示并恢复开关状态 |
 | 清除缓存 | `package_name` | 调用清除 A2 包缓存接口 |
+
+TradPlus 与其他聚合使用相同的字段校验、置信度评估、接口提交和回放流程。APP ID 与 SDK 版本保留在提取结果及任务描述中；现有接口没有对应的独立字段，不映射到 AppLovin SDK Key。广告位 ID 缺失时不自动提交。
+
+自动接口提交现在先读取旧记录并保存快照，再合并字段：人工 `ps` 保留，已确认归属的工具旧结论可移除；`block_ps` 非空时阻止写入。没有检测来源的 `activity_guide_page` 保留旧值。缺失已有有效广告位/Key 会阻止覆盖；最终提交值全部回读核验。手动 URL 映射不改变备注。

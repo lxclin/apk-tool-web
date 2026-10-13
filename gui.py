@@ -14,8 +14,14 @@ import selectors
 import subprocess
 from collections import deque
 from types import SimpleNamespace
+from dataclasses import replace, is_dataclass
 
 from qr_generator import generate_qr
+from apkpure_recovery import (
+    THIRD_PARTY_RETRY_STATUSES, apkcombo_recovery_candidate,
+    third_party_download_result, download_and_install_apkpure, download_and_install_aptoide,
+    DOWNLOAD_MODES, download_and_install_third_party,
+)
 from auto_asana.main import (
     add_precheck_comment_once as _add_precheck_comment_once_impl,
     build_asana_client,
@@ -54,7 +60,7 @@ from adb_pusher import (
     extract_logcat_fields, download_and_install, download_and_install_apkcombo,
     build_backend_url, extract_uid_from_dumpsys, parse_fill_url,
     extract_google_play_package, is_apk_download_url,
-    build_apkcombo_search_url,
+    build_apkcombo_search_url, resolve_google_play_package,
     normalize_action_script_text,
     normalize_optional_parameter,
     DEFAULT_FOLLOWING_ACTION_MIN_DELAY_MS,
@@ -66,6 +72,7 @@ from adb_pusher import (
     run_app_launch_precheck,
     PackageRuntimeMonitor,
     dismiss_safe_interrupting_dialog,
+    trigger_visible_rewarded_ad,
     capture_max_debugger_ad_units,
     get_connected_device_profile,
     ensure_clash_vpn_connected,
@@ -78,6 +85,7 @@ from ad_replay import (
     INTERSTITIAL,
     REWARDED,
     ReplayExpectation,
+    accept_single_format_replay,
     build_replay_failure_comment,
     run_ad_replay_check,
     split_ad_unit_ids,
@@ -91,6 +99,7 @@ from automation_deferred_retry import (
 from automation_adaptation import (
     add_automation_comment_once as _add_automation_comment_once_impl,
     aggregation_gate_issue,
+    applovin_key_gate_issue,
     attribution_gate_issue,
     build_aggregation_assessment,
     clear_backend_adaptation_via_api,
@@ -127,6 +136,9 @@ from private_features import (
     private_feature_enabled,
     verify_permission_license,
 )
+from selected_retry import STAGES as SELECTED_RETRY_STAGES, validated_retry_fields
+from automation_adaptation import verify_backend_for_replay_via_api
+
 from automation_checkpoint import (
     AutomationCheckpointStore,
     new_batch_checkpoint,
@@ -149,6 +161,7 @@ from workflow_engine import (
     precheck_comment_result,
     precheck_task_status,
     should_install_after_precheck,
+    is_blacklisted_task,
 )
 from app_version import build_label
 
@@ -324,6 +337,11 @@ class APKToolApp:
         self._closing = False
         self._after_ids: set[str] = set()
         self._settings = load_gui_settings()
+        self._third_party_download_mode = self._settings.get("third_party_download_mode", "fallback")
+        if self._third_party_download_mode not in DOWNLOAD_MODES:
+            self._third_party_download_mode = "fallback"
+        self.third_party_download_mode_var = tk.StringVar(value=self._third_party_download_mode)
+        self.third_party_download_mode_var.trace_add("write", self._on_download_mode_changed)
         self._sync_settings_after_id: str | None = None
         self._command_state_token = 0
         self._button_restore_after_id: str | None = None
@@ -770,6 +788,32 @@ class APKToolApp:
 
     # ── APK 工具 Tab ──────────────────────────────────────────────
 
+    def _on_download_mode_changed(self, *_args):
+        mode = self.third_party_download_mode_var.get()
+        self._third_party_download_mode = mode if mode in DOWNLOAD_MODES else "fallback"
+        self._settings["third_party_download_mode"] = self._third_party_download_mode
+        save_gui_settings(self._settings)
+
+    def _build_download_mode_controls(self, parent):
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row, text="第三方下载策略：").pack(side=tk.LEFT)
+        for mode, label in DOWNLOAD_MODES.items():
+            ttk.Radiobutton(
+                row, text=label, value=mode,
+                variable=self.third_party_download_mode_var,
+            ).pack(side=tk.LEFT, padx=(0, 10))
+
+    def _download_third_party_package(self, package_name, *, on_progress=None,
+                                      cancelled=None, force_reinstall=False):
+        return download_and_install_third_party(
+            package_name, mode=getattr(self, "_third_party_download_mode", "fallback"),
+            on_progress=on_progress, cancelled=cancelled, force_reinstall=force_reinstall,
+            apkcombo_installer=download_and_install_apkcombo,
+            apkpure_installer=download_and_install_apkpure,
+            aptoide_installer=download_and_install_aptoide,
+        )
+
     def _build_apk_tab(self, parent: ttk.Frame):
         top = ttk.Frame(parent, padding=10)
         top.pack(fill=tk.X)
@@ -788,9 +832,11 @@ class APKToolApp:
         ttk.Button(first_row, text="解析URL", command=self._on_parse_fill_url).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(first_row, text="推送安装", command=self._on_push_apk).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(first_row, text="APKCombo 下载", command=self._on_apkcombo_download).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(first_row, text="APKPure 下载", command=self._on_apkpure_download).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(second_row, text="选择APK", command=self._on_browse).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(second_row, text="选择目录", command=self._on_browse_apk_dir).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(second_row, text="设置ADB", command=self._on_set_adb).pack(side=tk.LEFT, padx=(0, 6))
+        self._build_download_mode_controls(top)
 
         # APKPure 搜索
         apkpure_frame = ttk.Frame(top)
@@ -909,6 +955,7 @@ class APKToolApp:
 
         intro = ttk.LabelFrame(parent, text="预检说明", padding=10)
         intro.pack(fill=tk.X, **pad)
+        self._build_download_mode_controls(intro)
         ttk.Label(
             intro,
             text=(
@@ -1002,11 +1049,24 @@ class APKToolApp:
             search_row, text="重置为待处理",
             command=self._on_reset_automation_failed_tasks,
         )
+        ttk.Button(
+            search_row, text="重试下载并适配",
+            command=self._on_retry_third_party_downloads,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         if self._asana_write_enabled:
             self._precheck_reset_failed_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.precheck_search_var.trace_add(
             "write", self._on_precheck_search_changed
         )
+
+        retry_row = ttk.Frame(asana_frame)
+        retry_row.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(retry_row, text="选中任务重试起点：").pack(side=tk.LEFT)
+        self._selected_retry_stage_var = tk.StringVar(value="重新检测并适配")
+        ttk.Combobox(retry_row, textvariable=self._selected_retry_stage_var,
+                     values=list(SELECTED_RETRY_STAGES), state="readonly", width=20).pack(side=tk.LEFT)
+        ttk.Button(retry_row, text="仅重试选中任务", command=self._on_retry_selected_tasks).pack(side=tk.LEFT, padx=6)
+        ttk.Label(retry_row, text="可按 Command / Shift 多选；只处理选中的包", foreground="gray").pack(side=tk.LEFT)
 
         task_table_frame = ttk.Frame(asana_frame)
         task_table_frame.pack(fill=tk.BOTH, expand=True)
@@ -1016,7 +1076,7 @@ class APKToolApp:
             displaycolumns=("order", "package", "status"),
             show="headings",
             height=6,
-            selectmode="browse",
+            selectmode="extended",
         )
         self.precheck_task_tree.heading("order", text="顺序")
         self.precheck_task_tree.heading("package", text="包名")
@@ -1306,16 +1366,17 @@ class APKToolApp:
                 task is None
                 or getattr(task, "completed", False)
                 or getattr(task, "workflow_terminal", False)
+                or self._precheck_task_is_blacklisted(item_id, task)
             ):
                 continue
             if not broad_from_selection:
                 if gid in new_gids:
-                    if status not in {"新增待预检", "APKCombo有包", "待处理"}:
+                    if status not in ({"新增待预检", "待处理"} | THIRD_PARTY_RETRY_STATUSES):
                         continue
                 # Rows read earlier that were never prechecked stay "待处理";
                 # they must run through page precheck like any new row
                 # instead of being skipped forever or adapted directly.
-                elif status != "待处理":
+                elif status != "待处理" and status not in THIRD_PARTY_RETRY_STATUSES:
                     continue
             queue.append((item_id, task))
         return queue, start_index + 1
@@ -1365,6 +1426,31 @@ class APKToolApp:
         except OSError as exc:
             self._precheck_asana_status.config(
                 text=f"增量待办记录保存失败: {exc}", foreground="#ef5350"
+            )
+
+    def _precheck_task_is_blacklisted(self, item_id, task=None):
+        current = self._precheck_tasks.get(item_id)
+        if current is None and task is not None:
+            current = next((
+                candidate for candidate in self._precheck_tasks.values()
+                if str(getattr(candidate, "gid", "") or "")
+                == str(getattr(task, "gid", "") or "")
+                and getattr(task, "gid", "")
+            ), None)
+        status = ""
+        if self.precheck_task_tree.exists(item_id):
+            values = self.precheck_task_tree.item(item_id, "values")
+            status = str(values[3] or "") if len(values) >= 4 else ""
+        return is_blacklisted_task(current, status) or is_blacklisted_task(task)
+
+    def _remember_precheck_blacklist(self, item_id, result):
+        if result.get("code") not in {"IAP_ONLY", "JAPANESE_PACKAGE", "GOOGLE_LOGIN_REQUIRED"}:
+            return
+        task = self._precheck_tasks.get(item_id)
+        if task is not None and is_dataclass(task):
+            self._precheck_tasks[item_id] = replace(
+                task, workflow_status="已加黑", workflow_terminal=True,
+                precheck_status="已加黑", final_business_status="已加黑",
             )
 
     def _set_precheck_task_status(self, item_id: str, status: str):
@@ -1443,14 +1529,21 @@ class APKToolApp:
         value: str,
         device_profile: dict | None = None,
     ) -> dict:
-        """Route customized G99 ROMs through APKCombo."""
+        """Preserve Play precheck, then use the selected third-party policy."""
         profile = device_profile or get_connected_device_profile()
+        mode = getattr(self, "_third_party_download_mode", "fallback")
         if profile.get("use_apkcombo_only"):
-            return run_apkcombo_only_precheck(
-                value,
-                device_profile=profile,
-            )
-        return run_google_play_precheck(value, verify_apkcombo=True)
+            if mode != "apkcombo":
+                return third_party_download_result(resolve_google_play_package(value))
+            result = run_apkcombo_only_precheck(value, device_profile=profile)
+        else:
+            result = run_google_play_precheck(value, verify_apkcombo=mode == "apkcombo")
+        if result.get("code") in {
+            "APKCOMBO_CHECK_FAILED", "ALL_NETWORK_NO_PACKAGE", "GOOGLE_NO_PACKAGE",
+            "DEVICE_UNSUPPORTED", "COUNTRY_UNSUPPORTED",
+        }:
+            return {**result, **third_party_download_result(result.get("package_name", ""))}
+        return result
 
     def _run_precheck_with_unknown_retry(
         self,
@@ -1559,10 +1652,10 @@ class APKToolApp:
                 ),
             )
 
-        if result.get("code") == "APKCOMBO_AVAILABLE":
-            install_result = download_and_install_apkcombo(
-                result.get("package_name", ""),
-                on_progress=_progress,
+        if result.get("code") in {"APKPURE_AVAILABLE", "APKCOMBO_AVAILABLE", "THIRD_PARTY_DOWNLOAD"}:
+            install_result = self._download_third_party_package(
+                result.get("package_name", ""), on_progress=_progress,
+                cancelled=lambda: self._precheck_cancel_requested,
             )
         else:
             install_result = install_google_play_app(
@@ -1570,6 +1663,14 @@ class APKToolApp:
                 on_progress=_progress,
                 return_after_start=return_after_start,
             )
+            if (not install_result.get("ok")
+                    and install_result.get("code") != "DOWNLOAD_STARTED"
+                    and not self._precheck_cancel_requested):
+                _progress("Google Play 下载未成功，进入第三方兜底")
+                install_result = self._download_third_party_package(
+                    result.get("package_name", ""), on_progress=_progress,
+                    cancelled=lambda: self._precheck_cancel_requested,
+                )
         return {**result, "install_result": install_result}
 
     def _launch_check_after_install(
@@ -1692,7 +1793,7 @@ class APKToolApp:
             str(getattr(task, "gid", "") or "") for task in tasks
             if getattr(task, "gid", "")
         }
-        actionable_restored_statuses = {"APKCombo有包"}
+        actionable_restored_statuses = THIRD_PARTY_RETRY_STATUSES
         eligible_gids = {
             str(getattr(task, "gid", "") or "")
             for task in tasks
@@ -1809,7 +1910,7 @@ class APKToolApp:
         self._load_today_asana_tasks_async()
 
     def _on_reset_automation_failed_tasks(self):
-        """Reset today's failed, manual-review and pending rows."""
+        """Reset only explicitly selected, retryable rows from today."""
         if not private_feature_enabled("asana_write"):
             self._precheck_asana_status.config(
                 text="当前版本未启用 Asana 自动写入权限", foreground="#ef5350"
@@ -1827,8 +1928,14 @@ class APKToolApp:
                 text="请先读取今日任务，再重置任务状态", foreground="#ef6c00"
             )
             return False
+        selected = set(self.precheck_task_tree.selection())
+        if not selected:
+            self._precheck_asana_status.config(text="请先选中需要重置的任务（支持多选）", foreground="#ef6c00")
+            return False
         candidates = []
         for item_id in self.precheck_task_tree.get_children():
+            if item_id not in selected:
+                continue
             task = self._precheck_tasks.get(item_id)
             values = self.precheck_task_tree.item(item_id, "values")
             if (
@@ -1838,7 +1945,7 @@ class APKToolApp:
                 candidates.append(task)
         if not candidates:
             self._precheck_asana_status.config(
-                text="今日列表中没有自动化失败、待人工检查或待处理任务可重置", foreground="#2e7d32"
+                text="选中项中没有可重置任务；成功、加黑及其他明确不适配结论不会重置", foreground="#2e7d32"
             )
             return False
         project_gid = self.project_gid_var.get().strip()
@@ -1853,9 +1960,10 @@ class APKToolApp:
             packages += f"\n……另 {len(candidates) - 10} 个"
         if not messagebox.askyesno(
             "重置为待处理",
-            f"将重置 {section} 中 {len(candidates)} 个任务（自动化失败、待人工检查、待处理）：\n{packages}\n\n"
+            f"仅重置 {section} 中选中的 {len(candidates)} 个可重试任务：\n{packages}\n\n"
             "会新增 Asana 复检评论并恢复为待处理，保留历史评论，不修改后台参数。\n"
-            "成功、加黑和暂不适配等任务不重置。重置后需手动启动批量预检并自动适配。",
+            "成功、加黑及其他明确不适配结论不重置；历史 TradPlus 和缺少 AppLovin Key 可重新检查。\n"
+            "重置后需手动启动自动适配，不会自动开始其他任务。",
         ):
             return False
         target_gids = {t.gid for t in candidates}
@@ -2051,6 +2159,7 @@ class APKToolApp:
         launch_check: bool,
         launch_observation: int,
         auto_adapt: bool,
+        task_gids: set[str] | None = None,
     ):
         """Persist pending installs and monitor them independently of precheck."""
         with self._background_install_watch_lock:
@@ -2071,6 +2180,7 @@ class APKToolApp:
                     "launch_check": bool(launch_check),
                     "launch_observation": launch_observation,
                     "auto_adapt": auto_adapt,
+                    "task_gids": sorted(task_gids) if task_gids is not None else None,
                 }
         self._ensure_background_install_watcher()
 
@@ -2175,7 +2285,19 @@ class APKToolApp:
             foreground="#2e7d32",
         )
         if entry.get("auto_adapt"):
-            self._schedule_background_auto_adapt()
+            if entry.get("task_gids") is not None:
+                gids = set(entry["task_gids"])
+                self._safe_after(300, lambda: self._maybe_start_scoped_background_auto_adapt(gids))
+            else:
+                self._schedule_background_auto_adapt()
+
+    def _maybe_start_scoped_background_auto_adapt(self, gids):
+        if self._closing:
+            return
+        if self._precheck_running or self._automation_running:
+            self._safe_after(1000, lambda: self._maybe_start_scoped_background_auto_adapt(gids))
+            return
+        self._automation_run_eligible_batch(task_gids=gids)
 
     def _schedule_background_auto_adapt(self):
         if self._background_auto_adapt_scheduled or self._closing:
@@ -2197,13 +2319,110 @@ class APKToolApp:
         )
         self._automation_run_eligible_batch()
 
+    def _on_retry_selected_tasks(self):
+        if self._precheck_running or self._automation_running:
+            self._precheck_status.config(text="请先停止当前队列", foreground="#ef6c00")
+            return False
+        if not self._automation_access_allowed():
+            return False
+        gids = {str(self._precheck_tasks[item].gid) for item in self.precheck_task_tree.selection()
+                if item in self._precheck_tasks}
+        if not gids:
+            self._precheck_status.config(text="请先选中需要重试的任务", foreground="#ef6c00")
+            return False
+        mode = SELECTED_RETRY_STAGES[self._selected_retry_stage_var.get()]
+        # Capture identities before refresh; refresh may change the selected row.
+        return self._load_today_asana_tasks_async(lambda: self._start_selected_retry(gids, mode))
+
+    def _start_selected_retry(self, gids, mode):
+        if self._precheck_running or self._automation_running:
+            return False
+        existing = self._automation_checkpoint_store.load()
+        if resumable_summary(existing):
+            self._precheck_status.config(text="存在未完成队列，请先恢复或放弃断点", foreground="#ef6c00")
+            return False
+        queue = [(item, task) for item, task in self._precheck_tasks.items() if str(task.gid) in gids]
+        if {str(task.gid) for _, task in queue} != gids:
+            self._precheck_status.config(text="部分选中任务已移出今日队列，未启动重试", foreground="#ef6c00")
+            return False
+        if any(task.completed or self._precheck_task_is_blacklisted(item, task) for item, task in queue):
+            self._precheck_status.config(text="选中项包含已完成或加黑任务，未启动重试", foreground="#ef6c00")
+            return False
+        if mode == "precheck":
+            return self._on_start_batch_precheck(start_automation_after=True,
+                                                 selected_gids=gids)
+        try:
+            replay_timeout = validate_replay_timeout(self.automation_replay_timeout_var.get())
+            saved = {str(task.gid): validated_retry_fields(task) for _, task in queue} if mode in {"submit", "replay"} else {}
+        except ValueError as exc:
+            self._precheck_status.config(text=str(exc), foreground="#ef6c00")
+            return False
+        checkpoint = new_batch_checkpoint(queue, replay_timeout_seconds=replay_timeout)
+        for record in checkpoint["tasks"]:
+            record["selected_retry_stage"] = mode
+            record["retry_fields"] = saved.get(str(record["gid"]), {})
+        self._automation_checkpoint = self._automation_checkpoint_store.save(checkpoint)
+        self._automation_start_batch_queue(queue, start_index=0, resume_stage="queued")
+        return True
+
+    def _automation_replay_selected_only_sync(self):
+        verified = verify_backend_for_replay_via_api(
+            self._automation_fields, self._automation_current_package_name(),
+            api_url=self.cp_adapt_api_url_var.get().strip(),
+            x_token=self.cp_adapt_x_token_var.get().strip(),
+            token=self.cp_adapt_token_var.get().strip())
+        self._safe_after(0, self._automation_log, verified.get("message", ""))
+        if not verified.get("ok"):
+            self._automation_mark_failed(verified["message"], code=verified["code"])
+            self._automation_comment_failure(verified["code"], verified["message"])
+            return False
+        # No ID rotation: rotating an ID would write parameters in replay-only mode.
+        replay = self._automation_replay_sync()
+        if replay.get("ok"):
+            if not self._automation_confirm_cleanup_after_replay_sync():
+                return False
+            self._automation_comment_success(replay)
+        self._safe_after(0, self._automation_handle_replay_result, replay)
+        return bool(replay.get("ok"))
+
+    def _on_retry_third_party_downloads(self):
+        if self._precheck_running or self._automation_running:
+            self._precheck_status.config(text="请先停止当前预检或适配队列", foreground="#ef6c00")
+            return
+        if not self._automation_access_allowed():
+            return
+        self._precheck_status.config(text="正在读取今日任务，按所选下载策略重试异常任务...", foreground="#1976d2")
+        self._load_today_asana_tasks_async(
+            lambda: self._on_start_batch_precheck(
+                start_automation_after=True, ignore_selection=True, retry_downloads=True
+            )
+        )
+
+    def _apkpure_recovery_queue(self):
+        queue = []
+        for item_id in self.precheck_task_tree.get_children():
+            task = self._precheck_tasks.get(item_id)
+            values = self.precheck_task_tree.item(item_id, "values")
+            status = str(values[3] or "") if len(values) >= 4 else ""
+            if (
+                task is not None and apkcombo_recovery_candidate(task, status)
+                and not self._precheck_task_is_blacklisted(item_id, task)
+            ):
+                queue.append((item_id, task))
+        return queue
+
     def _on_start_batch_precheck(
         self,
         *,
         start_automation_after: bool = False,
         ignore_selection: bool = False,
+        retry_downloads: bool = False,
+        selected_gids: set[str] | None = None,
     ):
         if self._precheck_running:
+            return
+        if retry_downloads and self._automation_running:
+            self._precheck_status.config(text="自动化适配队列正在运行", foreground="#ef6c00")
             return
         self._refresh_completed_background_downloads()
         project_gid = self.project_gid_var.get().strip()
@@ -2253,15 +2472,33 @@ class APKToolApp:
             )
             return
 
-        queue, batch_start_position = self._precheck_batch_queue_from_selection(
-            ignore_selection=ignore_selection
-        )
+        if selected_gids is not None:
+            queue = [(item, replace(task, workflow_terminal=False, workflow_status="待处理"))
+                     for item, task in self._precheck_tasks.items()
+                     if str(task.gid) in selected_gids and not task.completed
+                     and not self._precheck_task_is_blacklisted(item, task)]
+            batch_start_position = 1
+        elif retry_downloads:
+            queue, batch_start_position = self._apkpure_recovery_queue(), 1
+        else:
+            queue, batch_start_position = self._precheck_batch_queue_from_selection(
+                ignore_selection=ignore_selection
+            )
         if not queue:
             self._precheck_status.config(
                 text="选中项及其后没有待处理任务", foreground="#ef5350"
             )
             return
 
+        download_retry_gids = set()
+        for item_id, task in queue:
+            status = str(getattr(task, "workflow_status", "") or "")
+            if self.precheck_task_tree.exists(item_id):
+                values = self.precheck_task_tree.item(item_id, "values")
+                if len(values) >= 4:
+                    status = str(values[3] or status)
+            if apkcombo_recovery_candidate(task, status):
+                download_retry_gids.add(str(task.gid))
         self._precheck_running = True
         self._precheck_cancel_requested = False
         self._precheck_load_asana_btn.configure(state=tk.DISABLED)
@@ -2294,6 +2531,13 @@ class APKToolApp:
                 for position, (item_id, task) in enumerate(queue, start=1):
                     if self._precheck_cancel_requested:
                         break
+                    if self._precheck_task_is_blacklisted(item_id, task):
+                        processed += 1
+                        continue
+                    if selected_gids is not None:
+                        client.stories.create_comment(task.gid,
+                            "【APK Tool 自动化适配：RECHECK_REQUESTED】\n"
+                            f"包名：{task.package_name}\n用户指定仅重试此任务，从页面预检与下载继续。")
                     self._precheck_ensure_clash_vpn_sync()
                     value = getattr(task, "gp_link", "") or getattr(task, "package_name", "")
                     self._safe_after(0, self._select_precheck_item, item_id)
@@ -2305,16 +2549,8 @@ class APKToolApp:
                         ),
                     )
 
-                    if getattr(task, "workflow_status", "") == "APKCombo有包":
-                        result = {
-                            "code": "APKCOMBO_AVAILABLE",
-                            "title": "APKCombo 有包，重新尝试自动下载",
-                            "detail": "历史安装失败任务已转入 APKCombo 新下载链路重试。",
-                            "continue_adaptation": False,
-                            "package_name": getattr(task, "package_name", ""),
-                            "source": "历史预检状态迁移",
-                            "evidence": ["此前安装失败，按新规则使用 APKCombo 重试"],
-                        }
+                    if retry_downloads or str(task.gid) in download_retry_gids:
+                        result = third_party_download_result(getattr(task, "package_name", ""))
                     else:
                         result = self._run_precheck_with_unknown_retry(
                             value,
@@ -2329,6 +2565,7 @@ class APKToolApp:
                                 ),
                             ),
                         )
+                    self._safe_after(0, self._remember_precheck_blacklist, item_id, result)
                     result = self._submit_precheck_blacklist(result)
                     backend_blacklist = result.get("backend_blacklist") or {}
                     if backend_blacklist and not backend_blacklist.get("ok"):
@@ -2339,6 +2576,8 @@ class APKToolApp:
                             "HAS_ADS",
                             "NO_ADS_OR_IAP",
                             "APKCOMBO_AVAILABLE",
+                            "APKPURE_AVAILABLE",
+                            "THIRD_PARTY_DOWNLOAD",
                         }
                     ):
                         if new_downloads >= download_limit:
@@ -2366,6 +2605,7 @@ class APKToolApp:
                                 "DOWNLOAD_STARTED",
                                 "INSTALLED",
                                 "APKCOMBO_INSTALLED",
+                                "APKPURE_INSTALLED", "APTOIDE_INSTALLED",
                             }:
                                 new_downloads += 1
                                 downloaded_total += 1
@@ -2385,7 +2625,10 @@ class APKToolApp:
 
                     status = self._precheck_task_status_for_result(result)
                     comment_error = ""
-                    if result.get("code") not in {"NO_DEVICE", "OPEN_FAILED"}:
+                    if (
+                        result.get("code") not in {"NO_DEVICE", "OPEN_FAILED"}
+                        and not self._precheck_cancel_requested
+                    ):
                         try:
                             add_precheck_comment_once(
                                 client,
@@ -2428,6 +2671,7 @@ class APKToolApp:
                             "DOWNLOAD_STARTED",
                             "INSTALLED",
                             "APKCOMBO_INSTALLED",
+                            "APKPURE_INSTALLED", "APTOIDE_INSTALLED",
                         }
                         and download_cooldown > 0
                         and position < total
@@ -2465,6 +2709,8 @@ class APKToolApp:
                     ):
                         if self._precheck_cancel_requested:
                             break
+                        if self._precheck_task_is_blacklisted(item_id, task):
+                            continue
                         self._precheck_ensure_clash_vpn_sync()
                         value = (
                             getattr(task, "gp_link", "")
@@ -2485,7 +2731,7 @@ class APKToolApp:
                             ),
                         )
 
-                        if base_result.get("code") == "APKCOMBO_AVAILABLE":
+                        if base_result.get("code") in {"APKCOMBO_AVAILABLE", "APKPURE_AVAILABLE", "THIRD_PARTY_DOWNLOAD"}:
                             result = self._install_after_precheck(base_result, True)
                         else:
                             opened, open_message, _ = open_google_play_page(value)
@@ -2506,6 +2752,7 @@ class APKToolApp:
                             "DOWNLOAD_STARTED",
                             "INSTALLED",
                             "APKCOMBO_INSTALLED",
+                            "APKPURE_INSTALLED", "APTOIDE_INSTALLED",
                         }:
                             new_downloads += 1
                             downloaded_total += 1
@@ -2545,6 +2792,7 @@ class APKToolApp:
                                 "DOWNLOAD_STARTED",
                                 "INSTALLED",
                                 "APKCOMBO_INSTALLED",
+                                "APKPURE_INSTALLED", "APTOIDE_INSTALLED",
                             }
                             and download_cooldown > 0
                             and deferred_position < deferred_total
@@ -2576,6 +2824,7 @@ class APKToolApp:
                         launch_check=launch_check,
                         launch_observation=launch_observation,
                         auto_adapt=start_automation_after,
+                        **({"task_gids": selected_gids} if selected_gids is not None else {}),
                     )
                     remaining_background_downloads = len(pending_downloads)
 
@@ -2649,7 +2898,13 @@ class APKToolApp:
                     0, lambda: self._precheck_stop_btn.configure(state=tk.DISABLED)
                 )
                 if start_automation_after and batch_completed:
-                    self._safe_after(0, self._start_automation_after_precheck)
+                    if retry_downloads or selected_gids is not None:
+                        retry_gids = {str(task.gid) for _, task in queue}
+                        self._safe_after(
+                            0, lambda: self._automation_run_eligible_batch(task_gids=retry_gids)
+                        )
+                    else:
+                        self._safe_after(0, self._start_automation_after_precheck)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -2712,7 +2967,9 @@ class APKToolApp:
         elif code == "ALL_NETWORK_NO_PACKAGE":
             recommendation = "Google Play 无法下载且 APKCombo 无可用包，暂不适配"
         elif code == "APKCOMBO_AVAILABLE":
-            recommendation = "通过 APKCombo 下载第三方包体，再继续检查和适配"
+            recommendation = "按所选第三方下载策略获取包体，再继续检查和适配"
+        elif code == "THIRD_PARTY_DOWNLOAD":
+            recommendation = "按所选第三方下载策略下载安装，验收通过后继续适配"
         elif code == "APKCOMBO_CHECK_FAILED":
             recommendation = "APKCombo 自动核验无明确结果，需要人工确认"
         elif code == "GOOGLE_NO_PACKAGE":
@@ -2795,6 +3052,14 @@ class APKToolApp:
             )
             return
         selected_item_id, selected_task = self._selected_precheck_task()
+        package_name = resolve_google_play_package(value)
+        if any(
+            getattr(task, "package_name", "") == package_name
+            and self._precheck_task_is_blacklisted(item_id, task)
+            for item_id, task in self._precheck_tasks.items()
+        ):
+            self._precheck_status.config(text="该包已加黑，跳过重复检查；后台提交异常不改变加黑结论", foreground="#ef6c00")
+            return
         asana_pat = self.asana_pat_var.get().strip()
         auto_install = self.precheck_auto_install_var.get()
         launch_check = self.precheck_launch_check_var.get()
@@ -2821,18 +3086,12 @@ class APKToolApp:
                 self._precheck_ensure_clash_vpn_sync()
                 if (
                     selected_task is not None
-                    and getattr(selected_task, "workflow_status", "")
-                    == "APKCombo有包"
+                    and apkcombo_recovery_candidate(
+                        selected_task,
+                        str(self.precheck_task_tree.item(selected_item_id, "values")[3]),
+                    )
                 ):
-                    result = {
-                        "code": "APKCOMBO_AVAILABLE",
-                        "title": "APKCombo 有包，重新尝试自动下载",
-                        "detail": "历史安装失败任务已转入 APKCombo 新下载链路重试。",
-                        "continue_adaptation": False,
-                        "package_name": selected_task.package_name,
-                        "source": "历史预检状态迁移",
-                        "evidence": ["此前安装失败，按新规则使用 APKCombo 重试"],
-                    }
+                    result = third_party_download_result(selected_task.package_name)
                 else:
                     result = self._run_precheck_with_unknown_retry(
                         value,
@@ -2844,6 +3103,7 @@ class APKToolApp:
                             ),
                         ),
                     )
+                self._safe_after(0, self._remember_precheck_blacklist, selected_item_id, result)
                 result = self._submit_precheck_blacklist(result)
                 if auto_install and (
                     result.get("continue_adaptation") is True
@@ -2851,6 +3111,8 @@ class APKToolApp:
                         "HAS_ADS",
                         "NO_ADS_OR_IAP",
                         "APKCOMBO_AVAILABLE",
+                        "APKPURE_AVAILABLE",
+                        "THIRD_PARTY_DOWNLOAD",
                     }
                 ):
                     if selected_item_id:
@@ -4325,6 +4587,7 @@ class APKToolApp:
 
         intro = ttk.LabelFrame(outer, text="自动化说明", padding=10)
         intro.pack(fill=tk.X, pady=(0, 8))
+        self._build_download_mode_controls(intro)
         ttk.Label(
             intro,
             text=(
@@ -4858,6 +5121,10 @@ class APKToolApp:
             gp_link=str(record.get("gp_link") or ""),
             notes=str(record.get("notes") or ""),
             completed=bool(record.get("completed", False)),
+            workflow_status=str(record.get("workflow_status") or ""),
+            workflow_terminal=bool(record.get("workflow_terminal", False)),
+            precheck_status=str(record.get("precheck_status") or ""),
+            final_business_status=str(record.get("final_business_status") or ""),
         )
 
     def _automation_checkpoint_item_id(self, record: dict) -> str:
@@ -5363,10 +5630,12 @@ class APKToolApp:
                     "AGGREGATION_TYPE_EMPTY",
                     "AGGREGATION_RESULT_INCOMPLETE",
                     "AF_KEY_EMPTY",
+                    "APPLOVIN_SDK_KEY_EMPTY",
                     "AD_IDS_EMPTY",
                     "UNSUPPORTED_ATTRIBUTION",
                     "APP_CRASHED",
                     "APP_EXITED_DURING_AUTOMATION",
+                    "APP_LAUNCH_NOT_CONFIRMED",
                 }:
                     package_name = self._automation_current_package_name()
                     runtime_evidence = result.get("runtime") or {}
@@ -5391,6 +5660,13 @@ class APKToolApp:
                         or runtime_fields.get("_runtime_unknown_signature")
                         or ""
                     ).strip()
+                    runtime_reason = str(
+                        runtime_evidence.get("root_cause")
+                        or runtime_fields.get("_runtime_root_cause")
+                        or runtime_evidence.get("reason")
+                        or runtime_fields.get("_runtime_reason")
+                        or ""
+                    ).strip()
                     runtime_candidates = [
                         str(value or "").strip()
                         for value in (
@@ -5401,6 +5677,12 @@ class APKToolApp:
                         if str(value or "").strip()
                     ]
                     runtime_metadata = ""
+                    if runtime_reason:
+                        label = (
+                            "崩溃原因" if result.get("code") == "APP_CRASHED"
+                            else "运行状态说明"
+                        )
+                        runtime_metadata += f"\n{label}：{runtime_reason}"
                     if runtime_rule_id:
                         runtime_metadata += f"\n规则编号：{runtime_rule_id}"
                     if runtime_fingerprint:
@@ -5415,7 +5697,10 @@ class APKToolApp:
                     self._automation_comment_failure(
                         result.get("code"),
                         f"{message}\n包名：{package_name}"
-                        + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else "")
+                        + (
+                            f"\n{'关键崩溃日志' if result.get('code') == 'APP_CRASHED' else '关键运行日志'}：\n{runtime_summary}"
+                            if runtime_summary else ""
+                        )
                         + runtime_metadata,
                     )
             except AutomationVPNUnavailable:
@@ -5519,6 +5804,7 @@ class APKToolApp:
         """Keep usable detection evidence in Asana without backend submission."""
         if code not in {
             "AF_KEY_EMPTY",
+            "APPLOVIN_SDK_KEY_EMPTY",
             "AD_IDS_EMPTY",
             "AGGREGATION_RESULT_INCOMPLETE",
             "AGGREGATION_TYPE_EMPTY",
@@ -5548,7 +5834,10 @@ class APKToolApp:
                     terminal_note=terminal_note,
                 )
             else:
-                self._automation_fill_asana_sync()
+                if code == "APPLOVIN_SDK_KEY_EMPTY":
+                    self._automation_fill_asana_sync(terminal_note=message)
+                else:
+                    self._automation_fill_asana_sync()
         except Exception as exc:
             self._safe_after(
                 0,
@@ -5640,7 +5929,8 @@ class APKToolApp:
             self._automation_report_event(
                 "backend_submitted",
                 status="success" if submitted.get("ok") else "failed",
-                details={"code": str(submitted.get("code") or "")[:80]},
+                details={"code": str(submitted.get("code") or "")[:80],
+                         "snapshot_path": str(submitted.get("snapshot_path") or "")},
             )
             return submitted
         except RuntimeError:
@@ -5731,11 +6021,25 @@ class APKToolApp:
         # A replay without a verified display does not disprove mediation.
         # Restore the raw detection evidence before a possible manual review.
         terminal_fields = dict(self._automation_fields or {})
+        if (
+            is_inferred_aggregation_result(terminal_fields)
+            and not replay.get("ok")
+            and not any(
+                (replay.get(ad_type) or {}).get("displayed")
+                for ad_type in (INTERSTITIAL, REWARDED)
+            )
+            and replay.get("code") in {
+                "REPLAY_NOT_TRIGGERED", "REPLAY_TIMEOUT",
+                "REPLAY_ID_CANDIDATES_EXHAUSTED", "REPLAY_UNVERIFIED",
+            }
+        ):
+            terminal_fields["_inferred_ironsource_failed_replay_code"] = replay["code"]
         terminal_fields["最终判断"] = ""
         terminal_fields["激励视频聚合id"] = ""
         terminal_fields["插屏聚合id"] = ""
         terminal_fields.pop("_aggregation_type_inferred", None)
         self._automation_fields = terminal_fields
+        self._automation_replay_id_candidates = {}
         white_package_detection = (
             self._automation_apply_suspected_white_package_rule_sync(
                 {
@@ -5943,7 +6247,9 @@ class APKToolApp:
                     "等待重试",
                 )
             return
-        self._automation_finish_report("failed", code, message)
+        self._automation_finish_report(
+            "skipped" if code == "APPLOVIN_SDK_KEY_EMPTY" else "failed", code, message
+        )
         task_gid = self._automation_current_task_gid()
         if not task_gid:
             return
@@ -6088,14 +6394,19 @@ class APKToolApp:
     def _automation_comment_success(self, result: dict):
         task_gid = self._automation_current_task_gid()
         package_name = self._automation_current_package_name()
-        self._automation_last_result_code = "AGGREGATION_REPLAY_SUCCESS"
+        code = (
+            "AGGREGATION_REPLAY_PARTIAL_SUCCESS"
+            if result.get("partial_success")
+            else "AGGREGATION_REPLAY_SUCCESS"
+        )
+        self._automation_last_result_code = code
         self._automation_last_result_message = result.get(
             "message", "聚合广告回放成功"
         )
         self._automation_deferred_failure = None
         self._automation_finish_report(
             "success",
-            "AGGREGATION_REPLAY_SUCCESS",
+            code,
             result.get("message", "聚合广告回放成功"),
         )
         self._automation_write_sheet_outcome_sync(
@@ -6107,19 +6418,23 @@ class APKToolApp:
         interstitial = result.get("interstitial") or {}
         rewarded = result.get("rewarded") or {}
         lines = ["聚合适配完成", f"包名：{package_name}"]
-        lines.append(
-            "插屏广告："
-            + ("回放成功" if interstitial.get("displayed") else "未配置")
-        )
-        lines.append(
-            "激励视频："
-            + ("回放成功" if rewarded.get("displayed") else "未配置")
-        )
+        for label, state in (("插屏广告", interstitial), ("激励视频", rewarded)):
+            if state.get("displayed"):
+                outcome = "回放成功"
+            elif not state.get("required"):
+                outcome = "未配置"
+            elif state.get("request_observed") is False:
+                outcome = "未观察到目标广告请求，未验证"
+            else:
+                outcome = "未确认展示，未验证"
+            lines.append(f"{label}：{outcome}")
+        if result.get("partial_success"):
+            lines.append("判定：已有一种目标广告真实展示，按单类型成功规则计为聚合适配通过")
         try:
             created = add_automation_comment_once(
                 self._automation_asana_client(),
                 task_gid,
-                "AGGREGATION_REPLAY_SUCCESS",
+                code,
                 "\n".join(lines),
             )
             self._safe_after(
@@ -6186,11 +6501,10 @@ class APKToolApp:
             )
 
     def _automation_mark_failed(self, message: str, *, code: str = ""):
-        failure_status = (
-            "af_key为空"
-            if str(code or "").strip().upper() == "AF_KEY_EMPTY"
-            else "自动化失败"
-        )
+        failure_status = {
+            "AF_KEY_EMPTY": "af_key为空",
+            "APPLOVIN_SDK_KEY_EMPTY": "AppLovin SDK Key为空，暂不适配",
+        }.get(str(code or "").strip().upper(), "自动化失败")
         self._safe_after(0, self._automation_set_status, failure_status, "#e53935")
         self._safe_after(0, self._automation_log, message)
         if self._automation_precheck_item_id:
@@ -6269,8 +6583,9 @@ class APKToolApp:
             runtime.get("rule_id") or fields.get("_runtime_rule_id") or ""
         ).strip()
         reason = str(
-            runtime.get("reason")
-            or runtime.get("root_cause")
+            runtime.get("root_cause")
+            or fields.get("_runtime_root_cause")
+            or runtime.get("reason")
             or fields.get("_runtime_reason")
             or ""
         ).strip()
@@ -6693,6 +7008,9 @@ class APKToolApp:
     ) -> dict:
         if not self._automation_fields:
             raise ValueError("请先提取并校对聚合参数")
+        missing_key = applovin_key_gate_issue(self._automation_fields)
+        if missing_key:
+            return {"ok": False, "code": missing_key[0], "message": missing_key[1]}
         self._automation_set_batch_stage("准备广告回放")
         self._automation_ensure_clash_vpn_sync()
         package_name = self._automation_current_package_name()
@@ -6759,6 +7077,7 @@ class APKToolApp:
             on_line=lambda line: self._safe_after(0, self._automation_log, line),
             on_progress=_replay_progress,
             dismiss_interrupting_dialog=dismiss_safe_interrupting_dialog,
+            trigger_rewarded_entry=trigger_visible_rewarded_ad,
             aggregation_change_detector=(
                 _higher_priority_max_detected if watch_type_change else None
             ),
@@ -6766,11 +7085,11 @@ class APKToolApp:
         )
 
     def _automation_replay_with_id_rotation_sync(self) -> dict:
-        """Replay candidates, locking successes and retrying transient failures.
+        """Replay candidates, accepting the first real displayed format.
 
-        A successful ad type is never replayed merely because the other type
-        received No Fill or timed out.  The failed type first retries the same
-        configured ID twice; multi-ID tasks then continue with the next ID.
+        Without any verified display, transient failures retry the same ID
+        before trying another candidate. Once one format displays, preserve
+        the other format's unverified evidence and accept aggregation.
         """
         if not self._automation_replay_id_candidates:
             self._automation_prepare_replay_id_candidates()
@@ -6853,6 +7172,7 @@ class APKToolApp:
                         MULTI_ID_REPLAY_TIMEOUT_SECONDS
                     )
                 result = self._automation_replay_sync(**replay_kwargs)
+            result = accept_single_format_replay(result)
             last_result = result
             self._automation_report_event(
                 "replay_attempt",
@@ -6872,6 +7192,8 @@ class APKToolApp:
             if result.get("code") == "AGGREGATION_TYPE_CHANGED_DURING_REPLAY":
                 return result
             if result.get("action_success"):
+                return result
+            if result.get("code") == "AGGREGATION_REPLAY_PARTIAL_SUCCESS":
                 return result
 
             for ad_type in tuple(pending):
@@ -7104,6 +7426,13 @@ class APKToolApp:
         """Run the common fill/submit/replay tail for validated fields."""
         self._automation_ensure_clash_vpn_sync()
         issue = detection_field_issue(self._automation_fields)
+        if issue and issue[0] == "APPLOVIN_SDK_KEY_EMPTY":
+            self._automation_persist_detected_failure_fields_sync(*issue)
+            self._automation_mark_failed(issue[1], code=issue[0])
+            self._automation_comment_failure(
+                issue[0], f"{issue[1]}\n包名：{self._automation_current_package_name()}"
+            )
+            return False
         if issue and issue[0] == "UNSUPPORTED_AGGREGATION":
             return self._automation_complete_unsupported_aggregation_sync(
                 issue[1]
@@ -7184,6 +7513,14 @@ class APKToolApp:
             return False
         if self._automation_running:
             return
+        package_name = self._automation_current_package_name()
+        if package_name and any(
+            getattr(task, "package_name", "") == package_name
+            and self._precheck_task_is_blacklisted(item_id, task)
+            for item_id, task in self._precheck_tasks.items()
+        ):
+            self._automation_set_status("该包已加黑，跳过二次检查和适配", "#ef6c00")
+            return False
         context_version = self._automation_context_version
         self._automation_set_running(True)
         self._automation_set_status("开始自动化后半程...", "#ef6c00")
@@ -7277,6 +7614,7 @@ class APKToolApp:
                             "AGGREGATION_TYPE_EMPTY",
                             "AGGREGATION_RESULT_INCOMPLETE",
                             "AF_KEY_EMPTY",
+                            "APPLOVIN_SDK_KEY_EMPTY",
                             "AD_IDS_EMPTY",
                             "UNSUPPORTED_ATTRIBUTION",
                             "APP_CRASHED",
@@ -7298,6 +7636,7 @@ class APKToolApp:
                                         "AGGREGATION_RESULT_INCOMPLETE",
                                         "AD_IDS_EMPTY",
                                         "AF_KEY_EMPTY",
+                                        "APPLOVIN_SDK_KEY_EMPTY",
                                     }
                                     else ""
                                 )
@@ -7323,13 +7662,13 @@ class APKToolApp:
         """Return non-terminal tasks eligible on the connected device.
 
         Pending and manual-review tasks are allowed into the automatic
-        adaptation queue.  Missing packages are installed through APKCombo
-        before adaptation on ordinary devices as well as G99.
+        adaptation queue. Download-review rows use the selected third-party
+        policy on ordinary devices as well as G99.
 
         A G99 is the fallback adaptation device for packages that could not be
         installed or launched reliably on the Google phone.  Those historical
         statuses must therefore be allowed into its queue; the batch worker
-        will verify/install the package through APKCombo before ADB detection.
+        will verify/install the package through the selected policy before ADB detection.
         """
         eligible_statuses = {
             "待处理",
@@ -7339,7 +7678,7 @@ class APKToolApp:
             "启动待复检",
             "安装完成",
             "已安装",
-        }
+        } | THIRD_PARTY_RETRY_STATUSES
         profile = device_profile or get_connected_device_profile()
         if profile.get("is_g99"):
             eligible_statuses.update({
@@ -7350,7 +7689,10 @@ class APKToolApp:
         queue = []
         for item_id in self.precheck_task_tree.get_children():
             task = self._precheck_tasks.get(item_id)
-            if task is None or getattr(task, "completed", False):
+            if (
+                task is None or getattr(task, "completed", False)
+                or self._precheck_task_is_blacklisted(item_id, task)
+            ):
                 continue
             values = self.precheck_task_tree.item(item_id, "values")
             status = str(values[3] if len(values) >= 4 else "").strip()
@@ -7362,10 +7704,13 @@ class APKToolApp:
         """Ensure a queue item that supports auto-install has a package.
 
         The historic G99 recovery statuses still force a clean reinstall.
-        A normal device now also installs a missing ``待处理`` package through
-        APKCombo, so admitting that status to the queue results in real work
-        instead of immediately returning it to the same state.
+        All third-party downloads use the selected provider/fallback policy.
+        Ordinary devices must inspect and try Google Play before that policy.
         """
+        if self._precheck_task_is_blacklisted(item_id, task):
+            self._automation_task_outcome = "blacklisted"
+            self._safe_after(0, self._automation_log, "该包已加黑，跳过下载和二次检测")
+            return False
         is_g99 = bool((device_profile or {}).get("is_g99"))
         package_name = str(getattr(task, "package_name", "") or "").strip()
         values = self.precheck_task_tree.item(item_id, "values")
@@ -7389,33 +7734,77 @@ class APKToolApp:
         installed = is_package_installed(package_name)
         if installed and not force_reinstall:
             return True
-        ordinary_auto_install_statuses = {"待处理", "待人工检查", "待人工"}
+        ordinary_auto_install_statuses = {"待处理", "待人工检查", "待人工"} | THIRD_PARTY_RETRY_STATUSES
         if not is_g99 and source_status not in ordinary_auto_install_statuses:
             return True
 
         device_label = "G99" if is_g99 else "待处理任务"
-        self._safe_after(
-            0,
-            self._automation_log,
-            (
-                f"G99 任务状态为“{source_status}”，正在通过 APKCombo "
-                f"重新下载并覆盖安装 {package_name}"
-                if force_reinstall
-                else f"{device_label}未安装 {package_name}，正在通过 APKCombo 自动下载安装"
-            ),
-        )
+        provider = DOWNLOAD_MODES[getattr(self, "_third_party_download_mode", "fallback")]
 
         def _progress(message):
             self._safe_after(
-                0, self._automation_log, f"{device_label} APKCombo | {message}"
+                0, self._automation_log, f"{device_label} {provider} | {message}"
             )
             self._automation_set_batch_stage(f"{device_label}下载/安装：{message}")
 
-        install_result = download_and_install_apkcombo(
-            package_name,
-            on_progress=_progress,
-            force_reinstall=force_reinstall,
-        )
+        install_result = None
+        if not is_g99:
+            self._safe_after(0, self._automation_log, f"优先检查 Google Play：{package_name}")
+            self._automation_set_batch_stage("Google Play 页面预检")
+            result = self._run_precheck_with_unknown_retry(
+                getattr(task, "gp_link", "") or package_name,
+                device_profile=device_profile,
+            )
+            if self._automation_stop_event.is_set():
+                return False
+            if not should_install_after_precheck(result):
+                self._safe_after(0, self._remember_precheck_blacklist, item_id, result)
+                result = self._submit_precheck_blacklist(result)
+                code = result.get("code", "UNKNOWN")
+                self._automation_comment_review(
+                    code,
+                    f"Google Play 预检未通过，未进入下载安装\n包名：{package_name}\n"
+                    f"原因：{result.get('detail') or result.get('title') or code}",
+                    precheck_task_status(result),
+                )
+                if code in {"IAP_ONLY", "JAPANESE_PACKAGE", "GOOGLE_LOGIN_REQUIRED"}:
+                    self._automation_task_outcome = "blacklisted"
+                return False
+            if result.get("code") not in {"APKCOMBO_AVAILABLE", "APKPURE_AVAILABLE", "THIRD_PARTY_DOWNLOAD"}:
+                self._automation_set_batch_stage("Google Play 下载/安装")
+                install_result = install_google_play_app(
+                    package_name,
+                    on_progress=lambda message: self._safe_after(
+                        0, self._automation_log, f"Google Play | {message}"
+                    ),
+                )
+                if not install_result.get("ok"):
+                    self._safe_after(
+                        0, self._automation_log,
+                        f"Google Play 下载未成功，进入第三方兜底：{install_result.get('message', '')}",
+                    )
+            else:
+                self._safe_after(
+                    0, self._automation_log,
+                    f"Google Play 无法下载，进入第三方兜底：{result.get('detail') or result.get('title') or result.get('code')}",
+                )
+        if self._automation_stop_event.is_set():
+            return False
+        if install_result is None or not install_result.get("ok"):
+            self._safe_after(
+                0,
+                self._automation_log,
+                (
+                    f"G99 任务状态为“{source_status}”，正在通过 {provider} "
+                    f"重新下载并覆盖安装 {package_name}"
+                    if force_reinstall
+                    else f"{device_label}未安装 {package_name}，正在通过 {provider} 自动下载安装"
+                ),
+            )
+            install_result = self._download_third_party_package(
+                package_name, on_progress=_progress, force_reinstall=force_reinstall,
+                cancelled=self._automation_stop_event.is_set,
+            )
         if install_result.get("ok"):
             self._safe_after(
                 0, self._set_precheck_task_status, item_id, "安装完成"
@@ -7428,16 +7817,14 @@ class APKToolApp:
             return True
 
         message = str(
-            install_result.get("message") or "APKCombo 自动下载安装失败"
+            install_result.get("message") or f"{provider} 自动下载安装失败"
         )
-        if not is_g99:
-            raise AutomationTaskRequeued(message)
-        self._automation_mark_failed(f"G99 安装失败：{message}")
-        self._automation_comment_failure(
-            "G99_APKCOMBO_INSTALL_FAILED",
-            f"G99 通过 APKCombo 安装包体失败，暂未进入聚合检测\n"
-            f"包名：{package_name}\n失败原因：{message}",
-        )
+        if not self._automation_stop_event.is_set():
+            self._automation_comment_review(
+                "THIRD_PARTY_CHECK_FAILED",
+                f"第三方下载安装未成功，暂未进入聚合检测\n包名：{package_name}\n策略：{provider}\n原因：{message}",
+                "第三方下载待确认",
+            )
         return False
 
     def _automation_apply_task_context(self, item_id: str, task):
@@ -7950,7 +8337,13 @@ class APKToolApp:
                 summary = str(runtime.get("summary") or "").strip()
                 message = runtime.get("message", "应用在检测过程中异常退出")
                 if summary:
-                    self._safe_after(0, self._automation_log, f"ADB | 崩溃证据: {summary}")
+                    evidence_label = (
+                        "崩溃证据" if runtime.get("code") == "APP_CRASHED"
+                        else "运行记录"
+                    )
+                    self._safe_after(
+                        0, self._automation_log, f"ADB | {evidence_label}: {summary}"
+                    )
                 return {
                     "ok": False,
                     "error": message,
@@ -7958,6 +8351,8 @@ class APKToolApp:
                         "code", "APP_EXITED_DURING_AUTOMATION"
                     ),
                     "_runtime_summary": summary,
+                    "_runtime_reason": runtime.get("reason", ""),
+                    "_runtime_root_cause": runtime.get("root_cause", ""),
                     "_runtime_rule_id": runtime.get("rule_id", ""),
                     "_runtime_evidence_fingerprint": runtime.get(
                         "evidence_fingerprint", ""
@@ -8200,6 +8595,17 @@ class APKToolApp:
                 return False
             if self._automation_is_g99_confirmed_crash(detection):
                 return self._automation_complete_g99_crash_sync(detection)
+            if (
+                (self._automation_batch_device_profile or {}).get("is_g99")
+                and failure_code in {
+                    "APP_LAUNCH_NOT_CONFIRMED",
+                    "APP_EXITED_DURING_AUTOMATION",
+                }
+            ):
+                message += (
+                    "\nG99复核：未取得该包的崩溃堆栈，"
+                    "不执行“闪退，g99也闪退”终局。"
+                )
             if failure_code in {
                 "AGGREGATION_TYPE_EMPTY",
                 "AD_IDS_EMPTY",
@@ -8247,6 +8653,13 @@ class APKToolApp:
                 or runtime_fields.get("_runtime_unknown_signature")
                 or ""
             ).strip()
+            runtime_reason = str(
+                runtime_evidence.get("root_cause")
+                or runtime_fields.get("_runtime_root_cause")
+                or runtime_evidence.get("reason")
+                or runtime_fields.get("_runtime_reason")
+                or ""
+            ).strip()
             runtime_candidates = [
                 str(value or "").strip()
                 for value in (
@@ -8256,6 +8669,9 @@ class APKToolApp:
                 )
                 if str(value or "").strip()
             ]
+            if runtime_reason:
+                label = "崩溃原因" if failure_code == "APP_CRASHED" else "运行状态说明"
+                runtime_metadata += f"\n{label}：{runtime_reason}"
             if runtime_rule_id:
                 runtime_metadata += f"\n规则编号：{runtime_rule_id}"
             if runtime_fingerprint:
@@ -8276,10 +8692,14 @@ class APKToolApp:
                         "AGGREGATION_RESULT_INCOMPLETE",
                         "AD_IDS_EMPTY",
                         "AF_KEY_EMPTY",
+                        "APPLOVIN_SDK_KEY_EMPTY",
                     }
                     else ""
                 )
-                + (f"\n关键崩溃日志：\n{runtime_summary}" if runtime_summary else "")
+                + (
+                    f"\n{'关键崩溃日志' if failure_code == 'APP_CRASHED' else '关键运行日志'}：\n{runtime_summary}"
+                    if runtime_summary else ""
+                )
                 + runtime_metadata,
             )
             return False
@@ -8381,7 +8801,7 @@ class APKToolApp:
         self._automation_comment_failure(code, comment)
         return False
 
-    def _automation_run_eligible_batch(self):
+    def _automation_run_eligible_batch(self, *, task_gids=None):
         if not self._automation_access_allowed():
             return False
         if self._automation_running:
@@ -8420,6 +8840,13 @@ class APKToolApp:
             )
         device_profile = get_connected_device_profile()
         queue = self._automation_eligible_precheck_tasks(device_profile)
+        if task_gids is not None:
+            queue = [
+                (item_id, task) for item_id, task in queue
+                if str(task.gid) in task_gids
+                and self.precheck_task_tree.item(item_id, "values")[3]
+                in {"启动正常", "启动待复检", "安装完成", "已安装"}
+            ]
         if not queue:
             self._automation_set_status("预检列表中没有可自动适配的任务", "#e53935")
             self._automation_log(
@@ -8706,16 +9133,40 @@ class APKToolApp:
                             else f"========== [{position}/{total_count}] {package_name} =========="
                         ),
                     )
+                    live_tasks = (self._automation_checkpoint or {}).get("tasks") or []
+                    retry_record = live_tasks[checkpoint_index] if checkpoint_index < len(live_tasks) else {}
+                    selected_stage = retry_record.get("selected_retry_stage")
                     task_succeeded = False
                     try:
-                        self._automation_set_batch_stage("检查 Clash VPN")
-                        self._automation_ensure_clash_vpn_sync()
+                        if selected_stage and not retry_record.get("retry_requested"):
+                            self._automation_asana_client().stories.create_comment(task.gid,
+                                "【APK Tool 自动化适配：RECHECK_REQUESTED】\n"
+                                f"包名：{package_name}\n用户指定仅重试此任务，起点：{selected_stage}；保留历史记录。")
+                            retry_record["retry_requested"] = True
+                            if is_dataclass(task):
+                                task = replace(task, workflow_terminal=False, workflow_status="待处理")
+                        if not self._precheck_task_is_blacklisted(item_id, task):
+                            self._automation_set_batch_stage("检查 Clash VPN")
+                            self._automation_ensure_clash_vpn_sync()
                         self._automation_set_batch_stage("检查/安装当前包体")
-                        prepared = self._automation_prepare_g99_task_sync(
-                            item_id, task, device_profile
-                        )
+                        if selected_stage:
+                            self._safe_after(0, self._set_precheck_task_status, item_id, "待处理")
+                        if selected_stage in {"submit", "replay"}:
+                            if not is_package_installed(package_name):
+                                raise RuntimeError("当前设备未安装此包，请选择页面预检与下载；未执行参数提交或回放")
+                            prepared = True
+                        else:
+                            prepared = self._automation_prepare_g99_task_sync(item_id, task, device_profile)
                         if not prepared:
                             task_succeeded = False
+                        elif selected_stage in {"submit", "replay"}:
+                            self._automation_fields = dict(
+                                (checkpoint.get("current_fields") if is_resumed_current else None)
+                                or retry_record.get("retry_fields") or {})
+                            self._automation_prepare_replay_id_candidates()
+                            task_succeeded = (self._automation_execute_post_detection_sync()
+                                              if selected_stage == "submit"
+                                              else self._automation_replay_selected_only_sync())
                         elif is_resumed_current:
                             self._safe_after(
                                 0,
@@ -8789,7 +9240,8 @@ class APKToolApp:
                         self._safe_after(
                             0,
                             self._automation_log,
-                            f"{package_name} 已加入延迟重试队列，约 {wait_minutes} 分钟后重跑完整流程",
+                            f"{package_name} 已加入延迟重试队列，约 {wait_minutes} 分钟后"
+                            + ("从所选阶段继续" if selected_stage else "重跑完整流程"),
                         )
                         self._automation_deferred_failure = None
                         continue
@@ -8806,7 +9258,7 @@ class APKToolApp:
                         other_attribution += 1
                     elif self._automation_task_outcome == "unsupported_aggregation":
                         unsupported_aggregation += 1
-                    elif self._automation_task_outcome == "not_adapted":
+                    elif self._automation_task_outcome in {"not_adapted", "blacklisted"}:
                         not_adapted += 1
                     elif self._automation_task_outcome == "requeued":
                         requeued += 1
@@ -9395,6 +9847,22 @@ class APKToolApp:
         if path:
             set_adb_path(path)
             self._update_adb_status()
+
+    def _on_apkpure_download(self):
+        import urllib.parse
+        import webbrowser
+
+        package_name = resolve_google_play_package(self.url_entry.get().strip())
+        if not package_name:
+            self.status_label.config(text="请输入 Google Play 地址或应用包名")
+            return
+        search_url = "https://apkpure.com/search?" + urllib.parse.urlencode(
+            {"q": package_name}
+        )
+        if webbrowser.open(search_url):
+            self.status_label.config(text="已打开 APKPure 搜索页，请在浏览器中选择并下载 APK/XAPK")
+        else:
+            self.status_label.config(text="无法打开浏览器，请手动访问：" + search_url)
 
     def _on_apkcombo_download(self):
         url = self.url_entry.get().strip()
@@ -10258,6 +10726,10 @@ class APKToolApp:
             ("归因平台", data.get("归因平台", "")),
         ]
 
+        for field in ("TradPlus APP ID", "TradPlus SDK版本"):
+            if data.get(field):
+                fields.append((field, data[field]))
+
         content_frame = ttk.Frame(popup)
         content_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -10365,6 +10837,9 @@ class APKToolApp:
             f"插屏聚合id:{data.get('插屏聚合id', '')}",
             f"归因平台:{data.get('归因平台', '')}",
         ]
+        for field in ("TradPlus APP ID", "TradPlus SDK版本"):
+            if data.get(field):
+                lines.append(f"{field}:{data[field]}")
         text = "\n".join(lines)
         self._copy_to_clipboard(text)
 
@@ -10378,7 +10853,7 @@ class APKToolApp:
         if not pkg:
             self.status_label.config(text="请先在「配置」中填写包名")
             return
-        unsupported_aggregation = aggregation_gate_issue(data)
+        unsupported_aggregation = aggregation_gate_issue(data) or applovin_key_gate_issue(data)
         if unsupported_aggregation:
             self.status_label.config(
                 text=unsupported_aggregation[1] + "，禁止打开提交页面"

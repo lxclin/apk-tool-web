@@ -49,3 +49,13 @@ auto_asana/.claude/settings.local.json
 # Temporary files
 *.tmp
 *.temp
+
+# Backend write snapshots (local business data)
+backend_submission_history/
+
+# Local investigations, browser traces and exported packages
+diagnostics/
+.playwright-cli/
+*_export/
+*_export_*/
+*_export*.zip

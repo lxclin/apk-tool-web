@@ -26,7 +26,7 @@ def test_aggregation_platform_from_fields_supports_backend_options(verdict, plat
     assert _aggregation_platform_from_fields({"最终判断": verdict}) == platform
 
 
-@pytest.mark.parametrize("reset_status", ["自动化失败", "待人工检查", "待处理", ""])
+@pytest.mark.parametrize("reset_status", ["自动化失败", "待人工检查", "待处理", "第三方下载待确认", "", "包体闪退", "回放失败", "TradPlus暂不适配", "参数待确认", "AppLovin SDK Key为空，暂不适配"])
 def test_reset_automation_failures_uses_fresh_status_and_keeps_business_outcomes(reset_status):
     from auto_asana.main import reset_automation_failed_tasks_for_date
     from dataclasses import replace
@@ -38,7 +38,7 @@ def test_reset_automation_failures_uses_fresh_status_and_keeps_business_outcomes
     )
     tasks = [failed] + [
         replace(failed, gid=status, workflow_status=status)
-        for status in ["聚合适配成功", "已加黑", "其他归因", "暂不适配", "回放失败", "参数待确认"]
+        for status in ["聚合适配成功", "已加黑", "其他归因", "暂不适配", "疑似白包，暂不适配", "已适配成功"]
     ] + [replace(failed, gid="completed", completed=True)]
     client = MagicMock()
     snapshot = {"section_name": "9.16执行", "tasks": tasks}
@@ -386,6 +386,20 @@ class TestAsanaPrecheckTasks:
 
         assert stages.workflow_status == "广告未触发待验证"
         assert stages.terminal is True
+        assert stages.interstitial_replay_status == "回放成功"
+        assert stages.rewarded_replay_status == "未触发待验证"
+
+    def test_one_displayed_ad_is_success_without_marking_other_as_displayed(self):
+        comment = (
+            "【APK Tool 自动化适配：AGGREGATION_REPLAY_PARTIAL_SUCCESS】\n"
+            "聚合适配完成\n"
+            "插屏广告：回放成功\n"
+            "激励视频：未观察到目标广告请求，未验证"
+        )
+
+        stages = classify_precheck_workflow_stages([{"text": comment}])
+
+        assert stages.workflow_status == "聚合适配成功"
         assert stages.interstitial_replay_status == "回放成功"
         assert stages.rewarded_replay_status == "未触发待验证"
 
@@ -1788,6 +1802,25 @@ class TestAsanaDateParent:
 
         assert mock_client.tasks.search_tasks_for_workspace.call_count == 2
 
+    @pytest.mark.parametrize("day", [8, 9, 10])
+    def test_partial_week_parent_found_by_broad_search_beats_old_parent(self, day):
+        client = MagicMock()
+        client.tasks.search_tasks_for_workspace.side_effect = [[], [
+            {"gid": "old", "name": "【2026.9.28-9.30】聚合/动作适配"},
+            {"gid": "current", "name": "【2026.10.8-10.10】聚合/动作适配"},
+        ]]
+        result = find_matching_adaptation_parent_task(client, date(2026, 10, day))
+        assert result.gid == "current"
+
+    def test_broad_search_rejects_multiple_current_parents(self):
+        client = MagicMock()
+        client.tasks.search_tasks_for_workspace.side_effect = [[], [
+            {"gid": "a", "name": "【2026.10.8-10.10】聚合/动作适配"},
+            {"gid": "b", "name": "【2026.10.5-10.9】聚合/动作适配"},
+        ]]
+        with pytest.raises(RuntimeError, match="多个当期父表"):
+            find_matching_adaptation_parent_task(client, date(2026, 10, 9))
+
     def test_missing_current_parent_falls_back_to_latest_historical_parent(self):
         mock_client = MagicMock()
         mock_client.tasks.search_tasks_for_workspace.side_effect = [
@@ -2668,3 +2701,64 @@ class TestEndToEndSync:
         assert result["backfill_skipped_reason"] == "missing_task_link_column"
         mock_asana.tasks.create_task.assert_called_once()
         mock_gs.spreadsheets.return_value.values.return_value.update.assert_not_called()
+
+
+def test_non_game_empty_outcome_restores_terminal_status_without_claiming_backend_success():
+    from auto_asana.main import classify_precheck_workflow_stages
+    stages = classify_precheck_workflow_stages([{
+        'resource_subtype': 'comment_added',
+        'text': '【APK Tool 自动化适配：NON_GAME_AGGREGATION_EMPTY】\n聚合id识别为空\n包名：com.pdfall.readerinone.suiteone.android',
+    }])
+    assert stages.workflow_status == '聚合id识别为空'
+    assert stages.terminal
+    assert stages.aggregation_detection_status == '聚合id识别为空'
+    assert stages.final_business_status == '聚合id识别为空'
+    # The business marker is written before the backend request completes.
+    assert stages.backend_submission_status == ''
+
+
+def test_non_game_empty_outcome_can_be_explicitly_reset_or_superseded():
+    from auto_asana.main import classify_precheck_workflow_stages
+    first = {'resource_subtype': 'comment_added', 'text': '【APK Tool 自动化适配：NON_GAME_AGGREGATION_EMPTY】\n聚合id识别为空'}
+    reset = classify_precheck_workflow_stages([first, {'resource_subtype': 'comment_added', 'text': '【APK Tool 自动化适配：RECHECK_REQUESTED】'}])
+    assert reset.workflow_status == '待处理' and not reset.terminal
+    assert not reset.final_business_status and not reset.aggregation_detection_status
+    success = classify_precheck_workflow_stages([first, {'resource_subtype': 'comment_added', 'text': '【APK Tool 自动化适配：AGGREGATION_REPLAY_SUCCESS】'}])
+    assert success.workflow_status == '聚合适配成功'
+    assert success.final_business_status == '聚合适配成功'
+
+
+def test_non_game_empty_restored_task_does_not_reenter_automation_queue():
+    from gui import APKToolApp
+    from auto_asana.main import classify_precheck_workflow_stages
+    stages = classify_precheck_workflow_stages([{'resource_subtype': 'comment_added', 'text': '【APK Tool 自动化适配：NON_GAME_AGGREGATION_EMPTY】'}])
+    task = AsanaPrecheckTask(gid='pdf', name='pdf', package_name='com.pdfall.readerinone.suiteone.android', up2_appid='', gp_link='', workflow_status=stages.workflow_status, workflow_terminal=stages.terminal, final_business_status=stages.final_business_status)
+    app = APKToolApp.__new__(APKToolApp)
+    app.precheck_task_tree = MagicMock()
+    app.precheck_task_tree.get_children.return_value = ['row']
+    app.precheck_task_tree.item.return_value = (1, task.package_name, '', stages.workflow_status)
+    app._precheck_tasks = {'row': task}
+    assert app._automation_eligible_precheck_tasks({'is_g99': False}) == []
+    assert app._automation_eligible_precheck_tasks({'is_g99': True}) == []
+
+
+@pytest.mark.parametrize('note', ['聚合类型识别为空，暂不适配', '聚合id识别为空', '非游戏参数为空'])
+def test_non_game_empty_status_preserves_the_actual_missing_parameter(note):
+    from auto_asana.main import classify_precheck_workflow_stages
+    s = classify_precheck_workflow_stages([{'resource_subtype': 'comment_added', 'text': '【APK Tool 自动化适配：NON_GAME_AGGREGATION_EMPTY】\n' + note}])
+    assert s.workflow_status == note and s.terminal
+    assert s.aggregation_detection_status == note
+    assert s.final_business_status == note
+
+
+def test_reset_does_not_write_when_latest_comments_cannot_be_read():
+    from auto_asana.main import reset_automation_failed_tasks_for_date
+    task = AsanaPrecheckTask(gid="a", name="com.a", package_name="com.a", up2_appid="", gp_link="")
+    client = MagicMock()
+    snapshot = {"tasks": [task], "comment_status_errors": [{"task_gid": "a", "error": "timeout"}]}
+    with patch("auto_asana.main.get_asana_tasks_for_date", return_value=snapshot):
+        result = reset_automation_failed_tasks_for_date(client, "project", {"a"})
+    assert result["reset_gids"] == set()
+    assert result["reset_errors"][0]["task_gid"] == "a"
+    assert result["reset_skipped"] == 0
+    client.stories.create_comment.assert_not_called()

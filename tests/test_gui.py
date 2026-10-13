@@ -74,6 +74,68 @@ class ImmediateThread:
         return None
 
 
+class TestAPKPureNormalBatchRouting:
+    @pytest.mark.parametrize("saved,expected", [("apkpure", "apkpure"), ("apkcombo", "apkcombo"), ("aptoide", "aptoide"), ("fallback", "fallback"), ("invalid", "fallback")])
+    def test_download_mode_is_restored_and_saved(self, saved, expected):
+        from gui import APKToolApp
+        root = tk.Tk()
+        try:
+            with patch.object(root, "mainloop"), \
+                 patch("gui.load_gui_settings", return_value={"third_party_download_mode": saved}):
+                app = APKToolApp(root)
+            assert app.third_party_download_mode_var.get() == expected
+            with patch("gui.save_gui_settings") as save:
+                app.third_party_download_mode_var.set("fallback")
+            assert app._third_party_download_mode == "fallback"
+            assert save.call_args.args[0]["third_party_download_mode"] == "fallback"
+        finally:
+            root.destroy()
+
+    @pytest.mark.parametrize("mode", ["fallback", "apkcombo", "apkpure", "aptoide"])
+    @pytest.mark.parametrize("status", ["APKCombo待确认", "APKCombo有包", "APKPure待确认"])
+    def test_normal_combined_batch_uses_selected_policy_for_historical_failures(self, status, mode):
+        from gui import APKToolApp
+        from auto_asana.main import AsanaPrecheckTask
+
+        root = tk.Tk()
+        try:
+            with patch.object(root, "mainloop"):
+                app = APKToolApp(root)
+            app._safe_after = lambda delay, callback, *args: callback(*args)
+            app.third_party_download_mode_var.set(mode)
+            app.project_gid_var.set("project")
+            app.asana_pat_var.set("test-pat")
+            task = AsanaPrecheckTask(
+                gid="old-task", name="old-task", package_name="com.example.game",
+                up2_appid="", gp_link="", workflow_status=status, workflow_terminal=False,
+            )
+            row = app.precheck_task_tree.insert("", tk.END, values=(1, task.package_name, "", status))
+            app._precheck_tasks[row] = task
+            app._precheck_new_task_gids = set()
+            app._refresh_completed_background_downloads = MagicMock()
+            app._launch_check_after_install = lambda result, seconds: {
+                **result, "launch_result": {"ok": True, "code": "LAUNCH_OK"},
+            }
+            app._start_automation_after_precheck = MagicMock()
+            with patch("gui.threading.Thread", ImmediateThread), \
+                 patch("gui.build_asana_client"), patch("gui.add_precheck_comment_once"), \
+                 patch("gui.download_and_install_aptoide", return_value={"ok": False, "message": "not found"}) as aptoide, \
+                 patch("gui.download_and_install_apkpure", return_value={"ok": True, "code": "APKPURE_INSTALLED"}) as pure, \
+                 patch("gui.download_and_install_apkcombo", return_value={"ok": False, "message": "HTTP 403"}) as combo, \
+                 patch.object(app, "_run_precheck_with_unknown_retry") as play:
+                app._on_start_batch_precheck(start_automation_after=True, ignore_selection=True)
+            assert aptoide.call_count == (1 if mode in {"fallback", "aptoide"} else 0)
+            assert pure.call_count == (1 if mode in {"fallback", "apkpure"} else 0)
+            assert combo.call_count == (1 if mode == "apkcombo" else 0)
+            play.assert_not_called()
+            assert app.precheck_task_tree.item(row, "values")[3] == (
+                "第三方下载待确认" if mode in {"apkcombo", "aptoide"} else "启动正常"
+            )
+            app._start_automation_after_precheck.assert_called_once()
+        finally:
+            root.destroy()
+
+
 class TestResetAutomationFailuresButton:
     @staticmethod
     def _app():
@@ -99,6 +161,7 @@ class TestResetAutomationFailuresButton:
         )
         app._precheck_tasks = {"row": task}
         app.precheck_task_tree = MagicMock()
+        app.precheck_task_tree.selection.return_value = ("row",)
         app.precheck_task_tree.get_children.return_value = ["row"]
         app.precheck_task_tree.item.return_value = (1, "com.failed", "", "自动化失败")
         return app
@@ -123,7 +186,7 @@ class TestResetAutomationFailuresButton:
         app._automation_submit_backend_sync.assert_not_called()
         app._automation_comment_failure.assert_not_called()
 
-    @pytest.mark.parametrize("reset_status", ["自动化失败", "待人工检查", "待处理"])
+    @pytest.mark.parametrize("reset_status", ["自动化失败", "待人工检查", "待处理", "第三方下载待确认"])
     def test_confirmed_reset_calls_service_without_starting_automation(self, reset_status):
         app = self._app()
         app.precheck_task_tree.item.return_value = (1, "com.failed", "", reset_status)
@@ -156,6 +219,29 @@ class TestResetAutomationFailuresButton:
             assert app._on_reset_automation_failed_tasks() is False
         reset.assert_not_called()
 
+    def test_reset_targets_only_selected_rows(self):
+        from dataclasses import replace
+        app = self._app()
+        app._precheck_tasks["other"] = replace(app._precheck_tasks["row"], gid="other", package_name="com.other")
+        app.precheck_task_tree.get_children.return_value = ["row", "other"]
+        app.precheck_task_tree.item.side_effect = lambda item, *args: (1, "com."+item, "", "自动化失败")
+        result = {"reset_gids": {"failed"}, "reset_errors": [], "reset_skipped": 0}
+        with patch("gui.private_feature_enabled", return_value=True), \
+             patch("gui.messagebox.askyesno", return_value=True), \
+             patch("gui.build_asana_client"), \
+             patch("gui.reset_automation_failed_tasks_for_date", return_value=result) as reset, \
+             patch("gui.threading.Thread", ImmediateThread):
+            assert app._on_reset_automation_failed_tasks()
+        assert reset.call_args.args[2] == {"failed"}
+
+    def test_reset_requires_selection_and_never_falls_back_to_whole_list(self):
+        app = self._app()
+        app.precheck_task_tree.selection.return_value = ()
+        with patch("gui.private_feature_enabled", return_value=True), \
+             patch("gui.reset_automation_failed_tasks_for_date") as reset:
+            assert app._on_reset_automation_failed_tasks() is False
+        reset.assert_not_called()
+
     def test_service_error_restores_buttons_and_does_not_change_rows(self):
         app = self._app()
         with patch("gui.private_feature_enabled", return_value=True), \
@@ -169,9 +255,10 @@ class TestResetAutomationFailuresButton:
         app._precheck_reset_failed_btn.configure.assert_called_with(state=tk.NORMAL)
         assert "网络异常" in app._precheck_asana_status.config.call_args.kwargs["text"]
 
-    def test_reset_rows_survive_refresh_and_reenter_pending_queue(self):
+    @pytest.mark.parametrize("original_status", ["自动化失败", "第三方下载待确认"])
+    def test_reset_rows_survive_refresh_and_reenter_pending_queue(self, original_status):
         from gui import APKToolApp
-        from auto_asana.main import AsanaPrecheckTask
+        from auto_asana.main import AsanaPrecheckTask, reset_automation_failed_tasks_for_date
         from datetime import datetime
         root = tk.Tk()
         try:
@@ -179,15 +266,20 @@ class TestResetAutomationFailuresButton:
                 app = APKToolApp(root)
             task = AsanaPrecheckTask(
                 gid="reset", name="com.reset", package_name="com.reset", up2_appid="", gp_link="",
-                workflow_status="待处理", workflow_terminal=False,
+                workflow_status=original_status, workflow_terminal=False,
             )
             today = datetime.now().date()
             snapshot = {"section_name": f"{today.month}.{today.day}执行", "tasks": [task]}
-            app._render_today_asana_tasks(snapshot)
-            app._render_today_asana_tasks(snapshot)
+            with patch("auto_asana.main.get_asana_tasks_for_date", return_value=snapshot):
+                restored = reset_automation_failed_tasks_for_date(MagicMock(), "project", {"reset"}, today=today)
+            assert restored["reset_gids"] == {"reset"}
+            assert restored["tasks"][0].workflow_status == "待处理"
+            app._render_today_asana_tasks(restored)
+            app._render_today_asana_tasks(restored)
             queue, _start = app._precheck_batch_queue_from_selection()
             assert [t.gid for _row, t in queue] == ["reset"]
             assert "reset" in app._precheck_new_task_gids
+            assert [t.gid for _row, t in app._automation_eligible_precheck_tasks({"is_g99": False})] == ["reset"]
             assert app._precheck_reset_failed_btn.cget("text") == "重置为待处理"
         finally:
             root.destroy()
@@ -968,7 +1060,7 @@ class TestGooglePlayPrecheckActions:
         finally:
             root.destroy()
 
-    def test_g99_without_gms_routes_precheck_to_apkcombo(self):
+    def test_g99_combo_only_routes_precheck_to_apkcombo(self):
         from gui import APKToolApp
 
         expected = {"code": "APKCOMBO_AVAILABLE", "package_name": "com.g99.game"}
@@ -980,8 +1072,9 @@ class TestGooglePlayPrecheckActions:
         with patch(
             "gui.run_apkcombo_only_precheck", return_value=expected
         ) as apkcombo_precheck, patch("gui.run_google_play_precheck") as play_precheck:
-            result = APKToolApp._run_precheck_for_connected_device(
-                None,
+            app = APKToolApp.__new__(APKToolApp)
+            app._third_party_download_mode = "apkcombo"
+            result = app._run_precheck_for_connected_device(
                 "com.g99.game",
                 device_profile=profile,
             )
@@ -1210,6 +1303,74 @@ class TestGooglePlayPrecheckActions:
 
 
 class TestAutomationBatchActions:
+
+    def test_partial_replay_success_comment_preserves_unverified_format(self):
+        from gui import APKToolApp
+
+        app = object.__new__(APKToolApp)
+        app._automation_current_task_gid = lambda: "task-1"
+        app._automation_current_package_name = lambda: "com.demo"
+        app._automation_asana_client = lambda: object()
+        app._automation_finish_report = MagicMock()
+        app._automation_write_sheet_outcome_sync = MagicMock()
+        app._automation_log = MagicMock()
+        app._safe_after = lambda _delay, callback, *args: callback(*args)
+        result = {
+            "ok": True,
+            "partial_success": True,
+            "message": "聚合适配通过：插屏广告回放成功；激励视频未观察到请求",
+            "interstitial": {"required": True, "displayed": True},
+            "rewarded": {
+                "required": True, "displayed": False,
+                "request_observed": False,
+            },
+        }
+        with patch("gui.add_automation_comment_once", return_value=True) as add_comment:
+            app._automation_comment_success(result)
+
+        assert app._automation_last_result_code == "AGGREGATION_REPLAY_PARTIAL_SUCCESS"
+        app._automation_finish_report.assert_called_once_with(
+            "success", "AGGREGATION_REPLAY_PARTIAL_SUCCESS", result["message"]
+        )
+        comment = add_comment.call_args.args[3]
+        assert "插屏广告：回放成功" in comment
+        assert "激励视频：未观察到目标广告请求，未验证" in comment
+        assert "激励视频：回放成功" not in comment
+
+    def test_partial_replay_policy_finishes_without_retrying_other_format(self):
+        import threading
+        from gui import APKToolApp, INTERSTITIAL, REWARDED
+
+        app = object.__new__(APKToolApp)
+        app._automation_stop_event = threading.Event()
+        app._automation_fields = {
+            "插屏聚合id": "inter-1",
+            "激励视频聚合id": "reward-1",
+        }
+        app._automation_replay_id_candidates = {
+            INTERSTITIAL: ("inter-1",),
+            REWARDED: ("reward-1",),
+        }
+        app._automation_report_event = MagicMock()
+        app._automation_log = MagicMock()
+        app._safe_after = lambda _delay, callback, *args: callback(*args)
+        app._automation_replay_sync = MagicMock(return_value={
+            "ok": False,
+            "code": "REPLAY_NOT_TRIGGERED",
+            "interstitial": {
+                "required": True, "displayed": True, "request_observed": True,
+            },
+            "rewarded": {
+                "required": True, "displayed": False, "request_observed": False,
+            },
+        })
+
+        result = app._automation_replay_with_id_rotation_sync()
+
+        assert result["ok"] is True
+        assert result["code"] == "AGGREGATION_REPLAY_PARTIAL_SUCCESS"
+        app._automation_replay_sync.assert_called_once_with()
+        assert result["rewarded"]["displayed"] is False
     def test_single_extract_requeues_missing_package_and_finishes_report(self):
         root = tk.Tk()
         try:
@@ -1513,6 +1674,7 @@ class TestAutomationBatchActions:
                 app.automation_package_var.set("com.example.a")
                 app.automation_appid_var.set("appid-a")
                 app._automation_fields = {
+                    "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                     "ok": True,
                     "最终判断": "MAX聚合",
                     "归因平台": "Adjust",
@@ -1630,6 +1792,7 @@ class TestAutomationBatchActions:
                 app = APKToolApp(root)
                 app.automation_package_var.set("com.example.game")
                 app._automation_fields = {
+                    "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                     "ok": True,
                     "最终判断": "MAX聚合",
                     "归因平台": "Adjust",
@@ -1678,6 +1841,7 @@ class TestAutomationBatchActions:
                     return {
                         "ok": True,
                         "fields": {
+                            "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                             "最终判断": "MAX聚合",
                             "归因平台": "Adjust",
                             "初始Activity": "MainActivity",
@@ -1805,53 +1969,41 @@ class TestAutomationBatchActions:
         app._automation_replay_sync.assert_not_called()
         app._automation_submit_backend_sync.assert_not_called()
 
-    def test_tradplus_clears_backend_and_skips_parameter_submit_and_replay(self):
+    def test_tradplus_uses_common_fill_submit_and_replay_tail(self):
         import threading
         from gui import APKToolApp
-
         app = object.__new__(APKToolApp)
-        app._automation_current_package_name = lambda: "com.demo.tradplus"
+        app._automation_fields = {
+            "最终判断": "TradPlus聚合（日志与配置综合分析确认）",
+            "初始Activity": "com.demo.MainActivity", "归因平台": "Adjust",
+            "插屏聚合id": "tp-inter", "TradPlus APP ID": "tp-app",
+        }
         app._automation_stop_event = threading.Event()
-        app._automation_precheck_item_id = "item-1"
-        app._automation_log = MagicMock()
-        app._automation_set_status = MagicMock()
-        app._set_precheck_task_status = MagicMock()
+        app._automation_ensure_clash_vpn_sync = MagicMock()
+        app._automation_prepare_replay_id_candidates = MagicMock()
+        app._automation_save_checkpoint = MagicMock()
         app._safe_after = lambda _delay, callback, *args: callback(*args)
-        app._automation_fill_asana_sync = MagicMock()
-        app._automation_comment_business_outcome = MagicMock()
-        app._automation_clear_inferred_backend_sync = MagicMock(
-            return_value={"ok": True, "message": "后台参数已清空"}
-        )
-        app._automation_mark_failed = MagicMock()
-        app._automation_comment_failure = MagicMock()
-        app._automation_write_sheet_outcome_sync = MagicMock()
-
-        result = app._automation_complete_unsupported_aggregation_sync(
-            "TradPlus聚合，暂不适配"
-        )
-
-        assert result is False
-        app._automation_fill_asana_sync.assert_called_once_with(
-            allow_unsupported_attribution=True,
-            terminal_note="TradPlus聚合，暂不适配",
-        )
-        app._automation_clear_inferred_backend_sync.assert_called_once_with(
-            note="TradPlus聚合，暂不适配"
-        )
-        app._automation_comment_business_outcome.assert_called_once_with(
-            "UNSUPPORTED_AGGREGATION",
-            "TradPlus聚合，暂不适配\n包名：com.demo.tradplus",
-        )
-        app._automation_write_sheet_outcome_sync.assert_called_once_with(
-            "not_adapted", "TradPlus聚合，暂不适配"
-        )
-        assert app._automation_task_outcome == "unsupported_aggregation"
-        app._automation_set_status.assert_called_with(
-            "TradPlus聚合，暂不适配", "#ef6c00"
-        )
-        app._set_precheck_task_status.assert_called_once_with(
-            "item-1", "TradPlus暂不适配"
-        )
+        app._automation_log = MagicMock()
+        app._automation_complete_unsupported_aggregation_sync = MagicMock()
+        app._automation_clear_inferred_backend_sync = MagicMock()
+        app._automation_confirm_cleanup_after_replay_sync = MagicMock(return_value=True)
+        app._automation_comment_success = MagicMock()
+        app._automation_handle_replay_result = MagicMock()
+        calls = []
+        app._automation_fill_asana_sync = lambda: calls.append("fill")
+        def submit():
+            calls.append("submit")
+            return {"ok": True, "backend_readback_verified": True}
+        app._automation_submit_backend_sync = submit
+        def replay():
+            calls.append("replay")
+            return {"ok": True, "code": "AGGREGATION_REPLAY_SUCCESS"}
+        app._automation_replay_with_id_rotation_sync = replay
+        assert app._automation_execute_post_detection_sync() is True
+        assert calls == ["fill", "submit", "replay"]
+        app._automation_complete_unsupported_aggregation_sync.assert_not_called()
+        app._automation_clear_inferred_backend_sync.assert_not_called()
+        app._automation_comment_success.assert_called_once()
 
     def test_g99_confirmed_crash_submits_terminal_note_and_asana_evidence(self):
         import threading
@@ -1933,6 +2085,52 @@ class TestAutomationBatchActions:
         app._automation_batch_device_profile = device_profile
 
         assert app._automation_is_g99_confirmed_crash({"code": code}) is False
+
+    def test_g99_unconfirmed_launch_explains_why_crash_rule_did_not_run(self):
+        import threading
+        from gui import APKToolApp
+
+        app = object.__new__(APKToolApp)
+        app._automation_context_version = 1
+        app._automation_batch_active = True
+        app._automation_current_package_name = lambda: "com.bright.pdf.qmom"
+        app._automation_batch_device_profile = {"is_g99": True}
+        app._automation_stop_event = threading.Event()
+        app._automation_save_checkpoint = MagicMock()
+        app._automation_set_batch_stage = MagicMock()
+        app._automation_prepare_detection_sync = MagicMock(return_value={})
+        app._automation_apply_manifest_attribution_fallback_sync = lambda result: result
+        app._automation_apply_suspected_white_package_rule_sync = lambda result: result
+        app._automation_render_fields = MagicMock()
+        app._automation_log = MagicMock()
+        app._safe_after = lambda _delay, callback, *args: callback(*args)
+        app._automation_mark_failed = MagicMock()
+        app._automation_comment_failure = MagicMock()
+        app._automation_persist_detected_failure_fields_sync = MagicMock()
+        app._automation_clear_inferred_backend_sync = MagicMock()
+        detection = {
+            "ok": False,
+            "code": "APP_LAUNCH_NOT_CONFIRMED",
+            "message": "启动应用后 25 秒内未检测到目标进程",
+            "fields": {
+                "ok": False,
+                "_runtime_summary": "am_kill: force stop com.bright.pdf.qmom",
+                "_runtime_reason": "应用任务被移除",
+                "_runtime_rule_id": "TASK_REMOVED",
+            },
+        }
+        with patch("gui.PackageRuntimeMonitor"), patch(
+            "gui.detect_aggregation_with_one_retry", return_value=detection
+        ), patch("gui.reconcile_detection_result", side_effect=lambda result: result):
+            assert app._automation_process_current_task_sync() is False
+
+        app._automation_clear_inferred_backend_sync.assert_not_called()
+        comment = app._automation_comment_failure.call_args.args
+        assert comment[0] == "APP_LAUNCH_NOT_CONFIRMED"
+        assert "G99复核：未取得该包的崩溃堆栈" in comment[1]
+        assert "运行状态说明：应用任务被移除" in comment[1]
+        assert "关键运行日志" in comment[1]
+        assert "关键崩溃日志" not in comment[1]
 
     @pytest.mark.parametrize(
         ("fields", "note"),
@@ -2061,6 +2259,7 @@ class TestAutomationBatchActions:
                     "初始Activity": "com.demo.MainActivity",
                     "应用类型": "Native",
                     "归因平台": "Adjust, AppMetrica",
+                    "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                     "插屏聚合id": "inter-1",
                 }
                 detection = {
@@ -2169,22 +2368,19 @@ class TestAutomationBatchActions:
 
                 assert result["ok"] is True
                 assert result["interstitial"]["displayed"] is True
-                assert result["rewarded"]["displayed"] is True
+                assert result["rewarded"]["displayed"] is False
+                assert result["code"] == "AGGREGATION_REPLAY_PARTIAL_SUCCESS"
                 assert app._automation_fields["插屏聚合id"] == "inter-2"
-                assert app._automation_fields["激励视频聚合id"] == "reward-3"
+                assert app._automation_fields["激励视频聚合id"] == "reward-2"
                 assert replay.call_args_list == [
                     call(timeout_seconds=MULTI_ID_REPLAY_TIMEOUT_SECONDS),
                     call(
                         required_types={INTERSTITIAL, REWARDED},
                         timeout_seconds=MULTI_ID_REPLAY_TIMEOUT_SECONDS,
                     ),
-                    call(
-                        required_types={REWARDED},
-                        timeout_seconds=MULTI_ID_REPLAY_TIMEOUT_SECONDS,
-                    ),
                 ]
-                assert fill_asana.call_count == 2
-                assert submit.call_count == 2
+                assert fill_asana.call_count == 1
+                assert submit.call_count == 1
         finally:
             root.destroy()
 
@@ -2196,6 +2392,7 @@ class TestAutomationBatchActions:
             with patch.object(root, "mainloop"):
                 app = APKToolApp(root)
                 app._automation_fields = {
+                    "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                     "最终判断": "MAX聚合",
                     "归因平台": "Adjust",
                     "插屏聚合id": "inter-only",
@@ -2238,11 +2435,9 @@ class TestAutomationBatchActions:
 
                 assert result["ok"] is True
                 assert result["interstitial"]["displayed"] is True
-                assert result["rewarded"]["displayed"] is True
-                assert replay.call_args_list == [
-                    call(),
-                    call(required_types={"rewarded"}),
-                ]
+                assert result["rewarded"]["displayed"] is False
+                assert result["code"] == "AGGREGATION_REPLAY_PARTIAL_SUCCESS"
+                replay.assert_called_once_with()
                 fill_asana.assert_not_called()
                 submit.assert_not_called()
         finally:
@@ -2256,6 +2451,7 @@ class TestAutomationBatchActions:
             with patch.object(root, "mainloop"):
                 app = APKToolApp(root)
                 app._automation_fields = {
+                    "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                     "最终判断": "MAX聚合",
                     "归因平台": "Adjust",
                     "插屏聚合id": "inter-only",
@@ -2280,13 +2476,10 @@ class TestAutomationBatchActions:
                 ) as replay:
                     result = app._automation_replay_with_id_rotation_sync()
 
-                assert result["ok"] is False
-                assert result["code"] == "REPLAY_ID_CANDIDATES_EXHAUSTED"
+                assert result["ok"] is True
+                assert result["code"] == "AGGREGATION_REPLAY_PARTIAL_SUCCESS"
                 assert result["interstitial"]["displayed"] is True
-                assert replay.call_args_list == [
-                    call(),
-                    call(required_types={REWARDED}),
-                ]
+                replay.assert_called_once_with()
         finally:
             root.destroy()
 
@@ -2525,6 +2718,7 @@ class TestAutomationBatchActions:
             config_path.write_text('{"data": [{}]}', encoding="utf-8")
             (tmp_path / "zygote_build.sh").write_text("#!/bin/sh\n", encoding="utf-8")
             detected = {
+                "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                 "ok": True,
                 "最终判断": "MAX聚合",
                 "归因平台": "Adjust",
@@ -2885,9 +3079,10 @@ class TestAutomationBatchActions:
                 app._set_precheck_task_status(item_id, status)
 
                 with patch("gui.is_package_installed", return_value=False), \
+                     patch.object(app, "_run_precheck_with_unknown_retry", return_value={"code": "HAS_ADS"}), \
                      patch(
-                         "gui.download_and_install_apkcombo",
-                         return_value={"ok": True, "code": "APKCOMBO_INSTALLED"},
+                         "gui.install_google_play_app",
+                         return_value={"ok": True, "code": "INSTALLED"},
                      ) as install:
                     prepared = app._automation_prepare_g99_task_sync(
                         item_id,
@@ -2899,7 +3094,6 @@ class TestAutomationBatchActions:
                 install.assert_called_once_with(
                     "com.pending.install",
                     on_progress=install.call_args.kwargs["on_progress"],
-                    force_reinstall=False,
                 )
                 assert app.precheck_task_tree.item(item_id, "values")[3] == "安装完成"
         finally:
@@ -2944,6 +3138,7 @@ class TestAutomationBatchActions:
                     "com.g99.reinstall",
                     on_progress=install.call_args.kwargs["on_progress"],
                     force_reinstall=True,
+                    allow_browser_fallback=False,
                 )
         finally:
             root.destroy()
@@ -3188,7 +3383,7 @@ class TestAutomationBatchActions:
 
                 precheck.assert_called_once_with(
                     new_task.gp_link,
-                    verify_apkcombo=True,
+                    verify_apkcombo=False,
                 )
                 packages = [
                     app.precheck_task_tree.item(item_id, "values")[1]
@@ -3306,12 +3501,14 @@ class TestAutomationBatchActions:
             with patch.object(root, "mainloop"):
                 app = APKToolApp(root)
                 with patch(
-                    "gui.download_and_install_apkcombo", return_value=installed
+                    "gui.download_and_install_aptoide", return_value={**installed, "code": "APTOIDE_INSTALLED"}
                 ) as install:
                     output = app._install_after_precheck(result)
 
             install.assert_called_once()
-            assert output["install_result"] == installed
+            assert output["install_result"]["ok"]
+            assert output["install_result"]["code"] == "APTOIDE_INSTALLED"
+            assert output["install_result"]["provider"] == "aptoide"
             assert APKToolApp._precheck_task_status_for_result(output) == "安装完成"
         finally:
             root.destroy()
@@ -5094,6 +5291,7 @@ class TestManifestAttributionFallback:
             "message": "未知归因，暂不适配",
             "fields": {
                 "最终判断": "MAX聚合（强关系证据确认）",
+                "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                 "插屏聚合id": "inter-123",
                 "激励视频聚合id": "reward-456",
                 "归因平台": "",
@@ -5187,6 +5385,7 @@ class TestSuspectedWhitePackageRule:
             "code": "AD_IDS_EMPTY",
             "message": "聚合 ID 为空",
             "fields": {
+                "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                 "最终判断": "MAX聚合",
                 "归因平台": "Adjust",
                 "插屏聚合id": "",
@@ -5398,6 +5597,35 @@ class TestSuspectedWhitePackageRule:
             "clear_provisional": True
         }
         app._automation_clear_inferred_backend_sync.assert_not_called()
+
+    def test_colorblock_failed_symbolic_replay_ignores_remaining_applovin_key(self):
+        app = self._app()
+        app._automation_current_package_name = lambda: "com.colorblock.mania.puzzlegame"
+        app._automation_fields = {
+            "ok": True,
+            "最终判断": "IronSource聚合（根据 video/inter 自动推断）",
+            "_raw_aggregation_verdict": "未检测到主要聚合平台",
+            "_aggregation_type_inferred": True,
+            "归因平台": "Adjust",
+            "SDK列表": [{"名称": "AppLovin", "key": "existing-key"}],
+            "插屏聚合id": "inter", "激励视频聚合id": "video",
+        }
+        app._automation_replay_id_candidates = {"interstitial": ("inter",), "rewarded": ("video",)}
+        app._automation_complete_suspected_white_package_sync = MagicMock(return_value=False)
+        with patch("gui.fetch_google_play_install_count", return_value={
+            "ok": True, "installs": 10000, "display": "10K+",
+        }):
+            app._automation_handle_inferred_replay_failure_sync({
+                "ok": False, "code": "REPLAY_NOT_TRIGGERED",
+                "message": "未观察到目标广告请求",
+            })
+        app._automation_complete_suspected_white_package_sync.assert_called_once()
+        assert app._automation_complete_suspected_white_package_sync.call_args.kwargs == {"clear_provisional": True}
+        assert app._automation_fields["最终判断"] == ""
+        assert app._automation_fields["插屏聚合id"] == ""
+        assert app._automation_fields["激励视频聚合id"] == ""
+        assert app._automation_fields["SDK列表"][0]["key"] == "existing-key"
+        assert app._automation_replay_id_candidates == {}
 
     def test_dramahome_native_inferred_replay_untriggered_becomes_white_review(self):
         app = self._app()

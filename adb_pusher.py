@@ -2032,6 +2032,61 @@ def dismiss_safe_interrupting_dialog() -> dict:
     return dismiss_safe_first_run_dialog(nodes)
 
 
+REWARDED_AD_ACTION_LABELS = {
+    "watch ad", "watch an ad", "watch video", "watch a video",
+    "watch ad to get reward", "watch video to get reward",
+    "观看广告", "看广告", "观看视频", "看视频", "广告领奖励",
+}
+
+
+def trigger_visible_rewarded_ad() -> dict:
+    """Tap one explicit rewarded-ad control, never a generic game button."""
+    try:
+        nodes = collect_device_ui_nodes()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return {"triggered": False, "code": "UI_READ_FAILED", "message": str(exc)}
+    visible = "\n".join(
+        str(value or "").casefold()
+        for node in nodes
+        for value in (node.get("text"), node.get("content_desc"))
+        if value
+    )
+    if any(phrase.casefold() in visible for phrase in SAFE_FIRST_RUN_BLOCKED_PHRASES):
+        return {
+            "triggered": False,
+            "code": "SENSITIVE_SCREEN_SKIPPED",
+            "message": "当前页面包含购买或订阅内容，跳过自动点击激励入口",
+        }
+    if "mediation debugger" in visible or "max debugger" in visible:
+        return {
+            "triggered": False,
+            "code": "MEDIATION_DEBUGGER_SKIPPED",
+            "message": "当前为聚合调试页，等待返回游戏后再查找激励入口",
+        }
+    node = _find_action_node(
+        [item for item in nodes if item.get("clickable")],
+        REWARDED_AD_ACTION_LABELS,
+    )
+    if node is None:
+        return {
+            "triggered": False,
+            "code": "REWARDED_ENTRY_NOT_VISIBLE",
+            "message": "页面未暴露明确的激励广告按钮；继续监听，必要时人工触发",
+        }
+    label = str(node.get("text") or node.get("content_desc") or "").strip()
+    if not _tap_ui_node(node):
+        return {
+            "triggered": False,
+            "code": "REWARDED_ENTRY_TAP_FAILED",
+            "message": f"找到激励入口“{label}”，但点击失败",
+        }
+    return {
+        "triggered": True,
+        "code": "REWARDED_ENTRY_TAPPED",
+        "message": f"已点击激励入口“{label}”，等待目标广告请求及展示",
+    }
+
+
 def install_google_play_app(
     package_name: str,
     timeout_seconds: float = 600,
@@ -2232,7 +2287,7 @@ def _is_app_process_running(package_name: str) -> bool:
 
 def _read_crash_logcat() -> str:
     try:
-        result = _run_adb(["logcat", "-b", "all", "-d"], timeout=15)
+        result = _run_adb(["logcat", "-v", "threadtime", "-b", "all", "-d"], timeout=15)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return ""
     return (result.stdout or "") + (result.stderr or "")
@@ -3001,6 +3056,49 @@ def _clean_detected_value(value: str) -> str:
     return cleaned
 
 
+def _admob_runtime_overrides_empty_max(
+    lines: list[str], sdk_ids: dict[str, dict[str, str]]
+) -> bool:
+    """Prefer active AdMob units when MAX has no units or lifecycle evidence.
+
+    An AppLovin SDK initialized with mediationProvider=max is not proof that
+    the host loads its ads through MAX. Require a typed AdMob unit and a
+    matching Google Ads runtime load before correcting the verdict.
+    """
+    max_ids = sdk_ids.get("max", {})
+    admob_ids = sdk_ids.get("admob", {})
+    if any(max_ids.get(kind) for kind in ("reward", "interstitial")):
+        return False
+    units = [
+        unit for kind in ("reward", "interstitial")
+        if (unit := admob_ids.get(kind, ""))
+        and ADMOB_AD_UNIT_PATTERN.fullmatch(unit)
+    ]
+    if not units:
+        return False
+    if not any(
+        "AppLovinPreferencesMaxRuntimeEvidence=false" in line
+        or "hasMediatedAdLifecycle=false" in line
+        for line in lines
+    ):
+        return False
+    max_runtime_ids = extract_runtime_ad_unit_ids(lines, "max")
+    if max_runtime_ids["rewarded_ids"] or max_runtime_ids["interstitial_ids"]:
+        return False
+    if any(
+        "ZGSDK.mediationEvent" in line
+        and re.search(r'"platform"\s*:\s*"MAX"', line, re.I)
+        for line in lines
+    ):
+        return False
+    return any(
+        re.search(r"\bAds\s*:", line)
+        and ("preloading:" in line or "Server parameters:" in line)
+        and any(unit in line or unit.replace("/", r"\/") in line for unit in units)
+        for line in lines
+    )
+
+
 ADMOB_AD_UNIT_PATTERN = re.compile(r"\bca-app-pub-\d+/\d+\b", re.IGNORECASE)
 RUNTIME_AD_UNIT_PATTERNS = (
     re.compile(r'"adUnitId"\s*:\s*"([^"]+)"', re.I),
@@ -3017,6 +3115,7 @@ RUNTIME_PLATFORM_MARKERS = {
     "admob": ("admob", "google mobile ads", '"platform":"admob"'),
     "topon": ("topon", "anythink", '"platform":"topon"'),
     "fyber": ("fyber", "digital turbine", '"platform":"fyber"'),
+    "tradplus": ("tradplus", '"platform":"tradplus"'),
 }
 
 
@@ -3280,7 +3379,6 @@ def _should_scan_runtime_ad_ids(fields: dict, target_sdk: str) -> bool:
     if (
         not fields.get("ok", True)
         or target_sdk not in RUNTIME_PLATFORM_MARKERS
-        or target_sdk == "tradplus"
     ):
         return False
     # The fallback is intentionally all-or-nothing: if either standard ID is
@@ -3335,7 +3433,7 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
         m = re.search(r"ZGSDK\.AutoDetector:\s+(.*)", line)
         if not m:
             continue
-        content = m.group(1).strip()
+        content = m.group(1).strip().replace("：", ":")
         af_key = extract_af_key_from_content(content)
         if af_key:
             fields["af_key"] = af_key
@@ -3358,6 +3456,26 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
             current_sdk = content.rstrip(":").strip()
             ensure_sdk(current_sdk)
             remember_sdk_display(current_sdk)
+
+        elif current_sdk and _canonical_aggr_name(current_sdk) == "tradplus" and re.match(
+            r"^(?:TradPlus\s+)?APP\s*ID\s*:", content, re.I
+        ):
+            value = normalize_optional_parameter(content.split(":", 1)[1])
+            if value:
+                fields["TradPlus APP ID"] = value
+                for sdk in fields["SDK列表"]:
+                    if _canonical_aggr_name(sdk["名称"]) == "tradplus":
+                        sdk["app_id"] = value
+
+        elif current_sdk and _canonical_aggr_name(current_sdk) == "tradplus" and re.match(
+            r"^(?:SDK版本|版本号)\s*:", content
+        ):
+            value = normalize_optional_parameter(content.split(":", 1)[1])
+            if value:
+                fields["TradPlus SDK版本"] = value
+                for sdk in fields["SDK列表"]:
+                    if _canonical_aggr_name(sdk["名称"]) == "tradplus":
+                        sdk["version"] = value
 
         elif "SDK Key:" in content:
             key_val = content.split("SDK Key:", 1)[1].strip()
@@ -3402,6 +3520,11 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
                     sdk_order.append("max")
 
     target_sdk = _target_aggr_from_final(fields["最终判断"])
+    if target_sdk == "max" and _admob_runtime_overrides_empty_max(lines, sdk_ids):
+        fields["_raw_aggregation_verdict"] = fields["最终判断"]
+        fields["最终判断"] = "AdMob聚合（运行期广告请求确认）"
+        fields["_aggregation_platform_corrected"] = "max_to_admob_runtime"
+        target_sdk = "admob"
     selected_ids = sdk_ids.get(target_sdk, {}) if target_sdk else {}
     if not selected_ids:
         for sdk_key in sdk_order:
@@ -4181,6 +4304,7 @@ def download_and_install_apkcombo(
     on_progress=None,
     *,
     force_reinstall: bool = False,
+    allow_browser_fallback: bool = True,
 ) -> dict:
     """Resolve, immediately download and install an exact APKCombo package.
 
@@ -4232,7 +4356,7 @@ def download_and_install_apkcombo(
         referer=str(inspected.get("download_url") or ""),
     )
     package_confirmed = False
-    if not ok and (
+    if not ok and allow_browser_fallback and (
         "403" in message
         or "forbidden" in message.casefold()
         or "不是有效的 APK/XAPK" in message
@@ -4784,10 +4908,9 @@ def build_backend_url(fields: dict, package_name: str) -> str:
         "topon": "topon",
         "fyber": "fyber",
         "levelplay": "level_play",
+        "tradplus": "tradplus",
     }
     final = normalize_optional_parameter(fields.get("最终判断", ""))
-    if "tradplus" in final.casefold().replace(" ", "").replace("_", ""):
-        raise ValueError("TradPlus聚合，暂不适配，禁止生成后台提交参数")
     canonical_platform = _target_aggr_from_final(final)
     if canonical_platform in platform_map:
         params["aggr_platform"] = platform_map[canonical_platform]
@@ -4838,10 +4961,12 @@ def build_backend_url(fields: dict, package_name: str) -> str:
 
 
 def clear_logcat_buffer() -> None:
-    """清除 logcat 旧缓冲"""
+    """Clear all log buffers so old lifecycle events cannot taint a new run."""
     adb = get_adb_path()
     if adb:
-        subprocess.run([adb, "logcat", "-c"], capture_output=True, timeout=5)
+        subprocess.run(
+            [adb, "logcat", "-b", "all", "-c"], capture_output=True, timeout=5
+        )
 
 
 def extract_logcat_fields(

@@ -34,6 +34,9 @@ REPLAY_IN_FLIGHT_GRACE_SECONDS = 30
 REPLAY_TERMINAL_FAILURE_GRACE_SECONDS = 20
 REPLAY_LOG_DRAIN_BATCH_SIZE = 512
 REPLAY_PROGRESS_HEARTBEAT_SECONDS = 30
+REWARDED_ENTRY_FIRST_CHECK_SECONDS = 45
+REWARDED_ENTRY_RECHECK_SECONDS = 60
+REWARDED_ENTRY_MAX_CHECKS = 3
 
 INTERSTITIAL = "interstitial"
 REWARDED = "rewarded"
@@ -501,6 +504,53 @@ def _drain_logcat_queue(output: queue.Queue, limit: int = REPLAY_LOG_DRAIN_BATCH
     return pending
 
 
+def accept_single_format_replay(result: dict) -> dict:
+    """Accept one verified ad format without inventing success for the other.
+
+    Apply this business rule only after a normal replay observation has ended.
+    Transport failures, app exits and operator cancellation remain failures.
+    """
+    if result.get("ok") or result.get("code") not in {
+        "REPLAY_TIMEOUT", "REPLAY_NOT_TRIGGERED", "REPLAY_ID_CANDIDATES_EXHAUSTED"
+    }:
+        return result
+    states = {
+        INTERSTITIAL: result.get(INTERSTITIAL) or {},
+        REWARDED: result.get(REWARDED) or {},
+    }
+    verified = [
+        ad_type for ad_type, state in states.items()
+        if state.get("required") and state.get("displayed")
+    ]
+    missing = [
+        ad_type for ad_type, state in states.items()
+        if state.get("required") and not state.get("displayed")
+    ]
+    if not verified or not missing:
+        return result
+    names = {INTERSTITIAL: "插屏广告", REWARDED: "激励视频"}
+    details = []
+    for ad_type in missing:
+        state = states[ad_type]
+        outcome = (
+            "未观察到请求" if state.get("request_observed") is False
+            else "未确认展示"
+        )
+        details.append(f"{names[ad_type]}{outcome}")
+    return dict(
+        result,
+        ok=True,
+        code="AGGREGATION_REPLAY_PARTIAL_SUCCESS",
+        partial_success=True,
+        message=(
+            "聚合适配通过："
+            + "、".join(names[item] for item in verified)
+            + "回放成功；"
+            + "、".join(details)
+        ),
+    )
+
+
 def build_replay_failure_comment(package_name: str, result: dict) -> str:
     """Build a replay evidence comment without overstating missing triggers."""
     code = result.get("code")
@@ -568,6 +618,7 @@ def run_ad_replay_check(
     on_line: Callable[[str], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
     dismiss_interrupting_dialog: Callable[[], dict] | None = None,
+    trigger_rewarded_entry: Callable[[], dict] | None = None,
     aggregation_change_detector: Callable[[dict], bool] | None = None,
     aggregation_change_grace_seconds: int = 90,
 ) -> dict:
@@ -633,6 +684,8 @@ def run_ad_replay_check(
         deferred_success: dict | None = None
         last_progress_at = 0.0
         terminal_failure_announced = False
+        rewarded_entry_checks = 0
+        last_rewarded_entry_check = -REWARDED_ENTRY_RECHECK_SECONDS
         aggregation_change_grace_seconds = max(
             0,
             min(int(aggregation_change_grace_seconds), timeout_seconds),
@@ -643,6 +696,29 @@ def run_ad_replay_check(
             )
         while not stop_event.is_set():
             elapsed = time.monotonic() - started
+            rewarded_state = evaluator.states[REWARDED]
+            interstitial_state = evaluator.states[INTERSTITIAL]
+            if (
+                trigger_rewarded_entry is not None
+                and rewarded_state.required
+                and not rewarded_state.request_observed
+                and not rewarded_state.displayed
+                and (not interstitial_state.required or interstitial_state.displayed)
+                and rewarded_entry_checks < REWARDED_ENTRY_MAX_CHECKS
+                and elapsed >= REWARDED_ENTRY_FIRST_CHECK_SECONDS
+                and elapsed - last_rewarded_entry_check
+                >= REWARDED_ENTRY_RECHECK_SECONDS
+            ):
+                rewarded_entry_checks += 1
+                last_rewarded_entry_check = elapsed
+                try:
+                    entry_result = dict(trigger_rewarded_entry() or {})
+                except Exception as exc:
+                    entry_result = {"message": f"激励入口检查失败：{exc}"}
+                if on_progress and entry_result.get("message"):
+                    on_progress(str(entry_result["message"]))
+                if entry_result.get("triggered"):
+                    rewarded_entry_checks = REWARDED_ENTRY_MAX_CHECKS
             if (
                 dismiss_interrupting_dialog is not None
                 and not dialog_dismissed

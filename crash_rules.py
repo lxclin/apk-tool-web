@@ -227,11 +227,12 @@ def _contains_any(text: str, patterns: Iterable[str]) -> bool:
 
 
 def _target_markers(text: str, package_name: str) -> bool:
-    package_pattern = re.escape(package_name)
+    package_pattern = re.escape(package_name) + r"(?::[\w.]+)?(?![\w.])"
     target_line = re.compile(
         rf"Process:\s*{package_pattern}(?:\s|,|$)|"
-        rf"am_crash[^\n]*\b{package_pattern}\b|"
+        rf"am_crash\s*:\s*\[\s*\d+\s*,\s*\d+\s*,\s*{package_pattern}\s*,|"
         rf">>>\s*{package_pattern}\s*<<<|"
+        rf"Fatal signal[^\n]*in pid \d+\s*\({package_pattern}\)|"
         rf"(?:wm_|finish-imm:)[^\n]*\b{package_pattern}\b|"
         rf"(?:Failure starting process|Force stopping)[^\n]*\b{package_pattern}\b|"
         rf"Package\s+{package_pattern}\s+is currently frozen|"
@@ -244,50 +245,93 @@ def _target_markers(text: str, package_name: str) -> bool:
     return any(target_line.search(line) for line in (text or "").splitlines())
 
 
-def _target_scope(log_text: str, package_name: str) -> str:
-    """Keep the target crash and nearby stack trace, excluding noisy apps."""
+def _log_entry(line: str) -> tuple[str, str, str]:
+    """Read the emitting PID/tag without confusing it with a reported PID."""
+    match = re.match(
+        r"^\s*(?:(?:\d{2}-\d{2}|\d{4}-\d{2}-\d{2})\s+)?"
+        r"\d{2}:\d{2}:\d{2}\.\d+\s+(\d+)\s+\d+\s+[VDIWEFA]\s+([^:]+):\s?(.*)",
+        line,
+    )
+    if match:
+        return match[1], match[2].strip(), match[3]
+    short = re.match(r"^\s*(?:\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?[VDIWEFA][ /]([^:]+):\s?(.*)", line)
+    return ("", short[1].strip(), short[2]) if short else ("", "", line.strip())
+
+
+def _target_evidence_blocks(log_text: str, package_name: str) -> list[str]:
+    """Keep independently owned crash records, never a window of nearby apps."""
     lines = [line for line in (log_text or "").splitlines() if line.strip()]
-    if not lines:
-        return ""
+    entries = [_log_entry(line) for line in lines]
+    target = re.escape(package_name) + r"(?::[\w.]+)?(?![\w.])"
+    process = re.compile(rf"Process:\s*{target}(?:\s|,|$)", re.I)
+    native = re.compile(rf">>>\s*{target}\s*<<<", re.I)
+    blocks = []
 
-    package_pattern = re.escape(package_name)
-    target_indexes = [
-        index
-        for index, line in enumerate(lines)
-        if re.search(rf"Process:\s*{package_pattern}(?:\s|,|$)", line, re.IGNORECASE)
-        or re.search(rf"am_crash[^\n]*\b{package_pattern}\b", line, re.IGNORECASE)
-        or re.search(rf">>>\s*{package_pattern}\s*<<<", line, re.IGNORECASE)
-        or re.search(rf"(?:wm_|finish-imm:)[^\n]*\b{package_pattern}\b", line, re.IGNORECASE)
-        or re.search(
-            rf"(?:Failure starting process|Force stopping)[^\n]*\b{package_pattern}\b",
-            line,
-            re.IGNORECASE,
-        )
-        or re.search(
-            rf"Package\s+{package_pattern}\s+is currently frozen",
-            line,
-            re.IGNORECASE,
-        )
-        or (
-            re.search(rf"\b{package_pattern}\b", line, re.IGNORECASE)
-            and re.search(
-                r"ANR|not responding|input dispatching timed out|"
-                r"has died:\s*(?:cch|cached|empty)",
-                line,
-                re.IGNORECASE,
-            )
-        )
-    ]
-    if not target_indexes:
-        return "\n".join(lines)
+    for index, (pid, tag, message) in enumerate(entries):
+        if "FATAL EXCEPTION" in message and tag in {"", "AndroidRuntime"}:
+            block = [lines[index]]
+            for offset in range(index + 1, min(len(lines), index + 240)):
+                other_pid, other_tag, text = entries[offset]
+                if pid and other_pid and other_pid != pid:
+                    continue
+                if other_tag not in {"", tag}:
+                    continue
+                if "FATAL EXCEPTION" in text:
+                    break
+                if "Shutting down VM" in text:
+                    break
+                if "Process:" in text and any("Process:" in x for x in block):
+                    break
+                block.append(lines[offset])
+                if len(block) >= 120:
+                    break
+            scope = "\n".join(block)
+            if process.search(scope):
+                # A timestamped emitter must agree with AndroidRuntime's PID.
+                declared = re.search(r"Process:[^\n]+PID:\s*(\d+)", scope)
+                if not pid or not declared or pid == declared[1]:
+                    blocks.append(scope)
 
-    scoped: list[str] = []
-    for index in target_indexes[-4:]:
-        start = max(0, index - 40)
-        end = min(len(lines), index + 140)
-        scoped.extend(lines[start:end])
-    # Preserve order while removing duplicates caused by overlapping windows.
-    return "\n".join(dict.fromkeys(scoped))
+        if native.search(message):
+            # Tombstone DEBUG records use the dumper PID, not the app PID.
+            # Restrict to that emitter and stop at the next dump.
+            start = index
+            for offset in range(index - 1, max(-1, index - 80), -1):
+                other_pid, other_tag, text = entries[offset]
+                if (pid and other_pid != pid) or other_tag != tag:
+                    continue
+                if ">>>" in text:
+                    start = index
+                    break
+                if "*** ***" in text:
+                    break
+                start = offset
+                if re.search(r"\bpid:\s*\d+.*\btid:", text):
+                    break
+            block = []
+            for offset in range(start, min(len(lines), index + 240)):
+                other_pid, other_tag, text = entries[offset]
+                if (pid and other_pid != pid) or other_tag != tag:
+                    continue
+                if offset > index and (">>>" in text or "*** ***" in text
+                                       or re.search(r"\bpid:\s*\d+.*\btid:", text)):
+                    break
+                block.append(lines[offset])
+            blocks.append("\n".join(block))
+
+        # Event records already name their subject. A system_server exception
+        # beside one of these records is not part of its cause.
+        if _target_markers(lines[index], package_name) and re.search(
+            r"am_crash|am_anr|ANR|not responding|input dispatching timed out|"
+            r"wm_|finish-imm:|Failure starting process|Force stopping|"
+            r"currently frozen|has died:", lines[index], re.I,
+        ):
+            blocks.append(lines[index])
+        if re.search(r"Fatal signal", message, re.I) and re.search(
+            rf"(?:in pid \d+\s*\(|>>>\s*){target}(?:\)|\s*<<<)", message,
+        ):
+            blocks.append(lines[index])
+    return list(dict.fromkeys(blocks))
 
 
 def _normalize_class_name(value: str) -> str:
@@ -356,6 +400,11 @@ def _extract_summary(text: str, package_name: str) -> str:
         "fatal exception",
         "androidruntime",
         "fatal signal",
+        ">>>",
+        "backtrace:",
+        "abort message:",
+        "signal 6",
+        "signal 11",
         "am_crash",
         "am_anr",
         "anr",
@@ -381,7 +430,13 @@ def _extract_summary(text: str, package_name: str) -> str:
     selected = [line for line in lines if any(token in line.casefold() for token in important)]
     if not selected:
         selected = lines[-12:]
-    return "\n".join(dict.fromkeys(selected[-20:]))
+    selected = list(dict.fromkeys(selected))
+    anchors = [line for line in selected if re.search(
+        r"FATAL EXCEPTION|Process:|>>>|Fatal signal|am_crash|backtrace:|signal (?:6|11)", line, re.I,
+    )]
+    # Always retain the subject and decisive marker, even with a long stack.
+    keep = set(anchors[:8] + [line for line in selected if line not in anchors][-12:])
+    return "\n".join(line for line in selected if line in keep)
 
 
 def _rule_matches(rule: dict, text: str) -> bool:
@@ -429,7 +484,19 @@ def classify_crash_log(
     if not package_name:
         return result
 
-    scope = _target_scope(log_text, package_name)
+    results = [
+        _classify_crash_scope(scope, package_name, rules=rules)
+        for scope in _target_evidence_blocks(log_text, package_name)
+    ]
+    if not results:
+        return result
+    return max(results, key=lambda item: (
+        item["crashed"], item["crash_type"] == "ANR", bool(item["rule_id"]), item["confidence"],
+    ))
+
+
+def _classify_crash_scope(scope: str, package_name: str, *, rules=None) -> dict:
+    result = _empty_result()
     if not _target_markers(scope, package_name):
         return result
 
@@ -438,8 +505,6 @@ def classify_crash_log(
         key=lambda rule: int(rule.get("priority", 0)),
         reverse=True,
     )
-    matched = next((rule for rule in ordered_rules if _rule_matches(rule, scope)), None)
-
     # A target FATAL EXCEPTION/am_crash without a known pattern is still a
     # confirmed crash; it should never degrade to a generic process exit.
     java_authoritative = bool(
@@ -447,26 +512,29 @@ def classify_crash_log(
         and re.search(rf"Process:\s*{re.escape(package_name)}\b", scope, re.IGNORECASE)
     ) or bool(re.search(rf"am_crash[^\n]*\b{re.escape(package_name)}\b", scope, re.IGNORECASE))
     native_authoritative = bool(
-        re.search(r"Fatal signal|backtrace:", scope, re.IGNORECASE)
+        re.search(r"Fatal signal|backtrace:|Native crash|SIGSEGV|SIGABRT|signal (?:6|11)\b", scope, re.IGNORECASE)
         and _target_markers(scope, package_name)
     )
+    matched = next((rule for rule in ordered_rules
+                    if (rule.get("kind") != "crash" or java_authoritative or native_authoritative)
+                    and _rule_matches(rule, scope)), None)
 
-    if matched is None and java_authoritative:
-        matched = {
-            "id": "JAVA_CRASH_UNKNOWN",
-            "kind": "crash",
-            "crash_type": "JAVA_CRASH",
-            "reason_code": "UNKNOWN_JAVA_CRASH",
-            "reason": "Java 异常，暂未匹配到历史规则",
-            "confidence": 0.70,
-        }
-    elif matched is None and native_authoritative:
+    if matched is None and native_authoritative:
         matched = {
             "id": "NATIVE_CRASH_UNKNOWN",
             "kind": "crash",
             "crash_type": "NATIVE_CRASH",
             "reason_code": "UNKNOWN_NATIVE_CRASH",
             "reason": "Native 崩溃，暂未匹配到历史规则",
+            "confidence": 0.70,
+        }
+    elif matched is None and java_authoritative:
+        matched = {
+            "id": "JAVA_CRASH_UNKNOWN",
+            "kind": "crash",
+            "crash_type": "JAVA_CRASH",
+            "reason_code": "UNKNOWN_JAVA_CRASH",
+            "reason": "Java 异常，暂未匹配到历史规则",
             "confidence": 0.70,
         }
 

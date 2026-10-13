@@ -84,6 +84,20 @@ def test_untriggered_replay_is_review_not_adaptation_failure():
     assert "com.demo：广告未触发，待人工验证" in summary
 
 
+def test_single_format_replay_success_counts_as_aggregation_success():
+    result = classify_task_comments(
+        "com.demo",
+        [DailyComment(
+            "【APK Tool 自动化适配：AGGREGATION_REPLAY_PARTIAL_SUCCESS】\n"
+            "聚合适配完成\n插屏广告：回放成功\n"
+            "激励视频：未观察到目标广告请求，未验证"
+        )],
+    )
+
+    assert result["aggregation_state"] == "success"
+    assert result["aggregation_reason"] == ""
+
+
 def test_unverified_replay_is_review_not_not_adapted():
     result = classify_task_comments(
         "com.demo",
@@ -200,6 +214,11 @@ def test_structured_automation_comment_extracts_terminal_reason():
     [
         ("AF_KEY_EMPTY", "af_key为空，再次确认", "af_key为空，暂不适配"),
         (
+            "APPLOVIN_SDK_KEY_EMPTY",
+            "未取得有效 SDK Key",
+            "AppLovin SDK Key为空，暂不适配",
+        ),
+        (
             "LOGCAT_ENDED",
             "聚合广告回放失败，失败原因：Logcat 监听进程已提前结束",
             "聚合回放失败（Logcat监听提前结束），暂不适配",
@@ -221,6 +240,43 @@ def test_structured_terminal_failures_are_counted_without_legacy_wording(
 
     assert result["aggregation_state"] == "not_adapted"
     assert result["aggregation_reason"] == expected_reason
+
+
+def test_applovin_key_missing_has_dedicated_daily_count_and_package_reason():
+    reason = "AppLovin SDK Key为空，暂不适配"
+    result = classify_task_comments(
+        "com.songn.est",
+        [DailyComment("【APK Tool 自动化适配：APPLOVIN_SDK_KEY_EMPTY】\n" + reason)],
+    )
+    issues = [{
+        "package_name": "com.songn.est",
+        "state": result["aggregation_state"],
+        "reason": result["aggregation_reason"],
+    }]
+    assert summarize_issue_reasons(issues, "not_adapted") == [{
+        "key": "applovin_sdk_key_missing",
+        "label": "AppLovin SDK Key为空",
+        "count": 1,
+    }]
+    text = render_daily_summary(date(2026, 10, 12), [], issues, [])
+    assert "1个暂不适配，其中1个AppLovin SDK Key为空" in text
+    assert "com.songn.est：" + reason in text
+
+
+def test_manual_adjust_key_missing_is_classified_as_specific_parameter_issue():
+    reason = "Adjust归因，AppLovin SDK Key未找到，暂不适配"
+    result = classify_task_comments("com.songn.est", [DailyComment(reason)])
+    assert result["aggregation_state"] == "not_adapted"
+    assert classify_issue_reason(result["aggregation_reason"]) == "applovin_sdk_key_missing"
+
+
+def test_later_success_supersedes_applovin_key_missing_issue():
+    result = classify_task_comments("com.songn.est", [
+        DailyComment("【APK Tool 自动化适配：APPLOVIN_SDK_KEY_EMPTY】\nAppLovin SDK Key为空，暂不适配"),
+        DailyComment("聚合适配通过"),
+    ])
+    assert result["aggregation_state"] == "success"
+    assert result["aggregation_reason"] == ""
 
 
 def test_later_success_supersedes_structured_terminal_failure():

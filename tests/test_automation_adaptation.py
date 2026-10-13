@@ -26,6 +26,7 @@ from automation_adaptation import (
     derive_backend_submit_url,
     merge_aggregation_fields_into_notes,
     non_game_empty_backend_note,
+    requires_af_key,
     clear_backend_adaptation_via_api,
     submit_backend_via_api,
     submit_precheck_blacklist_via_api,
@@ -273,6 +274,7 @@ def test_empty_aggregation_type_is_not_written_to_asana_notes():
 def test_empty_aggregation_type_restarts_and_second_detection_can_succeed():
     restart = MagicMock(return_value=(True, "应用已重新启动"))
     extract = MagicMock(return_value={
+        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
         "ok": True,
         "最终判断": "MAX聚合",
         "归因平台": "Adjust",
@@ -360,6 +362,7 @@ def test_retry_polls_past_old_45_second_boundary_until_final_verdict():
         "完整日志": "激励视频广告单元ID列表: [reward-1]",
     }
     detected = {
+        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
         "ok": True,
         "最终判断": "MAX聚合（强关系证据确认）",
         "归因平台": "Adjust",
@@ -389,6 +392,7 @@ def test_retry_polls_past_old_45_second_boundary_until_final_verdict():
 def test_initial_empty_snapshot_waits_for_app_detector_before_restart():
     empty = {"ok": True, "最终判断": ""}
     detected = {
+        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
         "ok": True,
         "最终判断": "MAX聚合",
         "归因平台": "Adjust",
@@ -423,6 +427,7 @@ def test_initial_poll_tolerates_transient_logcat_timeout_and_then_detects():
         "_transient": True,
     }
     detected = {
+        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
         "ok": True,
         "最终判断": "MAX聚合",
         "归因平台": "Adjust",
@@ -602,6 +607,7 @@ def test_appsflyer_af_key_still_empty_after_retry_is_terminal():
 
 def test_both_ad_ids_empty_retry_once_but_one_detected_id_is_enough():
     first = {
+        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
         "ok": True,
         "最终判断": "MAX聚合",
         "归因平台": "Adjust",
@@ -625,6 +631,7 @@ def test_both_ad_ids_empty_retry_once_but_one_detected_id_is_enough():
 
 def test_both_ad_ids_still_empty_after_retry_is_terminal():
     fields = {
+        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
         "ok": True,
         "最终判断": "MAX聚合",
         "归因平台": "Adjust",
@@ -664,60 +671,79 @@ def test_ironsource_symbolic_video_and_inter_are_valid_ad_ids():
     assert payload["aggr_jilishipin_id"] == "video"
 
 
-def test_tradplus_is_a_note_only_unsupported_aggregation():
+def test_tradplus_uses_normal_confidence_and_full_submission():
     fields = {
-        "最终判断": "TradPlus聚合（自动化检测确认）",
-        "初始Activity": "com.demo.MainActivity",
-        "归因平台": "AppsFlyer",
-        "af_key": "af-key",
-        "激励视频聚合id": "tp-reward",
-        "插屏聚合id": "tp-inter",
-        "SDK列表": [{"名称": "TradPlus", "key": "tp-key"}],
-        "完整日志": "ZGSDK.AutoDetector: TradPlus: 18 次匹配",
-    }
-
-    assert aggregation_gate_issue(fields) == (
-        "UNSUPPORTED_AGGREGATION",
-        "TradPlus聚合，暂不适配",
-    )
-    assert detection_field_issue(fields) == (
-        "UNSUPPORTED_AGGREGATION",
-        "TradPlus聚合，暂不适配",
-    )
-    assert validate_backend_fields(fields, "com.demo") == [
-        "TradPlus聚合，暂不适配，禁止提交聚合参数"
-    ]
-    assessment = build_aggregation_assessment(fields)
-    assert assessment["confidence"] == "不评级"
-    assert assessment["auto_submit"] is True
-    assert assessment["terminal_outcome"] == "unsupported_aggregation"
-    assert assessment["submit_mode"] == "note_only"
-    assert "日志分析中 TradPlus 匹配 18 次" in assessment["evidence"]
-
-
-def test_tradplus_backend_api_submission_is_blocked_before_network_request():
-    fields = {
-        "最终判断": "TradPlus聚合（自动化检测确认）",
+        "最终判断": "TradPlus聚合（日志与配置综合分析确认）",
         "初始Activity": "com.demo.MainActivity",
         "归因平台": "Adjust",
+        "激励视频聚合id": "tp-reward",
         "插屏聚合id": "tp-inter",
+        "TradPlus APP ID": "8A52FE0EF90E9109088F111CE218EC11",
+        "完整日志": "ZGSDK.AutoDetector: TradPlus: 18 次匹配",
     }
+    assert aggregation_gate_issue(fields) is None
+    assert detection_field_issue(fields) is None
+    assert validate_backend_fields(fields, "com.demo") == []
+    assessment = build_aggregation_assessment(fields)
+    assert assessment["confidence"] == "高"
+    assert assessment["auto_submit"] is True
+    assert assessment["terminal_outcome"] == ""
+    assert assessment["submit_mode"] == "full"
+    assert "日志分析中 TradPlus 匹配 18 次" in assessment["evidence"]
+    assert "TradPlus APP ID:" in format_aggregation_fields(fields)
+
+    payload = build_backend_submission_payload(fields, "com.demo")
+    assert payload["aggr_platform"] == "tradplus"
+    assert payload["manual_applovin_sdk_key"] is None
     session = MagicMock()
+    submitted, readback, cache = MagicMock(), MagicMock(), MagicMock()
+    submitted.json.return_value = {"code": 200, "data": payload}
+    readback.json.return_value = {"code": 200, "data": {"data": [payload], "total": 1}}
+    cache.json.return_value = {"code": 200, "message": "success", "data": 1}
+    session.post.side_effect = [submitted, readback]
+    session.get.return_value = cache
+    _prepend_backend_lookup(session, payload)
 
     result = submit_backend_via_api(
-        fields,
-        "com.demo",
-        api_url="https://example.test/cp_adapt/list",
-        x_token="session-token",
-        token="fixed-token",
-        session=session,
+        fields, "com.demo", api_url="https://example.test/cp_adapt/list",
+        x_token="session-token", token="fixed-token", session=session,
+        readback_delay_seconds=0,
     )
+    assert result["ok"] is True
+    assert result["backend_readback_verified"] is True
+    assert result["device_verification"] == "pending_replay"
+    assert session.post.call_args_list[1].kwargs["json"]["aggr_platform"] == "tradplus"
 
-    assert result["ok"] is False
+
+
+def test_tradplus_app_id_without_ad_units_cannot_submit():
+    fields = {
+        "最终判断": "TradPlus聚合（日志与配置综合分析确认）",
+        "初始Activity": "com.demo.MainActivity",
+        "归因平台": "Adjust",
+        "TradPlus APP ID": "8A52FE0EF90E9109088F111CE218EC11",
+        "激励视频聚合id": "video",  # Other SDK symbolic placements are not TradPlus IDs.
+        "插屏聚合id": "inter",
+    }
+    assert detection_field_issue(fields)[0] == "AD_IDS_EMPTY"
+    assert build_aggregation_assessment(fields)["auto_submit"] is False
+    session = MagicMock()
+    result = submit_backend_via_api(
+        fields, "com.demo", api_url="https://example.test/cp_adapt/list",
+        x_token="session-token", token="fixed-token", session=session,
+    )
     assert result["code"] == "BACKEND_VALIDATION_FAILED"
-    assert "禁止提交聚合参数" in result["message"]
     session.post.assert_not_called()
-    session.get.assert_not_called()
+
+
+def test_old_tradplus_unsupported_result_is_reconciled_to_current_rules():
+    from automation_adaptation import reconcile_detection_result
+    fields = {"最终判断": "TradPlus聚合", "归因平台": "Adjust", "插屏聚合id": "tp-inter"}
+    result = reconcile_detection_result({"ok": False, "code": "UNSUPPORTED_AGGREGATION", "fields": fields})
+    assert result["ok"] is True
+    fields["插屏聚合id"] = ""
+    result = reconcile_detection_result({"ok": False, "code": "UNSUPPORTED_AGGREGATION", "fields": fields})
+    assert result["code"] == "AD_IDS_EMPTY"
 
 
 def test_empty_verdict_with_exact_video_inter_pair_is_inferred_as_ironsource():
@@ -995,6 +1021,7 @@ def test_levelplay_symbolic_video_and_inter_are_valid_ad_ids():
 
 def test_symbolic_video_and_inter_remain_invalid_for_max():
     fields = {
+        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
         "最终判断": "MAX聚合",
         "初始Activity": "MainActivity",
         "归因平台": "Adjust",
@@ -1037,7 +1064,7 @@ def test_mixed_adjust_appsflyer_max_can_submit_without_af_key():
         "af_key": "",
         "激励视频聚合id": "2ed22aa6d089678a",
         "插屏聚合id": "",
-        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
+    "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
     }
 
     assert detection_field_issue(fields) is None
@@ -1065,13 +1092,84 @@ def test_mixed_adjust_appsflyer_max_can_submit_without_af_key():
     extract.assert_not_called()
 
 
+def test_strong_max_with_appsflyer_thinkingdata_appmetrica_reaches_replay_gate():
+    fields = {
+        "ok": True,
+        "最终判断": "MAX聚合（强关系证据确认）",
+        "初始Activity": "com.cocos.game.GameEntryGateActivity",
+        "应用类型": "Native",
+        "归因平台": "AppsFlyer, ThinkingData, AppMetrica",
+        "af_key": "",
+        "激励视频聚合id": "8216426572746672",
+        "插屏聚合id": "654bbb2eb1908a16, e163dbbe5c6c2638",
+        "SDK列表": [
+            {"名称": "AppLovin", "key": "test-sdk-key"},
+            {"名称": "Appsflyer", "key": "未找到"},
+        ],
+    }
+
+    assert requires_af_key(fields) is False
+    assert detection_field_issue(fields) is None
+    assert validate_backend_fields(fields, "com.example.game") == []
+    assessment = build_aggregation_assessment(fields)
+    assert assessment["auto_submit"] is True
+    assert any("混合归因特例" in item for item in assessment["evidence"])
+    description = format_aggregation_fields(fields)
+    assert "自动提交策略:允许自动提交" in description
+    assert "混合归因特例" in description
+    payload = build_backend_submission_payload(fields, "com.example.game")
+    assert payload["aggr_platform"] == "max"
+    assert payload["attribution_platform"] == "AppsFlyer, ThinkingData, AppMetrica"
+    assert payload["af_key"] is None
+    assert payload["aggr_chaping_id"] == "654bbb2eb1908a16"
+    assert payload["aggr_jilishipin_id"] == "8216426572746672"
+
+    restart = MagicMock()
+    result = detect_aggregation_with_one_retry(
+        "com.example.game",
+        MagicMock(),
+        first_fields=fields,
+        restart_app=restart,
+        wait_seconds=0,
+    )
+    assert result["ok"] is True
+    restart.assert_not_called()
+
+
+@pytest.mark.parametrize("changes", [
+    {"归因平台": "AppsFlyer"},
+    {"归因平台": "AppsFlyer, AppMetrica"},
+    {"归因平台": "AppsFlyer, ThinkingData"},
+    {"最终判断": "MAX聚合"},
+    {"最终判断": "AdMob聚合（强关系证据确认）"},
+    {"初始Activity": ""},
+    {"激励视频聚合id": "", "插屏聚合id": ""},
+    {"SDK列表": []},
+])
+def test_mixed_attribution_af_key_exception_requires_complete_max_evidence(changes):
+    fields = {
+        "最终判断": "MAX聚合（强关系证据确认）",
+        "初始Activity": "com.cocos.game.GameEntryGateActivity",
+        "归因平台": "AppsFlyer, ThinkingData, AppMetrica",
+        "激励视频聚合id": "8216426572746672",
+        "插屏聚合id": "654bbb2eb1908a16",
+    "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
+    }
+    fields.update(changes)
+
+    assert requires_af_key(fields) is True
+    assert detection_field_issue(fields) == (
+        "AF_KEY_EMPTY", "af_key为空，再次确认"
+    )
+
+
 def test_mixed_adjust_appsflyer_allows_max_type_fallback_without_af_key():
     fields = {
         "最终判断": "",
         "初始Activity": "com.demo.MainActivity",
         "归因平台": "AppsFlyer, Adjust",
         "激励视频聚合id": "reward-1",
-        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
+    "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
     }
 
     apply_aggregation_type_fallback(fields)
@@ -1408,6 +1506,8 @@ def test_api_submit_posts_tokens_and_verifies_response_fields():
     }
     session.get.return_value = cache_response
 
+    _prepend_backend_lookup(session, payload)
+
     result = submit_backend_via_api(
         FIELDS,
         "com.demo",
@@ -1423,18 +1523,19 @@ def test_api_submit_posts_tokens_and_verifies_response_fields():
     assert result["code"] == "BACKEND_SUBMITTED"
     assert result["backend_readback_verified"] is True
     assert result["device_verification"] == "pending_replay"
-    request = session.post.call_args_list[0]
+    request = session.post.call_args_list[1]
     assert request.args[0].endswith("/s10_package_info")
     assert request.kwargs["headers"]["X-Token"] == "session-token"
     assert request.kwargs["headers"]["token"] == "fixed-token"
     assert request.kwargs["json"]["package_name"] == "com.demo"
-    readback_request = session.post.call_args_list[1]
+    readback_request = session.post.call_args_list[2]
     assert readback_request.args[0].endswith("/cp_adapt/list")
     assert readback_request.kwargs["json"]["package_name"] == "com.demo"
     cache_request = session.get.call_args
     assert cache_request.args[0].endswith("/a2/delete_a2_package_cache")
     assert cache_request.kwargs["params"] == {"package_name": "com.demo"}
     assert cache_request.kwargs["headers"]["X-Token"] == "session-token"
+
 
 
 def test_inferred_replay_failure_clears_all_backend_fields_and_keeps_note():
@@ -1456,6 +1557,8 @@ def test_inferred_replay_failure_clears_all_backend_fields_and_keeps_note():
     }
     session.get.return_value = cache_response
 
+    _prepend_backend_lookup(session, payload)
+
     result = clear_backend_adaptation_via_api(
         "com.inferred.game",
         api_url="http://8.131.54.114/admin/gd_web/overseas/cp_adapt/list",
@@ -1467,7 +1570,7 @@ def test_inferred_replay_failure_clears_all_backend_fields_and_keeps_note():
     )
 
     assert result["ok"] is True
-    submitted = session.post.call_args_list[0].kwargs["json"]
+    submitted = session.post.call_args_list[1].kwargs["json"]
     assert submitted["ps"] == "未识别出聚合类型，暂不适配"
     for field in (
         "aggr_platform",
@@ -1482,6 +1585,7 @@ def test_inferred_replay_failure_clears_all_backend_fields_and_keeps_note():
     ):
         assert submitted[field] is None
     session.get.assert_called_once()
+
 
 
 @pytest.mark.parametrize(
@@ -1569,6 +1673,65 @@ def test_precheck_blacklist_rejects_non_blacklist_result():
     assert result["code"] == "PRECHECK_BLACKLIST_VALIDATION_FAILED"
 
 
+def test_precheck_blacklist_finds_and_reads_back_package_on_second_page():
+    session = MagicMock()
+    package = "com.datemyage"
+    first = [{"package_name": f"com.other.app{i}"} for i in range(999)]
+    existing = {"package_name": package, "ps": "保留备注"}
+    reason = "应用内购，无广告，加黑"
+    submitted = {**existing, "block_ps": reason}
+
+    def response(records, total=1074):
+        r = MagicMock()
+        r.json.return_value = {"code": 200, "data": {"code": 200, "data": records, "total": total}}
+        return r
+
+    submit = MagicMock()
+    submit.json.return_value = {"code": 200, "data": submitted}
+    session.post.side_effect = [response(first), response([existing]), submit,
+                                response(first), response([submitted])]
+    session.get.return_value.json.return_value = {"code": 200, "message": "success"}
+    result = submit_precheck_blacklist_via_api(
+        {"code": "IAP_ONLY", "package_name": package},
+        api_url="http://example.test/cp_adapt/list", x_token="x", token="fixed",
+        session=session, readback_attempts=1,
+    )
+    assert result["ok"]
+    calls = session.post.call_args_list
+    assert [calls[i].kwargs["json"]["page"] for i in (0, 1, 3, 4)] == [1, 2, 1, 2]
+    assert calls[2].kwargs["json"]["package_name"] == package
+    assert calls[2].kwargs["json"]["ps"] == "保留备注"
+
+
+@pytest.mark.parametrize("case", ["rejected", "repeated_page", "missing_page", "absent"])
+def test_precheck_blacklist_lookup_never_submits_on_incomplete_or_absent_result(case):
+    session = MagicMock()
+
+    def response(records, total):
+        r = MagicMock()
+        r.json.return_value = {"code": 200, "data": {"code": 200, "data": records, "total": total}}
+        return r
+
+    page = response([{"package_name": "com.other.app"}], 2)
+    if case == "rejected":
+        page.json.return_value = {"code": 401, "message": "expired"}
+        session.post.side_effect = [page]
+    elif case == "repeated_page":
+        session.post.side_effect = [page, page]
+    elif case == "missing_page":
+        session.post.side_effect = [page, response([], 2)]
+    else:
+        session.post.side_effect = [page, response([{"package_name": "com.other.second"}], 2)]
+    result = submit_precheck_blacklist_via_api(
+        {"code": "IAP_ONLY", "package_name": "com.datemyage"},
+        api_url="http://example.test/cp_adapt/list", x_token="x", token="fixed", session=session,
+    )
+    assert result["code"] == ("PRECHECK_BLACKLIST_RECORD_NOT_FOUND" if case == "absent"
+                              else "PRECHECK_BLACKLIST_LOOKUP_FAILED")
+    assert all(call.args[0].endswith('/cp_adapt/list') for call in session.post.call_args_list)
+    session.get.assert_not_called()
+
+
 def test_api_submit_rejects_response_field_mismatch():
     session = MagicMock()
     response = MagicMock()
@@ -1576,6 +1739,8 @@ def test_api_submit_rejects_response_field_mismatch():
     record["aggr_chaping_id"] = "wrong-id"
     response.json.return_value = {"code": 200, "data": record}
     session.post.return_value = response
+
+    _prepend_backend_lookup(session, record)
 
     result = submit_backend_via_api(
         FIELDS,
@@ -1590,6 +1755,7 @@ def test_api_submit_rejects_response_field_mismatch():
     assert result["code"] == "BACKEND_VERIFY_FAILED"
     assert "aggr_chaping_id" in result["message"]
     session.get.assert_not_called()
+
 
 
 def test_api_submit_does_not_succeed_when_cache_clear_fails():
@@ -1608,6 +1774,8 @@ def test_api_submit_does_not_succeed_when_cache_clear_fails():
     }
     session.get.return_value = cache_response
 
+    _prepend_backend_lookup(session, build_backend_submission_payload(FIELDS, "com.demo"))
+
     result = submit_backend_via_api(
         FIELDS,
         "com.demo",
@@ -1620,6 +1788,7 @@ def test_api_submit_does_not_succeed_when_cache_clear_fails():
     assert result["ok"] is False
     assert result["code"] == "BACKEND_CACHE_CLEAR_REJECTED"
     assert "已提交" in result["message"]
+
 
 
 def test_api_submit_blocks_replay_when_readback_fields_do_not_match():
@@ -1647,6 +1816,8 @@ def test_api_submit_blocks_replay_when_readback_fields_do_not_match():
     }
     session.get.return_value = cache_response
 
+    _prepend_backend_lookup(session, payload)
+
     result = submit_backend_via_api(
         FIELDS,
         "com.demo",
@@ -1660,7 +1831,8 @@ def test_api_submit_blocks_replay_when_readback_fields_do_not_match():
     assert result["ok"] is False
     assert result["code"] == "BACKEND_READBACK_MISMATCH"
     assert result["mismatches"] == ["aggr_jilishipin_id"]
-    assert session.post.call_count == 4
+    assert session.post.call_count == 5
+
 
 
 def test_backend_readback_finds_exact_package_on_second_page():
@@ -1850,6 +2022,8 @@ def test_api_submit_succeeds_when_persisted_record_is_on_second_page():
     session.post.side_effect = [submit_response, first_page, second_page]
     session.get.return_value = cache_response
 
+    _prepend_backend_lookup(session, payload)
+
     result = submit_backend_via_api(
         FIELDS,
         "com.demo",
@@ -1862,7 +2036,8 @@ def test_api_submit_succeeds_when_persisted_record_is_on_second_page():
 
     assert result["ok"] is True
     assert result["backend_readback_verified"] is True
-    assert [call.kwargs["json"]["page"] for call in session.post.call_args_list[1:]] == [1, 2]
+    assert [call.kwargs["json"]["page"] for call in session.post.call_args_list[2:]] == [1, 2]
+
 
 
 def test_placeholder_ad_ids_are_not_treated_as_real_parameters():
@@ -2005,6 +2180,7 @@ def test_fetches_google_play_download_bucket_through_configured_proxy():
         ),
         (
             {
+                "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                 "最终判断": "MAX聚合",
                 "归因平台": "Adjust",
                 "插屏聚合id": "",
@@ -2016,6 +2192,7 @@ def test_fetches_google_play_download_bucket_through_configured_proxy():
         ),
         (
             {
+                "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
                 "最终判断": "MAX聚合",
                 "归因平台": "Adjust",
                 "插屏聚合id": "",
@@ -2036,7 +2213,7 @@ def test_white_package_180k_boundary(installs, expected):
     fields = {"最终判断": "未检测到主要聚合平台", "归因平台": "Adjust", "_google_play_installs": installs}
     assert (detection_field_issue(fields)[0] == "SUSPECTED_WHITE_PACKAGE") is expected
     # Install count alone never turns a complete mediation result into white.
-    complete_fields = {"最终判断": "MAX聚合", "归因平台": "Adjust", "_google_play_installs": installs, "插屏聚合id": "inter-123"}
+    complete_fields = {"SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}], "最终判断": "MAX聚合", "归因平台": "Adjust", "_google_play_installs": installs, "插屏聚合id": "inter-123"}
     assert detection_field_issue(complete_fields) is None
 
 
@@ -2056,6 +2233,7 @@ def test_suspected_white_package_uses_canonical_conclusion():
 
 def test_explicit_max_without_ids_is_not_mislabeled_white_package():
     fields = {
+        "SDK列表": [{"名称": "AppLovin", "key": "test-sdk-key"}],
         "最终判断": "MAX聚合",
         "归因平台": "Adjust",
         "插屏聚合id": "",
@@ -2085,6 +2263,33 @@ def test_low_install_with_ad_id_or_sdk_key_is_not_called_white_package():
     assert detection_field_issue(with_sdk_key)[0] == "AGGREGATION_RESULT_INCOMPLETE"
 
 
+@pytest.mark.parametrize("installs,expected", [(10000, "SUSPECTED_WHITE_PACKAGE"), (180000, "AGGREGATION_RESULT_INCOMPLETE")])
+def test_failed_symbolic_ironsource_replay_rechecks_white_despite_sdk_key(installs, expected):
+    fields = {
+        "最终判断": "",
+        "归因平台": "Adjust",
+        "SDK列表": [{"名称": "AppLovin", "key": "present-sdk-key"}],
+        "插屏聚合id": "",
+        "激励视频聚合id": "",
+        "_google_play_installs": installs,
+        "_inferred_ironsource_failed_replay_code": "REPLAY_NOT_TRIGGERED",
+    }
+    assert detection_field_issue(fields)[0] == expected
+    assert fields["SDK列表"][0]["key"] == "present-sdk-key"
+    fields["最终判断"] = "MAX聚合"
+    assert detection_field_issue(fields)[0] == "AD_IDS_EMPTY"
+
+
+def test_environment_failure_does_not_bypass_sdk_evidence_for_white_package():
+    fields = {
+        "最终判断": "", "归因平台": "Adjust",
+        "AppLovin SDK Key": "present-sdk-key",
+        "_google_play_installs": 10000,
+        "_inferred_ironsource_failed_replay_code": "LOGCAT_ENDED",
+    }
+    assert detection_field_issue(fields)[0] == "AGGREGATION_RESULT_INCOMPLETE"
+
+
 def test_asana_update_allows_missing_aggregation_for_white_package_terminal():
     client = MagicMock()
     fields = {
@@ -2106,3 +2311,23 @@ def test_asana_update_allows_missing_aggregation_for_white_package_terminal():
 
     assert "适配结论:疑似白包，暂不适配" in merged
     client.tasks.update_task.assert_called_once()
+
+
+def test_tradplus_app_id_alone_is_partial_evidence_not_a_platform_verdict():
+    fields = {"TradPlus APP ID": "tp-app", "归因平台": "Adjust"}
+    assert detection_field_issue(fields)[0] == "AGGREGATION_RESULT_INCOMPLETE"
+    assessment = build_aggregation_assessment(fields)
+    assert assessment["confidence"] == "低"
+    assert assessment["auto_submit"] is False
+
+
+@pytest.fixture(autouse=True)
+def isolate_backend_journal(tmp_path, monkeypatch):
+    monkeypatch.setattr("backend_write_guard.ROOT", tmp_path / "backend_history")
+
+
+def _prepend_backend_lookup(session, payload):
+    response = MagicMock()
+    response.json.return_value = {"code": 200, "data": {"data": [{**payload, "ps": None, "block_ps": None}], "total": 1}}
+    existing = list(session.post.side_effect) if session.post.side_effect is not None else [session.post.return_value] * 10
+    session.post.side_effect = [response] + existing

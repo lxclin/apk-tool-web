@@ -19,6 +19,8 @@ from typing import Any
 
 import requests
 
+from backend_write_guard import BackendWriteJournal, merge_backend_payload
+
 from adb_pusher import (
     build_backend_url,
     get_adb_path,
@@ -202,6 +204,20 @@ def get_applovin_sdk_key(fields: dict[str, Any] | None) -> str:
     return ""
 
 
+def applovin_key_gate_issue(fields: dict[str, Any] | None) -> tuple[str, str] | None:
+    """Adjust + MAX requires a real SDK key before submitting or replaying."""
+    fields = fields or {}
+    verdict = normalize_optional_parameter(fields.get("最终判断"))
+    attribution = normalize_optional_parameter(fields.get("归因平台"))
+    if (
+        "adjust" in attribution.casefold()
+        and re.match(r"^(?:max|applovin)(?:\b|聚合)", verdict, re.I)
+        and not get_applovin_sdk_key(fields)
+    ):
+        return "APPLOVIN_SDK_KEY_EMPTY", "AppLovin SDK Key为空，暂不适配"
+    return None
+
+
 def has_aggregation_type(fields: dict[str, Any] | None) -> bool:
     """Return whether AutoDetector produced or safely inferred a verdict."""
     apply_aggregation_type_fallback(fields)
@@ -223,11 +239,43 @@ def get_af_key(fields: dict[str, Any] | None) -> str:
     return ""
 
 
+def _strong_max_mixed_attribution_without_af_key(
+    fields: dict[str, Any] | None,
+) -> bool:
+    """Allow the observed MAX + AppsFlyer/ThinkingData/AppMetrica case to replay.
+
+    Keep this exception tied to complete MAX evidence. Other AppsFlyer
+    combinations still need their developer key unless Adjust is available.
+    """
+    fields = fields or {}
+    attribution = normalize_optional_parameter(fields.get("归因平台"))
+    platforms = {
+        re.sub(r"\s+", "", part).casefold()
+        for part in re.split(r"[,，、;/]+", attribution)
+    }
+    verdict = normalize_optional_parameter(fields.get("最终判断"))
+    return bool(
+        {"appsflyer", "thinkingdata", "appmetrica"} <= platforms
+        and "max" in verdict.casefold()
+        and "强关系证据确认" in verdict
+        and get_applovin_sdk_key(fields)
+        and normalize_optional_parameter(fields.get("初始Activity"))
+        and (
+            get_ad_unit_id(fields, "激励视频聚合id")
+            or get_ad_unit_id(fields, "插屏聚合id")
+        )
+    )
+
+
 def requires_af_key(fields: dict[str, Any] | None) -> bool:
-    """Require af_key when AppsFlyer is the only supported attribution route."""
+    """Require af_key except for Adjust and the evidenced mixed MAX case."""
     attribution = normalize_optional_parameter((fields or {}).get("归因平台"))
     compact = attribution.casefold().replace(" ", "")
-    return "appsflyer" in compact and "adjust" not in compact
+    return (
+        "appsflyer" in compact
+        and "adjust" not in compact
+        and not _strong_max_mixed_attribution_without_af_key(fields)
+    )
 
 
 def has_explicit_attribution(fields: dict[str, Any] | None) -> bool:
@@ -248,11 +296,7 @@ def attribution_gate_issue(fields: dict[str, Any] | None) -> tuple[str, str] | N
 
 
 def aggregation_gate_issue(fields: dict[str, Any] | None) -> tuple[str, str] | None:
-    """Reject aggregation platforms excluded by the original business rule."""
-    verdict = normalize_optional_parameter((fields or {}).get("最终判断"))
-    compact = verdict.casefold().replace(" ", "").replace("_", "")
-    if "tradplus" in compact:
-        return "UNSUPPORTED_AGGREGATION", "TradPlus聚合，暂不适配"
+    """All currently recognized mediation platforms use the normal field gate."""
     return None
 
 
@@ -453,6 +497,17 @@ def is_suspected_white_package(fields: dict[str, Any] | None) -> bool:
         return False
     if installs >= GOOGLE_PLAY_LOW_INSTALL_THRESHOLD:
         return False
+    if (
+        fields.get("_inferred_ironsource_failed_replay_code") in {
+            "REPLAY_NOT_TRIGGERED", "REPLAY_TIMEOUT",
+            "REPLAY_ID_CANDIDATES_EXHAUSTED", "REPLAY_UNVERIFIED",
+        }
+        and not has_aggregation_type(fields)
+        and not has_any_ad_unit_id(fields)
+    ):
+        # SDK keys remain evidence in the description, but cannot veto the
+        # white-package check after video/inter failed a real replay attempt.
+        return True
     return not has_aggregation_type(fields) and not has_partial_aggregation_evidence(fields)
 
 
@@ -460,6 +515,8 @@ def has_partial_aggregation_evidence(fields: dict[str, Any] | None) -> bool:
     """Return whether progressive logs already contain mediation evidence."""
     fields = fields or {}
     if has_any_ad_unit_id(fields):
+        return True
+    if normalize_optional_parameter(fields.get("TradPlus APP ID")):
         return True
     if get_applovin_sdk_key(fields):
         return True
@@ -519,6 +576,9 @@ def detection_field_issue(fields: dict[str, Any] | None) -> tuple[str, str] | No
         return unsupported
     if requires_af_key(fields) and not get_af_key(fields):
         return "AF_KEY_EMPTY", "af_key为空，再次确认"
+    missing_applovin_key = applovin_key_gate_issue(fields)
+    if missing_applovin_key:
+        return missing_applovin_key
     if not has_any_ad_unit_id(fields):
         return "AD_IDS_EMPTY", "插屏聚合id和激励视频聚合id均为空，再次确认"
     return None
@@ -536,9 +596,11 @@ def reconcile_detection_result(result: dict[str, Any] | None) -> dict[str, Any]:
     if normalized.get("ok"):
         return normalized
     if normalized.get("code") not in {
+        "UNSUPPORTED_AGGREGATION",
         "AGGREGATION_TYPE_EMPTY",
         "AGGREGATION_RESULT_INCOMPLETE",
         "AF_KEY_EMPTY",
+        "APPLOVIN_SDK_KEY_EMPTY",
         "AD_IDS_EMPTY",
     }:
         return normalized
@@ -603,12 +665,20 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
         confidence = "低"
         evidence.append("AutoDetector 未输出可用的最终判断")
 
+    tradplus_app_id = normalize_optional_parameter(fields.get("TradPlus APP ID"))
+    if tradplus_app_id:
+        evidence.append(f"检测到 TradPlus APP ID：{tradplus_app_id}")
     interstitial = get_ad_unit_id(fields, "插屏聚合id")
     rewarded = get_ad_unit_id(fields, "激励视频聚合id")
     if interstitial:
         evidence.append(f"检测到插屏聚合id：{interstitial}")
     if rewarded:
         evidence.append(f"检测到激励视频聚合id：{rewarded}")
+    if fields.get("_inferred_ironsource_failed_replay_code"):
+        evidence.append(
+            "video/inter 临时按 IronSource 回放未成功，已清空临时聚合参数；"
+            "残留 SDK Key 不阻止按下载量重新判定疑似白包"
+        )
     attribution = normalize_optional_parameter(fields.get("归因平台"))
     if attribution:
         attribution_source = str(fields.get("_attribution_source") or "").strip()
@@ -617,6 +687,11 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
             method = f"{method} + Manifest归因兜底"
         else:
             evidence.append(f"检测到归因平台：{attribution}")
+    if _strong_max_mixed_attribution_without_af_key(fields) and not get_af_key(fields):
+        evidence.append(
+            "混合归因特例：MAX 强关系证据及广告 ID 完整，"
+            "AppsFlyer Key 未找到，允许提交后以真实广告回放验证"
+        )
     for item in fields.get("_attribution_evidence", []) or []:
         detail = str(item or "").strip()
         if detail:
@@ -728,7 +803,10 @@ def restart_app_for_aggregation_detection(package_name: str) -> tuple[bool, str]
             return False, f"强制停止应用失败：{detail or '未知错误'}"
         # The second pass must not read the first pass from logcat again.
         subprocess.run(
-            [adb, "logcat", "-c"], capture_output=True, text=True, timeout=8
+            [adb, "logcat", "-b", "all", "-c"],
+            capture_output=True,
+            text=True,
+            timeout=8,
         )
         launched = launch_app_with_fallback(package_name, timeout=20)
         output = str(launched.get("output") or "").strip()
@@ -891,6 +969,7 @@ def detect_aggregation_with_one_retry(
     if first_issue[0] in {
         "UNSUPPORTED_ATTRIBUTION",
         "UNSUPPORTED_AGGREGATION",
+        "APPLOVIN_SDK_KEY_EMPTY",
     }:
         fields["_adaptation_terminal"] = True
         return {
@@ -1022,7 +1101,7 @@ def detect_aggregation_with_one_retry(
                 "fields": second_fields,
                 "attempts": 2,
             }
-        if second_issue[0] == "UNSUPPORTED_AGGREGATION" or (
+        if second_issue[0] in {"UNSUPPORTED_AGGREGATION", "APPLOVIN_SDK_KEY_EMPTY"} or (
             second_issue[0] == "UNSUPPORTED_ATTRIBUTION"
             and has_explicit_attribution(second_fields)
         ):
@@ -1113,6 +1192,10 @@ def format_aggregation_fields(data: dict[str, Any]) -> str:
             f"归因平台:{data.get('归因平台', '')}",
         ]
     )
+    for field in ("TradPlus APP ID", "TradPlus SDK版本"):
+        value = normalize_optional_parameter(data.get(field))
+        if value:
+            lines.append(f"{field}:{value}")
     install_count_text = str(data.get("_google_play_installs_text") or "").strip()
     if install_count_text:
         lines.append(f"Google Play下载量:{install_count_text}")
@@ -1266,6 +1349,9 @@ def validate_backend_fields(
         errors.append("插屏和激励视频聚合 ID 均为空")
     if requires_af_key(fields) and not get_af_key(fields):
         errors.append("缺少 af_key（归因平台包含 AppsFlyer）")
+    missing_applovin_key = applovin_key_gate_issue(fields)
+    if missing_applovin_key:
+        errors.append(missing_applovin_key[1])
     assessment = build_aggregation_assessment(fields)
     if not assessment["auto_submit"] and not errors:
         errors.append("聚合识别证据不足，禁止自动提交")
@@ -1403,6 +1489,46 @@ def _backend_list_total(body: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return total if total >= 0 else None
+
+
+def _find_backend_package_record(http, *, list_url, headers, query, timeout_seconds):
+    """The list API may ignore package_name; inspect all pages before absence."""
+    seen_pages = set()
+    scanned = 0
+    page_size = int(query.get("limit") or BACKEND_READBACK_PAGE_SIZE)
+    for page in range(1, BACKEND_READBACK_MAX_PAGES + 1):
+        response = http.post(
+            list_url, headers=headers, json={**query, "page": page},
+            timeout=max(10, min(int(timeout_seconds), 120)),
+        )
+        response.raise_for_status()
+        body = response.json()
+        data = body.get("data") if isinstance(body, dict) else None
+        if (
+            not isinstance(body, dict) or body.get("code") != 200
+            or (isinstance(data, dict) and data.get("code") not in (None, 200))
+        ):
+            raise ValueError("后台列表接口返回异常，无法确认包体是否存在")
+        records = _extract_backend_list_records(body)
+        record = next((item for item in records if
+                       str(item.get("package_name") or "").strip() == query["package_name"]), None)
+        if record is not None:
+            return record
+        total = _backend_list_total(body)
+        if not records:
+            if total is not None and scanned < total:
+                raise ValueError(f"后台列表第 {page} 页为空，但仍有未读取记录")
+            return None
+        fingerprint = tuple((str(item.get("id") or ""), str(item.get("package_name") or ""))
+                            for item in records)
+        if fingerprint in seen_pages:
+            raise ValueError("后台列表分页重复，无法确认已读完全部记录")
+        seen_pages.add(fingerprint)
+        scanned += len(records)
+        if ((total is not None and scanned >= total)
+                or (total is None and len(records) < page_size)):
+            return None
+    raise ValueError("后台列表分页超过安全上限，无法确认目标包")
 
 
 def verify_backend_persisted_record(
@@ -1562,6 +1688,52 @@ def verify_backend_persisted_record(
     return last_result
 
 
+def verify_backend_for_replay_via_api(fields, package_name, *, api_url, x_token, token, session=None):
+    """Read only: a replay-only retry must match the persisted mediation fields."""
+    errors = validate_backend_fields(fields, package_name)
+    if errors or not api_url or not x_token or not token:
+        return {"ok": False, "code": "BACKEND_REPLAY_VALIDATION_FAILED",
+                "message": "；".join(errors) or "缺少后台地址或认证信息"}
+    payload = build_backend_submission_payload(fields, package_name)
+    headers = {"X-Token": x_token, "token": token, "Content-Type": "application/json;charset=UTF-8"}
+    try:
+        record = _find_backend_package_record(
+            session or requests.Session(), list_url=derive_backend_list_url(api_url), headers=headers,
+            query={"is_adapted": "all", "hide_remarked": False, "hide_no_up2_appid": False,
+                   "assign": "", "package_name": package_name, "limit": BACKEND_READBACK_PAGE_SIZE},
+            timeout_seconds=30)
+        if record is None or str(record.get("block_ps") or "").strip():
+            raise ValueError("后台未找到包名或已有 Block 原因，未执行回放")
+        keys = ("aggr_platform", "attribution_platform", "aggr_chaping_id", "aggr_jilishipin_id",
+                "af_key", "manual_applovin_sdk_key", "activity_main_page")
+        mismatch = [k for k in keys if normalize_optional_parameter(record.get(k)) != normalize_optional_parameter(payload.get(k))]
+        if mismatch:
+            raise ValueError("后台参数与保存的检测结果不一致：" + ", ".join(mismatch))
+    except (requests.RequestException, ValueError) as exc:
+        return {"ok": False, "code": "BACKEND_REPLAY_VERIFY_FAILED", "message": str(exc)}
+    return {"ok": True, "code": "BACKEND_REPLAY_VERIFIED", "message": "后台参数回读一致，仅执行回放"}
+
+
+def prepare_protected_backend_write(http, *, api_url, headers, payload, timeout_seconds,
+                                    journal, terminal_note=None):
+    endpoint = derive_backend_submit_url(api_url)
+    before = _find_backend_package_record(
+        http, list_url=derive_backend_list_url(api_url), headers=headers,
+        query={"is_adapted": "all", "hide_remarked": False, "hide_no_up2_appid": False,
+               "assign": "", "package_name": payload["package_name"], "limit": BACKEND_READBACK_PAGE_SIZE},
+        timeout_seconds=timeout_seconds,
+    )
+    if before is None:
+        raise ValueError("后台未找到精确包名，未执行写入")
+    owned = journal.owned_note(endpoint, payload["package_name"])
+    protected = merge_backend_payload(before, payload, owned, terminal_note=terminal_note)
+    new_owned = terminal_note or ""
+    if terminal_note and ("\n" + terminal_note + "\n") in ("\n" + str(before.get("ps") or "").strip() + "\n") and owned != terminal_note:
+        new_owned = ""  # Existing manual text cannot become tool-owned retroactively.
+    receipt = journal.prepare(endpoint, before, protected, owned_note=new_owned)
+    return protected, receipt
+
+
 def submit_backend_via_api(
     fields: dict[str, Any],
     package_name: str,
@@ -1577,6 +1749,7 @@ def submit_backend_via_api(
     stop_event=None,
     session: Any = None,
     allow_unsupported_attribution: bool = False,
+    journal=None,
 ) -> dict:
     """Submit aggregation parameters through the CP backend API and verify them."""
     errors = validate_backend_fields(
@@ -1614,6 +1787,17 @@ def submit_backend_via_api(
         "token": str(token).strip(),
     }
     http = session or requests.Session()
+    journal = journal or BackendWriteJournal()
+    try:
+        payload, receipt = prepare_protected_backend_write(
+            http, api_url=api_url, headers=headers, payload=payload,
+            timeout_seconds=timeout_seconds, journal=journal,
+        )
+    except (requests.RequestException, ValueError, OSError) as exc:
+        return {"ok": False, "code": "BACKEND_PROTECTION_FAILED",
+                "message": f"后台数据保护检查未通过，未写入：{exc}"}
+    if stop_event is not None and stop_event.is_set():
+        return {"ok": False, "code": "USER_STOPPED", "message": "用户已停止，未写入后台"}
     try:
         response = http.post(
             submit_url,
@@ -1710,6 +1894,11 @@ def submit_backend_via_api(
     )
     if not readback.get("ok"):
         return readback
+    try:
+        journal.confirm(receipt, readback.get("record") or {})
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "code": "BACKEND_SNAPSHOT_CONFIRM_FAILED",
+                "message": f"参数已生效，但本地快照确认失败，不进入回放：{exc}"}
     if stop_event is not None and stop_event.is_set():
         return {
             "ok": False,
@@ -1732,6 +1921,7 @@ def submit_backend_via_api(
         "backend_readback_verified": True,
         "backend_record": readback.get("record"),
         "device_verification": "pending_replay",
+        "snapshot_path": str(receipt),
     }
 
 
@@ -1770,6 +1960,7 @@ def clear_backend_adaptation_via_api(
     readback_delay_seconds: float = BACKEND_READBACK_DELAY_SECONDS,
     sleep=time.sleep,
     session: Any = None,
+    journal=None,
 ) -> dict[str, Any]:
     """Clear an inferred aggregation submission after replay cannot verify it."""
     missing = []
@@ -1807,6 +1998,15 @@ def clear_backend_adaptation_via_api(
         "token": str(token).strip(),
     }
     http = session or requests.Session()
+    journal = journal or BackendWriteJournal()
+    try:
+        payload, receipt = prepare_protected_backend_write(
+            http, api_url=api_url, headers=headers, payload=payload,
+            timeout_seconds=timeout_seconds, journal=journal, terminal_note=note,
+        )
+    except (requests.RequestException, ValueError, OSError) as exc:
+        return {"ok": False, "code": "BACKEND_PROTECTION_FAILED",
+                "message": f"后台数据保护检查未通过，未清空参数：{exc}"}
     try:
         response = http.post(
             submit_url,
@@ -1894,6 +2094,11 @@ def clear_backend_adaptation_via_api(
             "message": "已提交清空并刷新缓存，但后台回读未确认全部字段已清空："
             + str(readback.get("message") or ""),
         }
+    try:
+        journal.confirm(receipt, readback.get("record") or {})
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "code": "BACKEND_SNAPSHOT_CONFIRM_FAILED",
+                "message": f"后台终态已生效，但本地快照确认失败：{exc}"}
     return {
         "ok": True,
         "code": "BACKEND_ADAPTATION_CLEARED",
@@ -1965,14 +2170,10 @@ def submit_precheck_blacklist_via_api(
     }
     http = session or requests.Session()
     try:
-        lookup_response = http.post(
-            list_url,
-            headers=headers,
-            json=query,
-            timeout=max(10, min(int(timeout_seconds), 120)),
+        record = _find_backend_package_record(
+            http, list_url=list_url, headers=headers, query=query,
+            timeout_seconds=timeout_seconds,
         )
-        lookup_response.raise_for_status()
-        records = _extract_backend_list_records(lookup_response.json())
     except requests.Timeout:
         return {
             "ok": False,
@@ -1985,14 +2186,6 @@ def submit_precheck_blacklist_via_api(
             "code": "PRECHECK_BLACKLIST_LOOKUP_FAILED",
             "message": f"查询待加黑包体的后台记录失败：{exc}",
         }
-    record = next(
-        (
-            item
-            for item in records
-            if str(item.get("package_name") or "").strip() == package_name
-        ),
-        None,
-    )
     if record is None:
         return {
             "ok": False,
@@ -2089,24 +2282,12 @@ def submit_precheck_blacklist_via_api(
     attempts = max(1, int(readback_attempts))
     for attempt in range(1, attempts + 1):
         try:
-            readback_response = http.post(
-                list_url,
-                headers=headers,
-                json=query,
-                timeout=max(10, min(int(timeout_seconds), 120)),
+            persisted = _find_backend_package_record(
+                http, list_url=list_url, headers=headers, query=query,
+                timeout_seconds=timeout_seconds,
             )
-            readback_response.raise_for_status()
-            readback_records = _extract_backend_list_records(readback_response.json())
         except (requests.RequestException, ValueError):
-            readback_records = []
-        persisted = next(
-            (
-                item
-                for item in readback_records
-                if str(item.get("package_name") or "").strip() == package_name
-            ),
-            None,
-        )
+            persisted = None
         if persisted and str(persisted.get("block_ps") or "").strip() == reason:
             return {
                 "ok": True,
