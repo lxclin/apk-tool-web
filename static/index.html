@@ -2119,15 +2119,11 @@ function automationGetAdId(data, fieldName) {
   const labels = new Set(['video','reward','rewarded','rewarded_video','inter','interstitial']);
   const concrete = values.filter(item => !labels.has(item.toLowerCase()));
   if (concrete.length) return concrete[0];
-  const first = values[0] || '';
-  const verdict = automationCleanDetectedValue((data || {})['最终判断']).toLowerCase();
-  const ironFamily = verdict.includes('ironsource') || verdict.includes('levelplay');
-  const validSymbol = (fieldName === '激励视频聚合id' && first.toLowerCase() === 'video')
-    || (fieldName === '插屏聚合id' && first.toLowerCase() === 'inter');
-  return ironFamily && validSymbol ? first : '';
+  return '';
 }
 
 function automationDetectionIssue(data) {
+  if ((data || {})._aggregation_evidence_conflict) return '聚合平台证据冲突，需复检确认';
   if (!automationHasAggregationType(data)) {
     const hasAdId = automationGetAdId(data, '插屏聚合id') || automationGetAdId(data, '激励视频聚合id');
     const hasMediationKey = ((data || {})['SDK列表'] || []).some(sdk => {

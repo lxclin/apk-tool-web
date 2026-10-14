@@ -72,7 +72,7 @@ python3 automation_diagnostics.py --days 7
   - 可从页面预检选中的 Asana 任务带入 Task GID、包名、UP2 appid 和原描述。
   - 聚合参数检测持续轮询 `最终判断`，正常至少等待 60 秒；日志仍在增长时最长等待 90 秒，避免在设备约 45 秒输出综合结果前提前判空。
   - 已取得 SDK Key 或聚合 ID、但始终没有综合结果时标记“检测结果未完整输出”，不误报为“聚合类型为空”。
-  - 参数结果显示识别方式、识别依据、置信度和自动提交策略：AutoDetector 明确结论为高置信度；仅通过 IronSource 标准 `video/inter` 组合推断时为中置信度；证据不完整为低置信度并禁止提交。
+  - 参数结果显示识别方式、识别依据、置信度和自动提交策略：AutoDetector 明确结论且无平台冲突时为高置信度；`video/inter` 固定文本不再作为广告位或推断依据；证据冲突、参数不完整时禁止提交并复检。
   - 自动将聚合参数写到 Asana 描述的 GP 链接下方，并保留包名、UP2 appid 与 GP 链接。
   - 自动化适配使用 `s10_package_info` 接口提交聚合参数，复用“数据同步”页的接口地址、X-Token、固定 token 和适配人员；依次校验写入响应、调用 `delete_a2_package_cache` 清除当前包缓存，再通过 `cp_adapt/list` 回读该包并逐字段比对。三个步骤均成功才进入广告回放。原有手动跳转后台逻辑保持不变。
   - `cp_adapt/list` 即使收到包名筛选条件也可能返回超过单页上限的完整列表；回读会逐页查找精确包名并核对字段。分页重复、缺页或超过安全扫描上限时中止回放，不把未完整读取误判为参数已生效。
@@ -89,7 +89,7 @@ python3 automation_diagnostics.py --days 7
   - `loadAd`、`showAd`、`onAdLoaded` 和 `display_start` 不算成功；仅接受匹配广告 ID 的 `onAdDisplayed`、`onAdImpression`、`display_success` 或收益回调。
   - 回放超时会把每类广告的已展示与未验证证据写入 Asana 评论并标记待复检；真实运行错误按对应故障类别处理。
   - 聚合回放成功后写入结构化 Asana 成功评论，供页面预检刷新和当日总结恢复成功状态。
-  - 首次按 IronSource（含 `video/inter` 推断结果）提交后，第一次回放仍持续监听同一 UID 的 AutoDetector；若随后明确、高置信度识别为 MAX，则先通过接口清空 IronSource 参数，再用完整 MAX 参数覆盖提交、刷新缓存、更新 Asana 描述并执行第二次 MAX 回放。普通 MAX SDK 初始化日志不会触发切换。
+  - 首次按 IronSource 提交后，回放仍持续监听同一 UID 的 AutoDetector；若随后完整、高置信度识别为 MAX 或 LevelPlay，则清理工具此前提交的临时参数、重新校验提交并回放。普通 SDK 初始化日志不能单独触发切换。
   - 自动识别并关闭 Android 通知权限弹窗，避免弹窗遮挡游戏启动流程和广告触发。
 
 - ADB 指令页
@@ -331,3 +331,12 @@ TradPlus 纳入正常聚合提取与适配，不再按“TradPlus暂不适配”
 ### IronSource / LevelPlay 广告位优先级（2026-10-13）
 
 同一广告类型同时出现具体广告位与 `inter/video` 时，只保留具体 ID；没有具体 ID 时仍允许 IronSource/LevelPlay 的合法符号值。解析、Asana 描述、手动后台链接、接口参数及回放候选采用同一规则。最终平台已明确时不从其他 SDK 区块借用 ID。回放期间 IronSource 的占位结果被完整、高置信度 LevelPlay/MAX 结果替代时，重建候选并通过标准提交流程回读验证，不复用旧占位候选。
+
+### 2026-10-14 聚合识别一致性
+
+- IronSource/LevelPlay 的 `video/inter` 为固定文本，禁止作为广告位提交；历史推断结果重新进入参数校验。
+- 明确最终判断与 LevelPlay 专属运行接口冲突、同轮多平台判断尚未消除，或存在 Demand Only/外部初始化关系时，暂缓提交并使用现有复检流程；未解决则待确认，日报记为待复检。
+- 缺少广告位时，先从平台专属运行日志提取 `adUnitId`，不混入广告源 `placementId`。再按 UID 唯一确定目标包，只读 `Mediation_Shared_Preferences.xml` 的 `providerOrder`；排除 `external` 和固定文本，保留来源。共享 UID、无权限、文件不存在、无配置广告位时不猜测参数。
+- 配置读取总预算 4 秒，仅补缺失格式，配置 ID 仍需实际广告回放验证；不修改已有后台记录或任务状态。
+
+详细记录见 [2026-10-14 更新说明](UPDATE_NOTES_2026-10-14.md)。

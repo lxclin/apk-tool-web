@@ -42,14 +42,15 @@ def test_concrete_ids_remove_symbolic_fallback_candidates(verdict):
     assert prioritized_ad_unit_ids('video, new-r', verdict, '激励视频聚合id') == ('new-r',)
 
 
-def test_exact_placeholder_pair_still_supports_legacy_inference():
+def test_exact_placeholder_pair_is_rejected_instead_of_legacy_inference():
     fields = parse_autodetector_fields(['ZGSDK.AutoDetector: IronSource:',
                  'ZGSDK.AutoDetector: 激励视频聚合id: video',
                  'ZGSDK.AutoDetector: 插屏聚合id: inter'])
     apply_aggregation_type_fallback(fields)
-    assert fields['_aggregation_type_inferred']
-    assert fields['激励视频聚合id'] == 'video'
-    assert fields['插屏聚合id'] == 'inter'
+    assert not fields.get('_aggregation_type_inferred')
+    assert fields['_symbolic_ad_ids_rejected']
+    assert fields['激励视频聚合id'] == ''
+    assert fields['插屏聚合id'] == ''
     assert get_ad_unit_id({"最终判断": None, "插屏聚合id": "inter"}, "插屏聚合id") == ""
 
 

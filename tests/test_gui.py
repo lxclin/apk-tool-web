@@ -2289,13 +2289,16 @@ class TestAutomationBatchActions:
                     app, "_automation_replay_sync", return_value=replay_result
                 ) as replay, patch.object(
                     app, "_automation_comment_success"
-                ) as comment_success:
+                ) as comment_success, patch.object(
+                    app, "_automation_confirm_cleanup_after_replay_sync", return_value=True
+                ):
                     app._automation_extract_fields()
                     root.update()
 
                 fill_asana.assert_called_once_with()
                 submit.assert_called_once_with()
                 replay.assert_called_once_with()
+                assert comment_success.call_count == 1, app.automation_log_text.get("1.0", tk.END)
                 comment_success.assert_called_once_with(replay_result)
                 log = app.automation_log_text.get("1.0", tk.END)
                 assert "高置信度且参数校验通过" in log
@@ -2483,7 +2486,7 @@ class TestAutomationBatchActions:
         finally:
             root.destroy()
 
-    def test_inferred_ironsource_replay_failure_clears_backend_and_updates_asana(self):
+    def test_legacy_symbolic_ironsource_stops_before_backend_and_replay(self):
         root = tk.Tk()
         try:
             from gui import APKToolApp
@@ -2523,9 +2526,9 @@ class TestAutomationBatchActions:
                     app,
                     "_automation_submit_backend_sync",
                     return_value={"ok": True, "message": "后台已生效"},
-                ), patch.object(
+                ) as submit, patch.object(
                     app, "_automation_replay_sync", return_value=replay
-                ), patch.object(
+                ) as replay_mock, patch.object(
                     app,
                     "_automation_clear_inferred_backend_sync",
                     return_value={
@@ -2545,17 +2548,10 @@ class TestAutomationBatchActions:
                     result = app._automation_process_current_task_sync()
 
                 assert result is False
-                assert fill_asana.call_count == 2
-                fill_asana.assert_any_call()
-                fill_asana.assert_any_call(
-                    allow_missing_aggregation=True,
-                    terminal_note="聚合类型未确认，待人工触发广告复检",
-                )
-                clear_backend.assert_called_once_with(
-                    note="聚合类型未确认，待人工触发广告复检"
-                )
-                assert review.call_args.args[0] == "INFERRED_REPLAY_UNVERIFIED"
-                assert "待人工触发广告复检" in review.call_args.args[1]
+                submit.assert_not_called()
+                replay_mock.assert_not_called()
+                clear_backend.assert_not_called()
+                assert not app._automation_fields.get("_aggregation_type_inferred")
         finally:
             root.destroy()
 

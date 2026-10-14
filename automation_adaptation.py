@@ -126,10 +126,15 @@ def _get_with_system_ca_retry(http: Any, url: str, **kwargs):
 def apply_aggregation_type_fallback(
     fields: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Apply guarded IronSource and AppLovin MAX provisional inferences."""
+    """Reject legacy symbolic IronSource inference; retain guarded MAX fallback."""
     if not isinstance(fields, dict):
         return fields
     verdict = normalize_optional_parameter(fields.get("最终判断"))
+    if verdict == INFERRED_IRONSOURCE_VERDICT:
+        fields.setdefault("_raw_aggregation_verdict", verdict)
+        fields["最终判断"] = ""
+        fields.pop("_aggregation_type_inferred", None)
+        verdict = ""
     if is_negative_aggregation_verdict(verdict):
         fields.setdefault("_raw_aggregation_verdict", verdict)
         fields["最终判断"] = ""
@@ -148,8 +153,8 @@ def apply_aggregation_type_fallback(
     rewarded = normalize_optional_parameter(fields.get("激励视频聚合id")).casefold()
     interstitial = normalize_optional_parameter(fields.get("插屏聚合id")).casefold()
     if rewarded == "video" and interstitial == "inter":
-        fields["最终判断"] = INFERRED_IRONSOURCE_VERDICT
-        fields["_aggregation_type_inferred"] = True
+        fields["_symbolic_ad_ids_rejected"] = True
+        normalize_detected_ad_unit_ids(fields)
         return fields
     app_lovin_key = get_applovin_sdk_key(fields)
     activity = normalize_optional_parameter(fields.get("初始Activity"))
@@ -302,14 +307,10 @@ def aggregation_gate_issue(fields: dict[str, Any] | None) -> tuple[str, str] | N
 
 
 def get_ad_unit_id(fields: dict[str, Any] | None, field_name: str) -> str:
-    """Prefer concrete units; symbolic placements are last-resort family values."""
+    """Return a concrete unit; fixed placement labels never qualify."""
     fields = fields or {}
     apply_aggregation_type_fallback(fields)
     candidates = prioritized_ad_unit_ids(fields.get(field_name), fields.get("最终判断", ""), field_name)
-    if candidates and candidates[0].casefold() in INVALID_AD_ID_VALUES:
-        verdict = str(fields.get("最终判断") or "").casefold().replace("_", "")
-        if "ironsource" not in verdict and "levelplay" not in verdict:
-            return ""
     return candidates[0] if candidates else ""
 
 
@@ -363,6 +364,12 @@ def format_detection_review_evidence(fields: dict[str, Any] | None) -> str:
     if requires_af_key(snapshot) and not get_af_key(snapshot):
         missing.append("af_key")
     lines = ["复核缺失项：" + ("、".join(missing) if missing else "无；请核对证据冲突")]
+    if snapshot.get("_aggregation_evidence_conflict"):
+        lines.append("聚合证据冲突：" + str(snapshot["_aggregation_evidence_conflict"]))
+    if snapshot.get("_symbolic_ad_ids_rejected"):
+        lines.append("video/inter 为固定文本，已拒绝作为广告位 ID 提交")
+    if snapshot.get("广告ID来源详情"):
+        lines.append("广告 ID 来源：目标包 providerOrder 配置；需回放验证")
     raw_verdict = normalize_optional_parameter(
         snapshot.get("_raw_aggregation_verdict") or snapshot.get("最终判断")
     )
@@ -398,6 +405,8 @@ NON_GAME_APPLICATION_TYPES = {
 
 def non_game_empty_backend_note(fields: dict[str, Any] | None) -> str:
     """Return the terminal backend note for a non-game empty detection."""
+    if (fields or {}).get("_symbolic_ad_ids_rejected") or (fields or {}).get("_aggregation_evidence_conflict"):
+        return ""
     app_type = re.sub(
         r"\s+", " ", str((fields or {}).get("应用类型") or "").strip().casefold()
     )
@@ -538,6 +547,8 @@ def is_suspected_white_package(fields: dict[str, Any] | None) -> bool:
 def has_partial_aggregation_evidence(fields: dict[str, Any] | None) -> bool:
     """Return whether progressive logs already contain mediation evidence."""
     fields = fields or {}
+    if fields.get("_symbolic_ad_ids_rejected") or fields.get("_aggregation_evidence_conflict"):
+        return True
     if has_any_ad_unit_id(fields):
         return True
     if normalize_optional_parameter(fields.get("TradPlus APP ID")):
@@ -563,6 +574,8 @@ def has_partial_aggregation_evidence(fields: dict[str, Any] | None) -> bool:
 
 def detection_field_issue(fields: dict[str, Any] | None) -> tuple[str, str] | None:
     """Return the terminal field issue that needs one detection retry."""
+    if (fields or {}).get("_aggregation_evidence_conflict"):
+        return "AGGREGATION_RESULT_INCOMPLETE", "聚合平台证据冲突，暂缓提交并复检：" + str(fields["_aggregation_evidence_conflict"])
     unsupported_aggregation = aggregation_gate_issue(fields)
     if unsupported_aggregation:
         return unsupported_aggregation
@@ -618,6 +631,11 @@ def reconcile_detection_result(result: dict[str, Any] | None) -> dict[str, Any]:
     """
     normalized = dict(result or {})
     if normalized.get("ok"):
+        fields = normalized.get("fields")
+        if isinstance(fields, dict):
+            issue = detection_field_issue(fields)
+            if issue:
+                normalized.update(ok=False, code=issue[0], message=issue[1])
         return normalized
     if normalized.get("code") not in {
         "UNSUPPORTED_AGGREGATION",
@@ -784,6 +802,10 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
         evidence.append("缺少初始 Activity，禁止自动提交")
     if issue and not terminal_note_only:
         evidence.append(f"阻断原因：{issue[1]}")
+        if fields.get("_aggregation_evidence_conflict"):
+            confidence = "待确认"
+    if fields.get("广告ID来源详情"):
+        evidence.append("广告 ID 补充来源：目标包 providerOrder 配置；需真实广告回放验证")
     elif terminal_note_only:
         evidence.append(f"终态规则：{issue[1]}，仅提交备注字段并跳过回放")
     return {

@@ -724,7 +724,7 @@ def test_replay_returns_explicit_max_autodetector_upgrade_from_same_uid(
     result = run_ad_replay_check(
         "com.demo",
         "10250",
-        ReplayExpectation.from_values("inter", "video", "IronSource聚合"),
+        ReplayExpectation.from_values("actual-i", "actual-r", "IronSource聚合"),
         timeout_seconds=10,
         aggregation_change_detector=is_authoritative_max,
     )
@@ -748,7 +748,7 @@ def test_replay_does_not_upgrade_on_generic_max_sdk_logs(
     proc.stdout = io.StringIO(
         "ZGSDK.Max: showRewardAd loadAd\n"
         'ZGSDK.mediationEvent: {"status":"display_success",'
-        '"platform":"IRONSOURCE","adUnitId":"inter",'
+        '"platform":"IRONSOURCE","adUnitId":"actual-i",'
         '"adType":"interstitial"}\n'
     )
     proc.poll.return_value = None
@@ -759,7 +759,7 @@ def test_replay_does_not_upgrade_on_generic_max_sdk_logs(
     result = run_ad_replay_check(
         "com.demo",
         "10250",
-        ReplayExpectation.from_values("inter", "", "IronSource聚合"),
+        ReplayExpectation.from_values("actual-i", "", "IronSource聚合"),
         timeout_seconds=10,
         aggregation_change_detector=lambda fields: bool(fields.get("最终判断")),
         aggregation_change_grace_seconds=0,

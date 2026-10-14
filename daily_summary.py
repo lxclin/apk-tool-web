@@ -408,6 +408,14 @@ def classify_task_comments(
         automation_match = AUTOMATION_CODE_RE.match(text.strip())
         if automation_match:
             code = automation_match.group(1).upper()
+            if code == "AGGREGATION_RESULT_INCOMPLETE" and "冲突" in text:
+                aggregation_state = "review"
+                aggregation_reason = "聚合平台证据冲突，待复检确认"
+                continue
+            if code in {"AD_IDS_EMPTY", "AGGREGATION_RESULT_INCOMPLETE"} and "video/inter" in text:
+                aggregation_state = "review"
+                aggregation_reason = "未提取到真实聚合广告位，待确认"
+                continue
             if code in REVIEW_AUTOMATION_CODES:
                 aggregation_state = "review"
                 aggregation_reason = {

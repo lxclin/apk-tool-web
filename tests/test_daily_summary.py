@@ -581,3 +581,17 @@ def test_generate_reads_date_section_and_comments():
     assert result["action_success_count"] == 1
     assert result["action_issue_count"] == 0
     assert "com.demo" in result["text"]
+
+
+def test_platform_conflict_is_review_instead_of_business_rejection():
+    result = classify_task_comments("com.example", [DailyComment(
+        "【APK Tool 自动化适配：AGGREGATION_RESULT_INCOMPLETE】\n聚合平台证据冲突，暂缓提交并复检")])
+    assert result["aggregation_state"] == "review"
+    assert result["aggregation_reason"] == "聚合平台证据冲突，待复检确认"
+
+
+def test_symbolic_units_are_reported_as_waiting_for_real_ids():
+    result = classify_task_comments("com.example", [DailyComment(
+        "【APK Tool 自动化适配：AD_IDS_EMPTY】\nvideo/inter 为固定文本，已拒绝作为广告位 ID 提交")])
+    assert result["aggregation_state"] == "review"
+    assert result["aggregation_reason"] == "未提取到真实聚合广告位，待确认"

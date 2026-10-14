@@ -465,8 +465,8 @@ def test_retry_poll_tolerates_transient_logcat_timeout_and_then_detects():
         "ok": True,
         "最终判断": "IronSource聚合",
         "归因平台": "Adjust",
-        "插屏聚合id": "inter",
-        "激励视频聚合id": "video",
+        "插屏聚合id": "real-i",
+        "激励视频聚合id": "real-r",
     }
 
     result = detect_aggregation_with_one_retry(
@@ -528,14 +528,14 @@ def test_appsflyer_attribution_retries_when_af_key_is_empty():
 def test_temporary_missing_af_key_blocks_backend_submission_until_retry():
     fields = {
         "ok": True,
-        "最终判断": "IronSource聚合（根据 video/inter 自动推断）",
-        "_aggregation_type_inferred": True,
+        "最终判断": "IronSource聚合（自动化检测确认）",
+
         "初始Activity": "com.dootalk.vibe.MainActivity",
         "应用类型": "ReactNative",
         "归因平台": "AppsFlyer",
         "af_key": "暂未找到",
-        "激励视频聚合id": "video",
-        "插屏聚合id": "inter",
+        "激励视频聚合id": "real-r",
+        "插屏聚合id": "real-i",
     }
 
     assert detection_field_issue(fields) == (
@@ -562,8 +562,8 @@ def test_temporary_missing_af_key_blocks_backend_submission_until_retry():
 def test_inferred_ironsource_does_not_override_unsupported_attribution_on_retry():
     fields = {
         "ok": True,
-        "最终判断": "IronSource聚合（根据 video/inter 自动推断）",
-        "_aggregation_type_inferred": True,
+        "最终判断": "IronSource聚合（自动化检测确认）",
+
         "初始Activity": "com.demo.MainActivity",
         "归因平台": "SolarEngine",
         "激励视频聚合id": "video",
@@ -652,7 +652,7 @@ def test_both_ad_ids_still_empty_after_retry_is_terminal():
     assert result["message"] == "插屏聚合id和激励视频聚合id均为空，再次确认"
 
 
-def test_ironsource_symbolic_video_and_inter_are_valid_ad_ids():
+def test_ironsource_symbolic_video_and_inter_are_rejected():
     fields = {
         "最终判断": "IronSource聚合（自动化检测确认）",
         "初始Activity": "com.unity3d.player.UnityPlayerActivity",
@@ -663,12 +663,12 @@ def test_ironsource_symbolic_video_and_inter_are_valid_ad_ids():
         "SDK列表": [{"名称": "LevelPlay", "key": "19992b405"}],
     }
 
-    assert detection_field_issue(fields) is None
-    assert validate_backend_fields(fields, "com.demo") == []
+    assert detection_field_issue(fields)[0] == "AD_IDS_EMPTY"
+    assert "插屏和激励视频聚合 ID 均为空" in validate_backend_fields(fields, "com.demo")
     payload = build_backend_submission_payload(fields, "com.demo", "rain")
     assert payload["aggr_platform"] == "iron_source"
-    assert payload["aggr_chaping_id"] == "inter"
-    assert payload["aggr_jilishipin_id"] == "video"
+    assert payload["aggr_chaping_id"] is None
+    assert payload["aggr_jilishipin_id"] is None
 
 
 def test_tradplus_uses_normal_confidence_and_full_submission():
@@ -746,7 +746,7 @@ def test_old_tradplus_unsupported_result_is_reconciled_to_current_rules():
     assert result["code"] == "AD_IDS_EMPTY"
 
 
-def test_empty_verdict_with_exact_video_inter_pair_is_inferred_as_ironsource():
+def test_empty_verdict_symbolic_pair_requires_recheck_without_submission():
     first = {
         "ok": True,
         "最终判断": "",
@@ -756,33 +756,17 @@ def test_empty_verdict_with_exact_video_inter_pair_is_inferred_as_ironsource():
         "激励视频聚合id": "video",
         "插屏聚合id": "inter",
     }
-    restart = MagicMock()
-
+    restart = MagicMock(return_value=(True, "ok"))
     result = detect_aggregation_with_one_retry(
-        "sheep.animal.parking.puzzle.game.jam",
-        MagicMock(),
-        first_fields=first,
-        restart_app=restart,
-        wait_seconds=0,
+        "com.example", MagicMock(return_value=dict(first)), first_fields=first,
+        restart_app=restart, wait_seconds=0,
     )
-
-    assert result["ok"] is True
-    assert result["attempts"] == 1
-    assert result["code"] == "AGGREGATION_TYPE_DETECTED"
-    assert result["fields"]["最终判断"].startswith("IronSource聚合")
-    assert result["fields"]["_aggregation_type_inferred"] is True
-    restart.assert_not_called()
-    payload = build_backend_submission_payload(
-        result["fields"], "sheep.animal.parking.puzzle.game.jam", "rain"
-    )
-    assert payload["aggr_platform"] == "iron_source"
-    assert payload["aggr_chaping_id"] == "inter"
-    assert payload["aggr_jilishipin_id"] == "video"
-    assessment = build_aggregation_assessment(result["fields"])
-    assert assessment["confidence"] == "中"
-    assert assessment["method"] == "业务规则推断"
-    assert assessment["auto_submit"] is True
-    assert "AutoDetector 原始最终判断为空" in assessment["evidence"]
+    assert result["ok"] is False
+    assert result["attempts"] == 2
+    assert result["code"] == "AGGREGATION_RESULT_INCOMPLETE"
+    assert not result["fields"].get("_aggregation_type_inferred")
+    restart.assert_called_once()
+    assert not build_aggregation_assessment(result["fields"])["auto_submit"]
 
 
 def test_empty_verdict_with_applovin_key_and_ids_is_provisionally_max():
@@ -836,7 +820,7 @@ def test_ids_without_applovin_key_do_not_infer_max():
     assert fields.get("_max_aggregation_type_inferred") is not True
 
 
-def test_reconcile_stale_incomplete_result_uses_final_video_inter_fields():
+def test_reconcile_does_not_promote_symbolic_pair_to_success():
     from automation_adaptation import reconcile_detection_result
 
     fields = {
@@ -857,13 +841,12 @@ def test_reconcile_stale_incomplete_result_uses_final_video_inter_fields():
         }
     )
 
-    assert result["ok"] is True
-    assert result["code"] == "AGGREGATION_FIELDS_RECONCILED"
-    assert result["fields"]["最终判断"].startswith("IronSource聚合")
-    assert result["fields"]["_aggregation_type_inferred"] is True
+    assert result["ok"] is False
+    assert result["code"] == "AGGREGATION_RESULT_INCOMPLETE"
+    assert not result["fields"].get("_aggregation_type_inferred")
 
 
-def test_reconcile_inferred_ironsource_reports_missing_af_key_not_incomplete():
+def test_reconcile_symbolic_pair_remains_incomplete():
     from automation_adaptation import reconcile_detection_result
 
     fields = {
@@ -886,12 +869,11 @@ def test_reconcile_inferred_ironsource_reports_missing_af_key_not_incomplete():
     )
 
     assert result["ok"] is False
-    assert result["code"] == "AF_KEY_EMPTY"
-    assert result["message"] == "af_key为空，再次确认"
-    assert result["fields"]["最终判断"].startswith("IronSource聚合")
+    assert result["code"] == "AGGREGATION_RESULT_INCOMPLETE"
+    assert not result["fields"].get("_aggregation_type_inferred")
 
 
-def test_explicit_max_retry_overrides_provisional_ironsource_inference():
+def test_explicit_max_retry_resolves_symbolic_first_result():
     first = {
         "ok": True,
         "最终判断": "",
@@ -929,12 +911,11 @@ def test_explicit_max_retry_overrides_provisional_ironsource_inference():
 
     assert result["ok"] is True
     assert result["attempts"] == 2
-    assert result["code"] == "AGGREGATION_TYPE_CHANGED_AFTER_RETRY"
+    assert result["code"] == "AGGREGATION_TYPE_DETECTED_AFTER_RETRY"
     assert result["fields"]["最终判断"].startswith("MAX聚合")
     assert result["fields"]["激励视频聚合id"] == "dda50d1ff1b9edcf"
     assert result["fields"]["插屏聚合id"] == "7feec795ef299377"
     assert result["fields"].get("_aggregation_type_inferred") is not True
-    assert result["fields"]["_aggregation_type_changed_after_retry"] is True
     payload = build_backend_submission_payload(
         result["fields"], "com.easybrain.number.sums.puzzle", "rain"
     )
@@ -961,7 +942,7 @@ def test_incomplete_or_mismatched_symbolic_ids_do_not_infer_ironsource(
     assert fields["最终判断"] == ""
 
 
-def test_negative_verdict_allows_exact_video_inter_ironsource_fallback():
+def test_negative_verdict_does_not_allow_symbolic_ironsource_fallback():
     fields = {
         "最终判断": "未检测到主要聚合平台",
         "归因平台": "Adjust",
@@ -971,10 +952,10 @@ def test_negative_verdict_allows_exact_video_inter_ironsource_fallback():
 
     apply_aggregation_type_fallback(fields)
 
-    assert fields["最终判断"] == "IronSource聚合（根据 video/inter 自动推断）"
-    assert fields["_aggregation_type_inferred"] is True
+    assert fields["最终判断"] == ""
+    assert not fields.get("_aggregation_type_inferred")
     assert fields["_raw_aggregation_verdict"] == "未检测到主要聚合平台"
-    assert detection_field_issue(fields) is None
+    assert detection_field_issue(fields)[0] == "AGGREGATION_RESULT_INCOMPLETE"
 
 
 def test_negative_verdict_without_symbolic_ids_is_not_a_valid_aggregation_type():
@@ -1006,7 +987,7 @@ def test_explicit_unsupported_attribution_precedes_empty_aggregation_type():
     )
 
 
-def test_levelplay_symbolic_video_and_inter_are_valid_ad_ids():
+def test_levelplay_symbolic_video_and_inter_are_rejected():
     fields = {
         "最终判断": "LevelPlay聚合（自动化检测确认）",
         "初始Activity": "MainActivity",
@@ -1015,8 +996,8 @@ def test_levelplay_symbolic_video_and_inter_are_valid_ad_ids():
         "插屏聚合id": "inter",
     }
 
-    assert detection_field_issue(fields) is None
-    assert validate_backend_fields(fields, "com.demo") == []
+    assert detection_field_issue(fields)[0] == "AD_IDS_EMPTY"
+    assert "插屏和激励视频聚合 ID 均为空" in validate_backend_fields(fields, "com.demo")
 
 
 def test_symbolic_video_and_inter_remain_invalid_for_max():

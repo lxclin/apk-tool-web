@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 import glob
 
 from crash_rules import classify_crash_log
+from mediation_config import supplement_family_config
 
 DEFAULT_KEEP_THIRD_PARTY_PACKAGES = [
     "com.apktool.sharereceiver",
@@ -3050,7 +3051,7 @@ def _target_aggr_from_final(final: str) -> str:
 
 
 def prioritized_ad_unit_ids(value, aggregation_verdict: str, field_name: str) -> tuple[str, ...]:
-    """Concrete units replace symbolic IronSource placements for the same format."""
+    """Return concrete units only; fixed labels are not ad-unit identifiers."""
     placeholders = {"video", "reward", "rewarded", "rewarded_video", "inter", "interstitial"}
     tokens = []
     for item in re.split(r"[,，\s]+", str(value or "")):
@@ -3060,10 +3061,6 @@ def prioritized_ad_unit_ids(value, aggregation_verdict: str, field_name: str) ->
     concrete = tuple(item for item in tokens if item.casefold() not in placeholders)
     if concrete:
         return concrete
-    platform = _target_aggr_from_final(normalize_optional_parameter(aggregation_verdict))
-    allowed = {"激励视频聚合id": "video", "插屏聚合id": "inter"}.get(field_name)
-    if (platform in {"ironsource", "levelplay"} or not platform) and allowed:
-        return tuple(item for item in tokens if item.casefold() == allowed)
     return ()
 
 
@@ -3071,6 +3068,9 @@ def normalize_detected_ad_unit_ids(fields: dict) -> dict:
     verdict = normalize_optional_parameter(fields.get("最终判断"))
     for name in ("插屏聚合id", "激励视频聚合id"):
         if name in fields:
+            raw = re.split(r"[,，\s]+", str(fields[name] or ""))
+            if any(item.casefold() in {"video", "inter", "reward", "rewarded", "rewarded_video", "interstitial"} for item in raw):
+                fields["_symbolic_ad_ids_rejected"] = True
             fields[name] = ", ".join(prioritized_ad_unit_ids(fields[name], verdict, name))
     return fields
 
@@ -3322,8 +3322,13 @@ def extract_runtime_ad_unit_ids(lines: list[str], target_sdk: str) -> dict:
         line = str(raw_line or "").strip()
         if not line:
             continue
+        if target_sdk in {"ironsource", "levelplay"} and re.search(
+            r"(?:ADAPTER[_ :]|DAPTER_API|R_CALLBACK)", line, re.I
+        ):
+            continue
         ids: list[str] = []
-        for pattern in RUNTIME_AD_UNIT_PATTERNS:
+        patterns = RUNTIME_AD_UNIT_PATTERNS[:4] if target_sdk in {"ironsource", "levelplay"} else RUNTIME_AD_UNIT_PATTERNS
+        for pattern in patterns:
             match = pattern.search(line)
             if match:
                 value = match.group(1).strip()
@@ -3407,6 +3412,10 @@ def _should_scan_runtime_ad_ids(fields: dict, target_sdk: str) -> bool:
         or target_sdk not in RUNTIME_PLATFORM_MARKERS
     ):
         return False
+    # Family SDKs expose concrete typed units on dedicated API lines. Extract
+    # those independently of attribution; submission still checks attribution.
+    if target_sdk in {"ironsource", "levelplay"}:
+        return not fields.get("激励视频聚合id") or not fields.get("插屏聚合id")
     # The fallback is intentionally all-or-nothing: if either standard ID is
     # already present, do not mix a runtime guess into the detector result.
     if fields.get("激励视频聚合id") or fields.get("插屏聚合id"):
@@ -3439,6 +3448,7 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
     sdk_ids: dict[str, dict[str, str]] = {}
     sdk_order: list[str] = []
     current_sdk = ""
+    verdict_history = []
 
     def ensure_sdk(name: str) -> str:
         canonical = _canonical_aggr_name(name)
@@ -3467,6 +3477,9 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
 
         if content.startswith("最终判断:"):
             fields["最终判断"] = content.replace("最终判断:", "").strip()
+            platform = _target_aggr_from_final(fields["最终判断"])
+            if platform and platform not in verdict_history:
+                verdict_history.append(platform)
 
         elif content.startswith("初始页面Activity:"):
             fields["初始Activity"] = content.replace("初始页面Activity:", "").strip()
@@ -3546,6 +3559,24 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
                     sdk_order.append("max")
 
     target_sdk = _target_aggr_from_final(fields["最终判断"])
+    # SDK class names and adapter integration checks are not ownership proof.
+    # Keep conflicts pending until the latest verdict agrees with dedicated
+    # LevelPlay runtime API evidence. Demand-only/external adapters cannot win.
+    level_runtime = [line for line in lines if re.search(
+        r"LevelPlaySDK:\s*API.*(?:\binit\s*\(appKey:|LevelPlay\.init\s*\(|LevelPlay(?:Rewarded|Interstitial)Ad(?:\.(?:loadAd|showAd)\s*\(|\s+<init>.*adUnitId\s*:))",
+        line, re.I)]
+    external_iron = any(re.search(r'"isDemandOnly"\s*:\s*1|IronSourceMediationAdapter.*initializ', line, re.I) for line in lines)
+    if len(verdict_history) > 1:
+        fields["聚合判定历史"] = verdict_history
+        if not (set(verdict_history) <= {"ironsource", "levelplay"}
+                and target_sdk == "levelplay" and level_runtime and not external_iron):
+            fields["_aggregation_evidence_conflict"] = "同一轮检测输出了不同聚合平台，需复检确认"
+    if target_sdk == "ironsource" and level_runtime and not external_iron:
+        fields["_aggregation_evidence_conflict"] = "最终判断为 IronSource，但存在 LevelPlay 专属运行接口证据"
+    if target_sdk in {"ironsource", "levelplay"} and external_iron:
+        fields["_aggregation_evidence_conflict"] = "发现 Demand Only 或外部聚合初始化关系，需确认 IronSource/LevelPlay 是否仅为广告源"
+    if level_runtime:
+        fields["聚合运行证据"] = level_runtime[-4:]
     if target_sdk == "max" and _admob_runtime_overrides_empty_max(lines, sdk_ids):
         fields["_raw_aggregation_verdict"] = fields["最终判断"]
         fields["最终判断"] = "AdMob聚合（运行期广告请求确认）"
@@ -3561,6 +3592,7 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
 
     fields["激励视频聚合id"] = selected_ids.get("reward", "")
     fields["插屏聚合id"] = selected_ids.get("interstitial", "")
+    normalize_detected_ad_unit_ids(fields)
     runtime_ids = {
         "interstitial_ids": [],
         "rewarded_ids": [],
@@ -3596,7 +3628,7 @@ def parse_autodetector_fields(lines: list[str]) -> dict:
             fields["AdMob运行时候选ID"] = runtime_ids["candidate_ids"]
             fields["AdMob运行时候选ID详情"] = runtime_ids["matches"]
     retained_logs = list(
-        dict.fromkeys(tag_lines[-50:] + runtime_ids["evidence"][-20:])
+        dict.fromkeys(tag_lines[-50:] + runtime_ids["evidence"][-20:] + level_runtime[-4:])
     )
     fields["完整日志"] = "\n".join(retained_logs)
     return normalize_detected_ad_unit_ids(fields)
@@ -4938,7 +4970,7 @@ def build_backend_url(fields: dict, package_name: str) -> str:
     }
     final = normalize_optional_parameter(fields.get("最终判断", ""))
     canonical_platform = _target_aggr_from_final(final)
-    if canonical_platform in platform_map:
+    if canonical_platform in platform_map and not fields.get("_aggregation_evidence_conflict"):
         params["aggr_platform"] = platform_map[canonical_platform]
 
     # 其他直接映射字段
@@ -4956,6 +4988,8 @@ def build_backend_url(fields: dict, package_name: str) -> str:
         "激励视频聚合id": "aggr_jilishipin_id",
     }
     for src, dst in single_value_field_map.items():
+        if fields.get("_aggregation_evidence_conflict"):
+            continue
         val = normalize_optional_parameter(fields.get(src, ""))
         if val:
             candidates = prioritized_ad_unit_ids(val, final, src)
@@ -5056,6 +5090,8 @@ def extract_logcat_fields(
                 }
             lines = result.stdout.split("\n")
             fields = parse_autodetector_fields(lines)
+            if uid:
+                fields = supplement_family_config(fields, adb, uid)
             if on_line:
                 for line in lines:
                     if (
