@@ -1,10 +1,11 @@
-"""Read-only, package-scoped IronSource/LevelPlay configuration evidence."""
+"""Read-only package-scoped mediation evidence and platform dispatch."""
 import json
 import re
 import shlex
 import subprocess
 import time
 import xml.etree.ElementTree as ET
+from topon_config import supplement_topon_config
 
 SYMBOLIC_IDS = frozenset({"video", "inter", "reward", "rewarded", "rewarded_video", "interstitial", "external"})
 
@@ -34,6 +35,8 @@ def parse_provider_order(xml_text):
 def supplement_family_config(fields, adb, uid, *, runner=subprocess.run):
     """Read only the unique package belonging to the Logcat UID; no device writes."""
     verdict = str(fields.get("最终判断") or "").casefold().replace("_", "")
+    if "topon" in verdict or "anythink" in verdict:
+        return supplement_topon_config(fields, adb, uid, runner=runner)
     if not any(name in verdict for name in ("ironsource", "levelplay")):
         return fields
     names = ("插屏聚合id", "激励视频聚合id")

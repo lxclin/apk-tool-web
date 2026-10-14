@@ -10,6 +10,12 @@
 
 本节取代下文历史记录中关于“video/inter 合法符号型广告位、可临时提交”的规则。详细边界和验证见 [更新说明](UPDATE_NOTES_2026-10-14.md)。
 
+## 2026-10-14 TopOn 策略缓存提取
+
+新增 TopOn/Thinkup 缺失广告位补查，按 UID 限定目标包，从只读数据库 App ID 关联到经过校验的 FastKV 有效策略。顶层 format 区分插屏和激励，跳过已删除记录；不以广告源 unit_id/placement_id 或 CloudX ID 代替 TopOn 广告位。提取后进入现有参数校验、保护提交和目标 ID 回放；无权限、缓存损坏或类型冲突保留复核原因。
+
+真实设备已只读提取 `com.piggywallet.spinfun.pro` 两类广告位，本轮不改变后台及任务状态。具体范围见 [10 月 14 日更新说明](UPDATE_NOTES_2026-10-14.md)。
+
 ## 时间范围
 
 | 日期 | 本文位置 | 内容 |

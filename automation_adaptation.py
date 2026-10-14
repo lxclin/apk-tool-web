@@ -369,7 +369,10 @@ def format_detection_review_evidence(fields: dict[str, Any] | None) -> str:
     if snapshot.get("_symbolic_ad_ids_rejected"):
         lines.append("video/inter 为固定文本，已拒绝作为广告位 ID 提交")
     if snapshot.get("广告ID来源详情"):
-        lines.append("广告 ID 来源：目标包 providerOrder 配置；需回放验证")
+        label = "TopOn 策略缓存" if snapshot.get("广告ID识别来源") == "topon_config_strategy" else "providerOrder 配置"
+        lines.append(f"广告 ID 来源：目标包 {label}；需回放验证")
+    if snapshot.get("_topon_config_read"):
+        lines.append("TopOn 配置补查：" + str(snapshot["_topon_config_read"]))
     raw_verdict = normalize_optional_parameter(
         snapshot.get("_raw_aggregation_verdict") or snapshot.get("最终判断")
     )
@@ -805,7 +808,8 @@ def build_aggregation_assessment(fields: dict[str, Any] | None) -> dict[str, Any
         if fields.get("_aggregation_evidence_conflict"):
             confidence = "待确认"
     if fields.get("广告ID来源详情"):
-        evidence.append("广告 ID 补充来源：目标包 providerOrder 配置；需真实广告回放验证")
+        label = "TopOn 策略缓存" if fields.get("广告ID识别来源") == "topon_config_strategy" else "providerOrder 配置"
+        evidence.append(f"广告 ID 补充来源：目标包 {label}；需真实广告回放验证")
     elif terminal_note_only:
         evidence.append(f"终态规则：{issue[1]}，仅提交备注字段并跳过回放")
     return {
@@ -1263,6 +1267,7 @@ def format_aggregation_fields(data: dict[str, Any]) -> str:
             "ironsource_runtime_log_explicit": "IronSource运行期日志明确字段",
             "levelplay_runtime_log_explicit": "LevelPlay运行期日志明确字段",
             "topon_runtime_log_explicit": "TopOn运行期日志明确字段",
+            "topon_config_strategy": "TopOn数据库与有效策略缓存",
             "fyber_runtime_log_explicit": "Fyber运行期日志明确字段",
         }.get(ad_id_source, ad_id_source)
         lines.append(f"广告ID识别方式:{source_label}")
